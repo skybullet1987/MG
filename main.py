@@ -610,12 +610,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         return self.max_daily_trades
 
     def _get_threshold(self):
-        # In ranging/sideways markets, lower the entry threshold so that
-        # mean-reversion setups (which score slightly below 0.60) can enter.
-        if self.market_regime == "sideways":
-            return max(0.50, self.entry_threshold - 0.10)
-        elif self.market_regime == "bull":
-            return max(0.45, self.entry_threshold - 0.15) # Relax threshold significantly in bull runs
         return self.entry_threshold
 
     def _check_correlation(self, new_symbol):
@@ -897,7 +891,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             atr_val = crypto['atr'].Current.Value if crypto['atr'].IsReady else None
             if atr_val and price > 0:
                 expected_move_pct = (atr_val * self.atr_tp_mult) / price
-                min_profit_gate = 0.008 if self.market_regime == "sideways" else self.min_expected_profit_pct
+                min_profit_gate = self.min_expected_profit_pct
                 min_required = self.expected_round_trip_fees + self.fee_slippage_buffer + min_profit_gate
                 if expected_move_pct < min_required:
                     continue
@@ -905,15 +899,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             # Dollar-volume liquidity gate (relaxed in sideways/low-activity periods)
             if len(crypto['dollar_volume']) >= 3:
                 recent_dv = np.mean(list(crypto['dollar_volume'])[-3:])
-                dv_threshold = 5000 if self.market_regime == "sideways" else self.min_dollar_volume_usd
+                dv_threshold = self.min_dollar_volume_usd
                 if recent_dv < dv_threshold:
                     reject_dollar_volume += 1
-                    continue
-
-            # Relative strength vs BTC: altcoin must outperform BTC momentum
-            if self.btc_symbol is not None and len(crypto.get('rs_vs_btc', [])) >= 1:
-                rs_latest = crypto['rs_vs_btc'][-1]
-                if rs_latest < 0:
                     continue
 
             # Position sizing: 70% base, Kelly-adjusted
@@ -1088,17 +1076,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             sl = self.tight_stop_loss   # 1.0-2.0% stop floor
             tp = self.quick_take_profit  # 1.5-3.0% take-profit floor
 
-        if self.volatility_regime == "high":
-            sl *= 1.2
-            tp *= 1.2
-        elif self.market_regime == "bear":
-            tp = min(tp, 0.015)
-        elif self.market_regime == "sideways":
-            tp = min(tp, 0.030)
-            sl = min(sl, 0.010)
-        if self.market_regime == "bull":
-            tp = max(tp * 3.0, 0.25)
-            sl = max(sl * 2.0, 0.05)
         if tp < sl * 1.5:
             tp = sl * 1.5
 
@@ -1116,12 +1093,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 and pnl >= self.partial_tp_threshold):
             if partial_smart_sell(self, symbol, 0.50, "Partial TP"):
                 self._partial_tp_taken[symbol] = True
-                if self.market_regime == "bull":
-                    self._breakeven_stops[symbol] = entry * 0.95
-                    self.Debug(f"PARTIAL TP: {symbol.Value} | PnL:{pnl:+.2%} | SL→entry-5% (bull)")
-                else:
-                    self._breakeven_stops[symbol] = entry * 1.002
-                    self.Debug(f"PARTIAL TP: {symbol.Value} | PnL:{pnl:+.2%} | SL→entry+0.2%")
+                self._breakeven_stops[symbol] = entry * 1.002
+                self.Debug(f"PARTIAL TP: {symbol.Value} | PnL:{pnl:+.2%} | SL→entry+0.2%")
                 return  # Don't trigger full exit this bar
 
         tag = ""
@@ -1134,7 +1107,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             tag = "Stop Loss"
 
 
-        if not tag and self.market_regime != "bull" and minutes > self.stagnation_minutes and pnl < self.stagnation_pnl_threshold:
+        if not tag and minutes > self.stagnation_minutes and pnl < self.stagnation_pnl_threshold:
             tag = "Stagnation Exit"
 
 
@@ -1163,10 +1136,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if not tag and crypto and crypto['rsi'].IsReady:
                 rsi_now = crypto['rsi'].Current.Value
                 if self.rsi_peaked_above_50.get(symbol, False) and rsi_now < 50:
-                    if self.market_regime == "bull" and pnl < 0.005:
-                        pass  # Do not exit at a loss during bull regime
-                    else:
-                        tag = "RSI Momentum Exit"
+                    tag = "RSI Momentum Exit"
 
 
             if not tag and hours >= 2.0 and crypto and len(crypto['volume']) >= 2:
