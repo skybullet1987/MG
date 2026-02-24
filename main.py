@@ -4,7 +4,23 @@ from execution import *
 from scoring import MicroScalpEngine
 from collections import deque
 import numpy as np
+from QuantConnect.Orders.Fees import FeeModel, OrderFee
+from QuantConnect.Securities import CashAmount
+from QuantConnect.Orders.Slippage import SlippageModel
 # endregion
+
+
+class MakerTakerFeeModel(FeeModel):
+    """Custom Fee Model: 0.25% Maker (Limit), 0.40% Taker (Market).
+    Note: assumes all Limit orders rest in the book as maker orders. Aggressive
+    limit orders that cross the spread will be charged the taker rate by the exchange
+    at settlement, but this model applies the maker rate as an approximation for
+    backtesting purposes."""
+    def GetOrderFee(self, parameters):
+        order = parameters.Order
+        fee_pct = 0.0025 if order.Type == OrderType.Limit else 0.0040
+        trade_value = order.AbsoluteQuantity * parameters.Security.Price
+        return OrderFee(CashAmount(trade_value * fee_pct, "USD"))
 
 
 class SimplifiedCryptoStrategy(QCAlgorithm):
@@ -19,21 +35,21 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
         # === Entry thresholds (scalp score 0-1) ===
-        self.entry_threshold = 0.60   # 3/5 signals firing (raised from 0.40 to improve win rate)
-        self.high_conviction_threshold = 0.80  # 4+ signals (raised from 0.60)
+        self.entry_threshold = 0.40   # Machine Gun: fires more frequently
+        self.high_conviction_threshold = 0.60  # Machine Gun: high-conviction threshold
 
         # === Exit parameters (aggressive profit-taking) ===
-        self.quick_take_profit = self._get_param("quick_take_profit", 0.020)  # 2.0% base TP
-        self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.012)  # 1.2% base SL
-        self.atr_tp_mult  = self._get_param("atr_tp_mult",  2.5)   # ATR × 2.5 for TP
-        self.atr_sl_mult  = self._get_param("atr_sl_mult",  1.5)   # ATR × 1.5 for SL
-        self.trail_activation  = self._get_param("trail_activation",  0.005)  # activate at +0.5%
+        self.quick_take_profit = self._get_param("quick_take_profit", 0.080)  # 8.0% base TP
+        self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.025)  # 2.5% base SL
+        self.atr_tp_mult  = self._get_param("atr_tp_mult",  4.0)   # ATR × 4.0 for TP
+        self.atr_sl_mult  = self._get_param("atr_sl_mult",  2.0)   # ATR × 2.0 for SL
+        self.trail_activation  = self._get_param("trail_activation",  0.010)  # activate at +1.0%
         self.trail_stop_pct    = self._get_param("trail_stop_pct",    0.005)  # trail 0.5% from high
-        self.time_stop_hours   = self._get_param("time_stop_hours",   4.0)    # exit after 4h if PnL < +0.3%
+        self.time_stop_hours   = self._get_param("time_stop_hours",   2.0)    # exit after 2h if PnL < +0.3%
         self.time_stop_pnl_min = self._get_param("time_stop_pnl_min", 0.003)  # +0.3% floor
-        self.extended_time_stop_hours   = self._get_param("extended_time_stop_hours",   6.0)   # exit after 6h if not clearly winning
+        self.extended_time_stop_hours   = self._get_param("extended_time_stop_hours",   4.0)   # exit after 4h if not clearly winning
         self.extended_time_stop_pnl_max = self._get_param("extended_time_stop_pnl_max", 0.015) # +1.5% ceiling
-        self.stale_position_hours       = self._get_param("stale_position_hours",       8.0)   # unconditional exit after 8h
+        self.stale_position_hours       = self._get_param("stale_position_hours",       6.0)   # unconditional exit after 6h
 
         # Keep legacy names used elsewhere
         self.trailing_activation = self.trail_activation
@@ -43,10 +59,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.atr_trail_mult      = 2.0
 
         # === Position sizing (aggressive compounding) ===
-        self.position_size_pct  = 0.90   # minimum base size; scoring engine scales to 99% at full conviction
-        self.base_max_positions = 1
-        self.max_positions      = 1
-        self.min_notional       = 5.0
+        self.position_size_pct  = 0.15   # Machine Gun: 15% per trade for small capital
+        self.base_max_positions = 6
+        self.max_positions      = 6
+        self.min_notional       = 5.5
         self.max_position_usd   = self._get_param("max_position_usd", 1500.0)
         self.min_price_usd      = 0.005
         self.cash_reserve_pct   = 0.0    # no dead-money reserve at $20
@@ -179,7 +195,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.last_log_time  = None
 
         # Universe
-        self.max_universe_size = 20
+        self.max_universe_size = 60
 
         # Kraken status gate
         self.kraken_status = "unknown"
@@ -203,7 +219,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(minutes=15)), self.PortfolioSanityCheck)
 
         self.SetWarmUp(timedelta(days=4))
-        self.SetSecurityInitializer(lambda security: security.SetSlippageModel(RealisticCryptoSlippage()))
+        self.SetSecurityInitializer(self.CustomSecurityInitializer)
         self.Settings.FreePortfolioValuePercentage = 0.01
         self.Settings.InsightScore = False
 
@@ -214,6 +230,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             load_persisted_state(self)
             self.Debug("=== LIVE TRADING (MICRO-SCALP) v7.0.0 ===")
             self.Debug(f"Capital: ${self.Portfolio.Cash:.2f} | Max pos: {self.max_positions} | Size: {self.position_size_pct:.0%}")
+
+    def CustomSecurityInitializer(self, security):
+        """Applies volume-aware slippage (RealisticCryptoSlippage) and the custom
+        Maker/Taker fee model (0.25% for Limit orders, 0.40% for Market orders)."""
+        security.SetSlippageModel(RealisticCryptoSlippage())
+        security.SetFeeModel(MakerTakerFeeModel())
 
     def _get_param(self, name, default):
         try:
@@ -910,6 +932,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             size *= slippage_penalty
 
             val = reserved_cash * size
+
+            # Floor at min_notional to support small accounts
+            val = max(val, self.min_notional)
 
             # Volume-Pegged Position Sizing ("Whale Rule"): cap at 2% of recent 3-min dollar volume
             if len(crypto['dollar_volume']) >= 3:

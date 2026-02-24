@@ -27,17 +27,17 @@ class MicroScalpEngine:
     """
 
     # Tunable signal thresholds (easy to adjust for backtesting)
-    OBI_STRONG_THRESHOLD    = 0.60   # strong bid-side imbalance
-    OBI_PARTIAL_THRESHOLD   = 0.30   # partial bid-side imbalance
-    VOL_SURGE_STRONG        = 4.0    # 4× average volume = strong ignition
-    VOL_SURGE_PARTIAL       = 2.5    # 2.5× volume = moderate spike
-    ADX_STRONG_THRESHOLD    = 25     # strong directional trend
-    ADX_MODERATE_THRESHOLD  = 20     # moderate directional trend
-    VWAP_BUFFER             = 1.001  # 0.1% above VWAP for confirmed reclaim
+    OBI_STRONG_THRESHOLD    = 0.50   # strong bid-side imbalance
+    OBI_PARTIAL_THRESHOLD   = 0.25   # partial bid-side imbalance
+    VOL_SURGE_STRONG        = 3.0    # 3× average volume = strong ignition
+    VOL_SURGE_PARTIAL       = 2.0    # 2× volume = moderate spike
+    ADX_STRONG_THRESHOLD    = 20     # strong directional trend
+    ADX_MODERATE_THRESHOLD  = 15     # moderate directional trend
+    VWAP_BUFFER             = 1.0005  # 0.05% above VWAP for confirmed reclaim
     # Ranging-market mean reversion thresholds (used when ADX < ADX_MODERATE_THRESHOLD)
-    RSI_OVERSOLD_THRESHOLD        = 40   # RSI < 40 → oversold, mean reversion buy signal
-    RSI_MILDLY_OVERSOLD_THRESHOLD = 45   # RSI < 45 → mildly oversold, partial credit
-    BB_NEAR_LOWER_PCT             = 0.02  # within 2% of lower Bollinger Band = near support
+    RSI_OVERSOLD_THRESHOLD        = 45   # RSI < 45 → oversold, mean reversion buy signal
+    RSI_MILDLY_OVERSOLD_THRESHOLD = 50   # RSI < 50 → mildly oversold, partial credit
+    BB_NEAR_LOWER_PCT             = 0.03  # within 3% of lower Bollinger Band = near support
 
     def __init__(self, algorithm):
         self.algo = algorithm
