@@ -233,8 +233,13 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
                         bid = sec.BidPrice
                         ask = sec.AskPrice
                         if bid > 0 and ask > 0:
-                            mid = 0.5 * (bid + ask)
-                            limit_order = algo.LimitOrder(symbol, safe_qty * direction_mult, mid, tag=tag)
+                            # Use bid/ask based on direction: covering a short buys at bid (maker),
+                            # selling a long sells at ask (maker).
+                            if direction_mult == 1:  # Covering a short (buying)
+                                limit_price = bid if bid > 0 else price * 0.9995
+                            else:  # Selling a long
+                                limit_price = ask if ask > 0 else price * 1.0005
+                            limit_order = algo.LimitOrder(symbol, safe_qty * direction_mult, limit_price, tag=tag)
                             # Track for fallback in VerifyOrderFills (90 second timeout handled there)
                             if hasattr(algo, '_submitted_orders'):
                                 algo._submitted_orders[symbol] = {
@@ -244,7 +249,7 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
                                     'is_limit_exit': True,
                                     'intent': 'exit'
                                 }
-                            algo.Debug(f"LIMIT EXIT: {symbol.Value} at mid ${mid:.4f} (spread={spread_pct:.2%})")
+                            algo.Debug(f"LIMIT EXIT: {symbol.Value} at ${limit_price:.4f} (spread={spread_pct:.2%})")
                             return True
                         else:
                             ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
@@ -1304,8 +1309,8 @@ def execute_sell(algo, symbol, quantity):
 
 
 def execute_short(algo, symbol, quantity):
-    """Place a short sell limit order at the best bid (Bybit Margin short entry).
-    Posting at the bid makes this a maker order, capturing the 0.1% maker fee rate.
+    """Executes a short using a Limit Order to capture Maker Fee.
+    To OPEN a short as a maker, we must post our sell order on the Ask side of the book.
     Negative quantity signals a short position to the brokerage.
 
     Note: In _execute_trades, short entries are placed via place_limit_or_market() with
@@ -1314,6 +1319,6 @@ def execute_short(algo, symbol, quantity):
     can be called directly in custom strategies that bypass the main entry loop).
     """
     security = algo.Securities[symbol]
-    # For a short sell: post at the bid so the order rests as a maker order
-    limit_price = security.BidPrice if security.BidPrice > 0 else security.Price * 0.9995
-    algo.LimitOrder(symbol, -quantity, limit_price, "MG Short Entry")
+    # To OPEN a short as a maker, we must post our sell order on the Ask
+    limit_price = security.AskPrice if security.AskPrice > 0 else security.Price * 1.0005
+    algo.LimitOrder(symbol, -quantity, limit_price, "MG Maker Short Open")

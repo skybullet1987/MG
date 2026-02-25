@@ -276,8 +276,8 @@ class MicroScalpEngine:
     # Short scoring: bearish microstructure signals (mirror of long)
     # ------------------------------------------------------------------
     # Short-specific thresholds
-    OBI_SHORT_STRONG_THRESHOLD   = -0.50   # strong ask-side imbalance (obi < -0.50)
-    OBI_SHORT_PARTIAL_THRESHOLD  = -0.25   # partial ask-side imbalance
+    OBI_SHORT_STRONG_THRESHOLD   = 0.75    # ask_size / total_size > 0.75 → strong ask pressure
+    OBI_SHORT_PARTIAL_THRESHOLD  = 0.625   # ask_size / total_size > 0.625 → partial ask pressure
     RSI_OVERBOUGHT_THRESHOLD     = 55      # RSI > 55 → overbought, mean reversion sell signal
     RSI_MILDLY_OVERBOUGHT_THRESHOLD = 50  # RSI > 50 → mildly overbought, partial credit
     BB_NEAR_UPPER_PCT            = 0.03   # within 3% of upper Bollinger Band = near resistance
@@ -303,33 +303,34 @@ class MicroScalpEngine:
         try:
             # ----------------------------------------------------------
             # Signal 1: Order Book Imbalance (OBI) – Ask-side pressure
-            # OBI = (bid_size - ask_size) / (bid_size + ask_size)
-            # Strong sell pressure when OBI < -0.5 (ask wall dominates).
+            # OBI = ask_size / total_size (heavy ask pressure → bearish)
+            # Strong sell pressure when ask_size / total_size > 0.75.
             # ----------------------------------------------------------
             bid_size = crypto.get('bid_size', 0.0)
             ask_size = crypto.get('ask_size', 0.0)
             total_size = bid_size + ask_size
             if total_size > 0:
-                obi = (bid_size - ask_size) / total_size
-                if obi < self.OBI_SHORT_STRONG_THRESHOLD:
+                obi = ask_size / total_size
+                if obi > self.OBI_SHORT_STRONG_THRESHOLD:
                     components['obi'] = 0.20
                     if not self.algo.IsWarmingUp:
                         self.algo.Debug(
-                            f"Short OBI Signal: obi={obi:.3f} bid={bid_size:.2f} ask={ask_size:.2f}")
-                elif obi < self.OBI_SHORT_PARTIAL_THRESHOLD:
+                            f"Short OBI Signal: ask_ratio={obi:.3f} bid={bid_size:.2f} ask={ask_size:.2f}")
+                elif obi > self.OBI_SHORT_PARTIAL_THRESHOLD:
                     components['obi'] = 0.10
 
             # ----------------------------------------------------------
             # Signal 2: Volume Ignition on down candles
             # Current volume surge vs adaptive rolling baseline on a bar
-            # where price moved downward.
+            # where price closed below its open (Red/Down candle: close < open).
             # ----------------------------------------------------------
-            if len(crypto['volume']) >= 20 and len(crypto['prices']) >= 2:
+            if len(crypto['volume']) >= 20 and len(crypto['prices']) >= 1 and len(crypto.get('opens', [])) >= 1:
                 volumes = list(crypto['volume'])
                 current_vol = volumes[-1]
                 prices = list(crypto['prices'])
-                # Only count ignition if price fell this bar
-                is_down_bar = prices[-1] < prices[-2]
+                opens = list(crypto['opens'])
+                # Only count ignition on a red/down candle (close < open)
+                is_down_bar = prices[-1] < opens[-1]
                 vol_long = list(crypto.get('volume_long', []))
                 if len(vol_long) >= 60:
                     vol_baseline = float(np.mean(vol_long))
@@ -347,14 +348,14 @@ class MicroScalpEngine:
 
             # ----------------------------------------------------------
             # Signal 3: MTF Trend Alignment (bearish)
-            # Price < EMA5 AND EMA5 < EMA20 → downtrend on both timeframes.
+            # EMA5 < EMA20 → short-term EMA below medium-term EMA (downtrend).
             # ----------------------------------------------------------
             if (crypto['ema_5'].IsReady and crypto.get('ema_medium') is not None
                     and crypto['ema_medium'].IsReady and len(crypto['prices']) >= 1):
                 price = crypto['prices'][-1]
                 ema5 = crypto['ema_5'].Current.Value
                 ema20 = crypto['ema_medium'].Current.Value
-                if price < ema5 and ema5 < ema20:
+                if ema5 < ema20:
                     components['micro_trend'] = 0.20
                 elif price < ema5:
                     components['micro_trend'] = 0.10
