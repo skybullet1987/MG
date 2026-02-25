@@ -5,7 +5,7 @@ from scoring import MicroScalpEngine
 from collections import deque
 import numpy as np
 from QuantConnect.Orders.Fees import FeeModel, OrderFee
-from QuantConnect.Securities import CashAmount
+from QuantConnect.Securities import CashAmount, SecurityMarginModel
 from QuantConnect.Orders.Slippage import SlippageModel
 # endregion
 
@@ -22,8 +22,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def Initialize(self):
         self.SetStartDate(2025, 1, 1)
-        # Force exact USDT cash balance to prevent the 100k/200k default bug
+
+        # CLEAR THE DEFAULT 100K USD, ONLY SET USDT
+        self.Portfolio.SetCash(1000)  # Temporarily reset default USD to 1000 to avoid 100k bug
         self.SetCash("USDT", 1000)
+        self.SetCash("USD", 0)        # Wipe out the USD so ONLY USDT exists
+
         # Force Margin account so short selling is legally permitted
         self.SetBrokerageModel(BrokerageName.Bybit, AccountType.Margin)
 
@@ -206,12 +210,14 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             cleanup_object_store(self)
             load_persisted_state(self)
             self.Debug("=== LIVE TRADING (MICRO-SCALP BYBIT) v7.1.0 ===")
-            self.Debug(f"Capital: ${self.Portfolio.Cash:.2f} | Mode: Long+Short")
+            self.Debug(f"Capital: ${self.Portfolio.CashBook['USDT'].Amount:.2f} | Mode: Long+Short")
 
     def CustomSecurityInitializer(self, security):
-        """Sets slippage and fee model."""
+        """Sets slippage, fee model, AND MARGIN CAPABILITY."""
         security.SetSlippageModel(RealisticCryptoSlippage())
         security.SetFeeModel(MakerTakerFeeModel())
+        # CRITICAL: Force the security to use a margin model so shorting is legally allowed
+        security.SetBuyingPowerModel(SecurityMarginModel(3.0))
 
     def _get_param(self, name, default):
         try:
@@ -731,9 +737,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 })
 
         try:
-            cash = self.Portfolio.CashBook["USD"].Amount
+            cash = self.Portfolio.CashBook["USDT"].Amount
         except (KeyError, AttributeError):
-            cash = self.Portfolio.Cash
+            cash = self.Portfolio.TotalPortfolioValue
 
         debug_limited(self, f"REBALANCE: {count_above_thresh}/{count_scored} above thresh={threshold_now:.2f} | cash=${cash:.2f}")
 
@@ -759,9 +765,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             return
         
         try:
-            available_cash = self.Portfolio.CashBook["USD"].Amount
+            available_cash = self.Portfolio.CashBook["USDT"].Amount
         except (KeyError, AttributeError):
-            available_cash = self.Portfolio.Cash
+            available_cash = self.Portfolio.TotalPortfolioValue
         
         open_buy_orders_value = self._get_open_buy_orders_value()
         
@@ -821,9 +827,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
 
             try:
-                available_cash = self.Portfolio.CashBook["USD"].Amount
+                available_cash = self.Portfolio.CashBook["USDT"].Amount
             except (KeyError, AttributeError):
-                available_cash = self.Portfolio.Cash
+                available_cash = self.Portfolio.TotalPortfolioValue
 
             available_cash = max(0, available_cash - open_buy_orders_value)
             total_value = self.Portfolio.TotalPortfolioValue

@@ -173,9 +173,9 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
     if algo.LiveMode and holding_qty != 0:
         estimated_fee = price * abs(holding_qty) * 0.002  # 0.2% fee estimate (0.1% base + 0.1% safety buffer)
         try:
-            available_usd = algo.Portfolio.CashBook["USD"].Amount
+            available_usd = algo.Portfolio.CashBook["USDT"].Amount
         except (KeyError, AttributeError):
-            available_usd = algo.Portfolio.Cash
+            available_usd = algo.Portfolio.TotalPortfolioValue
         is_stop_loss = "Stop Loss" in tag or "Stop" in tag
         if available_usd < estimated_fee and not is_stop_loss:
             algo.Debug(f"⚠️ SKIP SELL {symbol.Value}: fee reserve too low "
@@ -538,7 +538,7 @@ def sync_existing_positions(algo):
         elif pnl_pct <= -algo.base_stop_loss:
             positions_to_close.append((symbol, ticker, pnl_pct, "Sync SL"))
     algo.Debug(f"Synced {synced_count} positions")
-    algo.Debug(f"Cash: ${algo.Portfolio.Cash:.2f}")
+    algo.Debug(f"Cash: ${algo.Portfolio.CashBook['USDT'].Amount:.2f}")
     algo.Debug("=" * 50)
     for symbol, ticker, pnl_pct, reason in positions_to_close:
         algo.Debug(f"IMMEDIATE {reason}: {ticker} at {pnl_pct:+.2%}")
@@ -667,10 +667,10 @@ def live_safety_checks(algo):
     
     # Check if we have minimum viable cash
     try:
-        cash = algo.Portfolio.CashBook["USD"].Amount
+        cash = algo.Portfolio.CashBook["USDT"].Amount
     except Exception as e:
-        algo.Debug(f"Error getting cash from CashBook, using Portfolio.Cash: {e}")
-        cash = algo.Portfolio.Cash
+        algo.Debug(f"Error getting cash from CashBook, using TotalPortfolioValue: {e}")
+        cash = algo.Portfolio.TotalPortfolioValue
     
     if cash < 2.0:
         debug_limited(algo, "LIVE SAFETY: Cash below $2, pausing new entries")
@@ -845,8 +845,8 @@ def health_check(algo):
     resync_holdings_full(algo)
     
     issues = []
-    if algo.Portfolio.Cash < 5:
-        issues.append(f"Low cash: ${algo.Portfolio.Cash:.2f}")
+    if algo.Portfolio.CashBook["USDT"].Amount < 5:
+        issues.append(f"Low cash: ${algo.Portfolio.CashBook['USDT'].Amount:.2f}")
     
     for symbol in list(algo.entry_prices.keys()):
         open_orders = algo.Transactions.GetOpenOrders(symbol)
@@ -1146,7 +1146,7 @@ def verify_order_fills(algo):
 def portfolio_sanity_check(algo):
     """
     Check for portfolio value mismatches between QC and tracked positions.
-    Fixed: Use CashBook["USD"].Amount for actual USD cash, not Portfolio.Cash
+    Fixed: Use CashBook["USDT"].Amount for actual USDT cash, not Portfolio.Cash
     (which in Cash account mode includes crypto holdings value).
     Fix 6: Trigger resync_holdings_full on mismatch and log detailed breakdown.
     """
@@ -1155,11 +1155,11 @@ def portfolio_sanity_check(algo):
     
     total_qc = algo.Portfolio.TotalPortfolioValue
     
-    # Use actual USD cash, NOT Portfolio.Cash (which double-counts in Cash accounts)
+    # Use actual USDT cash, NOT Portfolio.Cash (which double-counts in Cash accounts)
     try:
-        usd_cash = algo.Portfolio.CashBook["USD"].Amount
+        usd_cash = algo.Portfolio.CashBook["USDT"].Amount
     except (KeyError, AttributeError):
-        usd_cash = algo.Portfolio.Cash
+        usd_cash = algo.Portfolio.TotalPortfolioValue
     
     tracked_value = 0.0
     tracked_positions = {}
@@ -1187,7 +1187,7 @@ def portfolio_sanity_check(algo):
                 
                 # Log detailed breakdown
                 algo.Debug("=== PORTFOLIO BREAKDOWN ===")
-                algo.Debug(f"USD Cash: ${usd_cash:.2f}")
+                algo.Debug(f"USDT Cash: ${usd_cash:.2f}")
                 
                 # Show tracked positions
                 if tracked_positions:
@@ -1277,7 +1277,7 @@ def daily_report(algo):
     wr = algo.winning_trades / total if total > 0 else 0
     avg = algo.total_pnl / total if total > 0 else 0
     algo.Debug(f"=== DAILY {algo.Time.date()} ===")
-    algo.Debug(f"Portfolio: ${algo.Portfolio.TotalPortfolioValue:.2f} | Cash: ${algo.Portfolio.Cash:.2f}")
+    algo.Debug(f"Portfolio: ${algo.Portfolio.TotalPortfolioValue:.2f} | Cash: ${algo.Portfolio.CashBook['USDT'].Amount:.2f}")
     algo.Debug(f"Pos: {get_actual_position_count(algo)}/{algo.base_max_positions} | {algo.market_regime} {algo.volatility_regime} {algo.market_breadth:.0%}")
     algo.Debug(f"Trades: {total} | WR: {wr:.1%} | Avg: {avg:+.2%}")
     if algo._session_blacklist:
