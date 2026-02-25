@@ -22,7 +22,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def Initialize(self):
         self.SetStartDate(2025, 1, 1)
-        self.SetCash(1000)
+        # Force exact USDT cash balance to prevent the 100k/200k default bug
+        self.SetCash("USDT", 1000)
+        # Force Margin account so short selling is legally permitted
         self.SetBrokerageModel(BrokerageName.Bybit, AccountType.Margin)
 
         self.entry_threshold = 0.40
@@ -274,12 +276,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             ticker = crypto.Symbol.Value
             if ticker in SYMBOL_BLACKLIST or ticker in self._session_blacklist:
                 continue
-            if not (ticker.endswith("USDT") or ticker.endswith("USD")):
+            if not ticker.endswith("USDT"):  # Bybit uses USDT for margin pairs mostly
                 continue
-            if ticker.endswith("USDT"):
-                base = ticker[:-4]  # remove "USDT" suffix
-            else:
-                base = ticker[:-3]  # remove "USD" suffix
+            base = ticker[:-4]  # remove "USDT" suffix
             if base in KNOWN_FIAT_CURRENCIES:
                 continue
             if crypto.VolumeInUsd is None or crypto.VolumeInUsd == 0:
@@ -292,6 +291,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def _initialize_symbol(self, symbol):
         self.crypto_data[symbol] = {
             'prices': deque(maxlen=self.lookback),
+            'opens': deque(maxlen=self.lookback),
             'returns': deque(maxlen=self.lookback),
             'volume': deque(maxlen=self.lookback),
             'volume_ma': deque(maxlen=self.medium_period),
@@ -385,10 +385,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def _update_symbol_data(self, symbol, bar, quote_bar=None):
         crypto = self.crypto_data[symbol]
         price = float(bar.Close)
+        open_price = float(bar.Open)
         high = float(bar.High)
         low = float(bar.Low)
         volume = float(bar.Volume)
         crypto['prices'].append(price)
+        crypto['opens'].append(open_price)
         crypto['highs'].append(high)
         crypto['lows'].append(low)
         if crypto['last_price'] > 0:
