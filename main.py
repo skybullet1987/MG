@@ -6,7 +6,7 @@ from collections import deque
 import numpy as np
 from QuantConnect.Orders.Fees import FeeModel, OrderFee
 from QuantConnect.Securities import CashAmount
-from QuantConnect.Orders.Slippage import SlippageModel
+# from QuantConnect.Orders.Slippage import SlippageModel
 # endregion
 
 
@@ -30,13 +30,15 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     """
 
     def Initialize(self):
-        self.SetStartDate(2025, 1, 1)
-        self.SetCash(1000)
+        self.SetStartDate(2024, 1, 1)
+        self.SetCash(19)
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
-        self.entry_threshold = 0.40   # Machine Gun: fires more frequently
+        # === Entry thresholds (scalp score 0-1) ===
+        self.entry_threshold = 0.25   # Machine Gun: fires more frequently
         self.high_conviction_threshold = 0.60  # Machine Gun: high-conviction threshold
 
+        # === Exit parameters (aggressive profit-taking) ===
         self.quick_take_profit = self._get_param("quick_take_profit", 0.080)  # 8.0% base TP
         self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.025)  # 2.5% base SL
         self.atr_tp_mult  = self._get_param("atr_tp_mult",  4.0)   # ATR × 4.0 for TP
@@ -56,7 +58,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.base_take_profit    = self.quick_take_profit
         self.atr_trail_mult      = 2.0
 
-        self.position_size_pct  = 0.15   # Machine Gun: 15% per trade for small capital
+        # === Position sizing (aggressive compounding) ===
+        self.position_size_pct  = 0.35   # Machine Gun: 15% per trade for small capital
         self.base_max_positions = 6
         self.max_positions      = 6
         self.min_notional       = 5.5
@@ -66,22 +69,26 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         # 50% buffer ensures post-fee qty stays above MinimumOrderSize.
         self.min_notional_fee_buffer = 1.5
 
+        # === Volatility / risk targets (kept for ATR sizing) ===
         self.target_position_ann_vol = self._get_param("target_position_ann_vol", 0.35)
         self.portfolio_vol_cap       = self._get_param("portfolio_vol_cap", 0.80)
         self.min_asset_vol_floor     = 0.05
 
+        # === Indicator periods (optimised for 1-minute scalping) ===
         self.ultra_short_period = 3
         self.short_period       = 6
         self.medium_period      = 12   # was 24
         self.lookback           = 48
         self.sqrt_annualization = np.sqrt(60 * 24 * 365)  # minute-resolution annualisation
 
+        # === Liquidity filters ===
         self.max_spread_pct         = 0.005   # 0.5% – tight spread required
         self.spread_median_window   = 12
         self.spread_widen_mult      = 2.5
-        self.min_dollar_volume_usd  = 50000   # $50k/hour minimum (checked via 3h avg in execute)
+        self.min_dollar_volume_usd  = 15000   # $50k/hour minimum (checked via 3h avg in execute)
         self.min_volume_usd         = 10000000  # $10M minimum VolumeInUsd for universe filter
 
+        # === Trade frequency & timing ===
         self.skip_hours_utc         = []      # 24/7 trading – no skip hours
         self.max_daily_trades       = 24      # increased to allow more opportunities
         self.daily_trade_count      = 0
@@ -90,11 +97,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.cancel_cooldown_minutes = 1
         self.max_symbol_trades_per_day = 4    # increased from 2 to allow more per-symbol trades
 
+        # === Fees & slippage ===
         self.expected_round_trip_fees = 0.0050   # 0.50% min (maker+maker)
         self.fee_slippage_buffer      = 0.001
         self.min_expected_profit_pct  = 0.015    # 1.5% minimum net profit above fees+slippage
         self.adx_min_period           = 14       # ADX indicator period
 
+        # === Order management ===
         self.stale_order_timeout_seconds      = 30    # 30s limit-entry timeout
         self.live_stale_order_timeout_seconds = 60
         self.max_concurrent_open_orders       = 2
@@ -108,6 +117,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.retry_pending_cooldown_seconds     = 60
         self.rate_limit_cooldown_minutes        = 10
 
+        # === Risk management ===
         self.max_drawdown_limit    = 0.25   # 25% – pause 6h
         self.cooldown_hours        = 6
         self.consecutive_losses    = 0
@@ -159,6 +169,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._bad_symbol_counts = {}
         self._recent_tickets  = deque(maxlen=25)
 
+        # Rolling performance tracking (for Kelly)
         self._rolling_wins      = deque(maxlen=50)
         self._rolling_win_sizes = deque(maxlen=50)
         self._rolling_loss_sizes = deque(maxlen=50)
@@ -175,6 +186,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.market_breadth   = 0.5
         self._regime_hold_count = 0
 
+        # Performance tracking
         self.winning_trades = 0
         self.losing_trades  = 0
         self.total_pnl      = 0.0
@@ -363,6 +375,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 del self.crypto_data[symbol]
 
     def OnData(self, data):
+        # === BTC reference data ===
         if self.btc_symbol and data.Bars.ContainsKey(self.btc_symbol):
             btc_bar = data.Bars[self.btc_symbol]
             btc_price = float(btc_bar.Close)
@@ -881,7 +894,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 min_profit_gate = self.min_expected_profit_pct
                 min_required = self.expected_round_trip_fees + self.fee_slippage_buffer + min_profit_gate
                 if expected_move_pct < min_required:
-                    continue
+                     continue
 
             # Dollar-volume liquidity gate (relaxed in sideways/low-activity periods)
             if len(crypto['dollar_volume']) >= 3:
