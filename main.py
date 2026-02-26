@@ -30,7 +30,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     """
 
     def Initialize(self):
-        self.SetStartDate(2025, 1, 1)
+        self.SetStartDate(2024, 1, 1)
         self.SetCash(19)
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
