@@ -30,12 +30,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     """
 
     def Initialize(self):
-        self.SetStartDate(2024, 1, 1)
+        self.SetStartDate(2025, 1, 1)
         self.SetCash(19)
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
         # === Entry thresholds (scalp score 0-1) ===
-        self.entry_threshold = 0.25   # Machine Gun: fires more frequently
+        self.entry_threshold = 0.40   # Machine Gun: fires more frequently
         self.high_conviction_threshold = 0.60  # Machine Gun: high-conviction threshold
 
         # === Exit parameters (aggressive profit-taking) ===
@@ -59,7 +59,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.atr_trail_mult      = 2.0
 
         # === Position sizing (aggressive compounding) ===
-        self.position_size_pct  = 0.35   # Machine Gun: 15% per trade for small capital
+        self.position_size_pct  = 0.15   # Machine Gun: 15% per trade for small capital
         self.base_max_positions = 6
         self.max_positions      = 6
         self.min_notional       = 5.5
@@ -85,7 +85,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.max_spread_pct         = 0.005   # 0.5% – tight spread required
         self.spread_median_window   = 12
         self.spread_widen_mult      = 2.5
-        self.min_dollar_volume_usd  = 15000   # $50k/hour minimum (checked via 3h avg in execute)
+        self.min_dollar_volume_usd  = 50000   # $50k/hour minimum (checked via 3h avg in execute)
         self.min_volume_usd         = 10000000  # $10M minimum VolumeInUsd for universe filter
 
         # === Trade frequency & timing ===
@@ -894,7 +894,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 min_profit_gate = self.min_expected_profit_pct
                 min_required = self.expected_round_trip_fees + self.fee_slippage_buffer + min_profit_gate
                 if expected_move_pct < min_required:
-                     continue
+                    continue
 
             # Dollar-volume liquidity gate (relaxed in sideways/low-activity periods)
             if len(crypto['dollar_volume']) >= 3:
