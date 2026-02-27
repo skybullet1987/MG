@@ -231,7 +231,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def _normalize_order_time(self, order_time):
         return normalize_order_time(order_time)
-    
+
     def _record_exit_pnl(self, symbol, entry_price, exit_price):
         return record_exit_pnl(self, symbol, entry_price, exit_price)
 
@@ -554,14 +554,32 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         return max(0, min(1, (v - mn) / (mx - mn)))
 
     def _calculate_factor_scores(self, symbol, crypto):
-        """Evaluate long signals only; block shorts."""
+        """Evaluate both signals and FADE them (reverse directions)."""
         long_score, long_components = self._scoring_engine.calculate_scalp_score(crypto)
+        short_score, short_components = self._scoring_engine.calculate_short_score(crypto)
 
-        components = long_components.copy()
-        components['_scalp_score'] = long_score
-        components['_direction'] = 1
-        components['_long_score'] = long_score
-        components['_short_score'] = 0.0
+        # FADE LOGIC: If system sees a bullish signal, we SHORT it.
+        if long_score >= short_score and long_score > 0:
+            components = long_components.copy()
+            components['_scalp_score'] = long_score
+            components['_direction'] = -1  # FADE: bullish signal -> enter SHORT
+            components['_long_score'] = 0.0
+            components['_short_score'] = long_score
+
+        # FADE LOGIC: If system sees a bearish signal, we LONG it.
+        elif short_score > long_score and short_score > 0:
+            components = short_components.copy()
+            components['_scalp_score'] = short_score
+            components['_direction'] = 1   # FADE: bearish signal -> enter LONG
+            components['_long_score'] = short_score
+            components['_short_score'] = 0.0
+
+        else:
+            components = long_components.copy()
+            components['_scalp_score'] = 0.0
+            components['_direction'] = 1
+            components['_long_score'] = 0.0
+            components['_short_score'] = 0.0
 
         return components
 
@@ -620,17 +638,17 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def Rebalance(self):
         if self.IsWarmingUp:
             return
-        
+
         if self._cash_mode_until is not None and self.Time < self._cash_mode_until:
             self._log_skip("cash mode - poor recent performance")
             return
-        
+
         self.log_budget = 20
-        
+
         if self._rate_limit_until is not None and self.Time < self._rate_limit_until:
             self._log_skip("rate limited")
             return
-        
+
         if self.LiveMode and not live_safety_checks(self):
             return
         if self.LiveMode and self.bybit_status in ("maintenance", "cancel_only"):
@@ -756,21 +774,21 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             return
         if self._compute_portfolio_risk_estimate() > self.portfolio_vol_cap:
             return
-        
+
         try:
             available_cash = self.Portfolio.CashBook["USDT"].Amount
         except (KeyError, AttributeError):
             available_cash = self.Portfolio.TotalPortfolioValue
-        
+
         open_buy_orders_value = self._get_open_buy_orders_value()
-        
+
         if available_cash <= 0:
             debug_limited(self, f"SKIP TRADES: No cash available (${available_cash:.2f})")
             return
         if open_buy_orders_value > available_cash * self.open_orders_cash_threshold:
             debug_limited(self, f"SKIP TRADES: ${open_buy_orders_value:.2f} reserved (>{self.open_orders_cash_threshold:.0%} of ${available_cash:.2f})")
             return
-        
+
         reject_pending_orders = 0
         reject_open_orders = 0
         reject_already_invested = 0
@@ -1181,7 +1199,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                         inferred_intent = 'entry'
                     else:
                         inferred_intent = 'entry' if event.Direction == OrderDirection.Buy else 'exit'
-                    
+
                     self._submitted_orders[symbol] = {
                         'order_id': event.OrderId,
                         'time': self.Time,
@@ -1349,7 +1367,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self.Debug(f"OnOrderEvent error: {e}")
         if self.LiveMode:
             persist_state(self)
-        
+
     def OnBrokerageMessage(self, message):
         try:
             txt = message.Message.lower()
@@ -1365,7 +1383,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 else:
                     self.bybit_status = "unknown"
                 self.Debug(f"Bybit status update: {self.bybit_status}")
-            
+
             if "rate limit" in txt or "too many" in txt:
                 self.Debug(f"⚠️ RATE LIMIT - pausing {self.rate_limit_cooldown_minutes}min")
                 self._rate_limit_until = self.Time + timedelta(minutes=self.rate_limit_cooldown_minutes)
