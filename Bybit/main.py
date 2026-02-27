@@ -554,22 +554,15 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         return max(0, min(1, (v - mn) / (mx - mn)))
 
     def _calculate_factor_scores(self, symbol, crypto):
-        """Evaluate long+short signals; pick best direction."""
+        """Evaluate long signals only; block shorts."""
         long_score, long_components = self._scoring_engine.calculate_scalp_score(crypto)
-        short_score, short_components = self._scoring_engine.calculate_short_score(crypto)
 
-        if long_score >= short_score:
-            components = long_components.copy()
-            components['_scalp_score'] = long_score
-            components['_direction'] = 1
-            components['_long_score'] = long_score
-            components['_short_score'] = short_score
-        else:
-            components = short_components.copy()
-            components['_scalp_score'] = short_score
-            components['_direction'] = -1
-            components['_long_score'] = long_score
-            components['_short_score'] = short_score
+        components = long_components.copy()
+        components['_scalp_score'] = long_score
+        components['_direction'] = 1
+        components['_long_score'] = long_score
+        components['_short_score'] = 0.0
+
         return components
 
     def _calculate_composite_score(self, factors, crypto=None):
