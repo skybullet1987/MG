@@ -82,11 +82,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.sqrt_annualization = np.sqrt(60 * 24 * 365)  # minute-resolution annualisation
 
         # === Liquidity filters ===
-        self.max_spread_pct         = 0.005   # 0.5% – tight spread required
+        self.max_spread_pct         = 0.003   # 0.3% – tightened to avoid bad fills in low-liquidity periods
         self.spread_median_window   = 12
         self.spread_widen_mult      = 2.5
-        self.min_dollar_volume_usd  = 25000   # $25k/hour minimum (checked via 3h avg in execute)
-        self.min_volume_usd         = 10000000  # $10M minimum VolumeInUsd for universe filter
+        self.min_dollar_volume_usd  = 50000   # $50k minimum (checked via 12-bar avg in execute)
+        self.min_volume_usd         = 25000000  # $25M minimum VolumeInUsd for universe filter (raised for capacity)
 
         # === Trade frequency & timing ===
         self.skip_hours_utc         = []      # 24/7 trading – no skip hours
@@ -95,7 +95,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.last_trade_date        = None
         self.exit_cooldown_hours    = 1.0     # 1-hour exit cooldown (raised from 15-min)
         self.cancel_cooldown_minutes = 1
-        self.max_symbol_trades_per_day = 4    # increased from 2 to allow more per-symbol trades
+        self.max_symbol_trades_per_day = 3    # limit per-symbol trades to reduce turnover
 
         # === Fees & slippage ===
         self.expected_round_trip_fees = 0.0050   # 0.50% min (maker+maker)
@@ -921,13 +921,21 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 if expected_move_pct < min_required:
                     continue
 
-            # Dollar-volume liquidity gate (relaxed in sideways/low-activity periods)
+            # Dollar-volume liquidity gate: use 12-bar average for more stable assessment
             if len(crypto['dollar_volume']) >= 3:
-                recent_dv = np.mean(list(crypto['dollar_volume'])[-3:])
+                dv_window = min(len(crypto['dollar_volume']), 12)
+                recent_dv = np.mean(list(crypto['dollar_volume'])[-dv_window:])
                 dv_threshold = self.min_dollar_volume_usd
                 if recent_dv < dv_threshold:
                     reject_dollar_volume += 1
                     continue
+
+            # ADX + volatility regime gate: skip entries in choppy low-vol conditions
+            adx_ind = crypto.get('adx')
+            if (adx_ind is not None and adx_ind.IsReady
+                    and adx_ind.Current.Value < 20
+                    and self.volatility_regime == "low"):
+                continue
 
             # Position sizing: 70% base, Kelly-adjusted
             vol = self._annualized_vol(crypto)
@@ -949,9 +957,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             # Floor at min_notional to support small accounts
             val = max(val, self.min_notional)
 
-            # Volume-Pegged Position Sizing ("Whale Rule"): cap at 2% of recent 3-min dollar volume
-            if len(crypto['dollar_volume']) >= 3:
-                whale_cap = sum(list(crypto['dollar_volume'])[-3:]) * 0.02
+            # Volume-Pegged Position Sizing ("Whale Rule"): cap at 1% of recent 60-bar (1h) dollar volume
+            dv_bars = list(crypto['dollar_volume'])
+            if len(dv_bars) >= 3:
+                whale_window = min(len(dv_bars), 60)
+                whale_cap = sum(dv_bars[-whale_window:]) * 0.01
                 val = min(val, whale_cap)
 
             # Absolute Hard Cap on position size
@@ -1109,6 +1119,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         # Tighten take-profit when this position was entered in a choppy (ADX < 25) regime
         if self._choppy_regime_entries.get(symbol, False):
             tp = tp * 0.65   # 35% tighter TP – trend continuation unlikely in choppy market
+
+        # Tighten take-profit in low-volatility regime to secure profits faster
+        if self.volatility_regime == "low":
+            tp = tp * 0.75   # 25% tighter TP – low-vol moves mean-revert quickly
 
         trailing_activation = self.trail_activation
         trailing_stop_pct   = self.trail_stop_pct
