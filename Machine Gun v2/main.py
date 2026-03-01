@@ -56,7 +56,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.base_take_profit    = self.quick_take_profit
         self.atr_trail_mult      = 2.0
 
-        self.position_size_pct  = 0.45
+        self.position_size_pct  = 0.50
         self.base_max_positions = 6
         self.max_positions      = 6
         self.min_notional       = 5.5
@@ -79,7 +79,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.spread_median_window   = 12
         self.spread_widen_mult      = 2.5
         self.min_dollar_volume_usd  = 50000
-        self.min_volume_usd         = 25000000
+        self.min_volume_usd         = 15000000
 
         self.skip_hours_utc         = []
         self.max_daily_trades       = 24
@@ -538,32 +538,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     uptrend_count += 1
         if total_ready > 5:
             self.market_breadth = uptrend_count / total_ready
-        self._update_liquidity_tiers()
-
-    def _update_liquidity_tiers(self):
-        """Scale position size, max positions, and min universe volume with portfolio equity."""
-        val = self.Portfolio.TotalPortfolioValue
-        if val < 2000:          # Tier 1: < $2k
-            self.position_size_pct = 0.40
-            self.max_positions = 6
-            self.min_volume_usd = 5_000_000
-        elif val < 10000:       # Tier 2: $2k–$10k
-            self.position_size_pct = 0.25
-            self.max_positions = 8
-            self.min_volume_usd = 10_000_000
-        elif val < 25000:       # Tier 3: $10k–$25k
-            self.position_size_pct = 0.15
-            self.max_positions = 12
-            self.min_volume_usd = 15_000_000
-        elif val < 50000:       # Tier 4: $25k–$50k
-            self.position_size_pct = 0.08
-            self.max_positions = 15
-            self.min_volume_usd = 25_000_000
-        else:                   # Tier 5: > $50k
-            self.position_size_pct = 0.05
-            self.max_positions = 20
-            self.min_volume_usd = 40_000_000
-        self.base_max_positions = self.max_positions
 
     def _annualized_vol(self, crypto):
         if crypto is None:
@@ -940,11 +914,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             # Floor at min_notional to support small accounts
             val = max(val, self.min_notional)
 
-            # Whale cap: 5% of recent 1-min dollar volume (mean of last 5 bars)
+            # Cap position size at 25% of recent 1-minute dollar volume to avoid capacity issues while maintaining edge
             dv_bars = list(crypto['dollar_volume'])
             if len(dv_bars) >= 3:
-                recent_1m_dv = float(np.mean(dv_bars[-min(len(dv_bars), 5):]))
-                val = min(val, recent_1m_dv * 0.05)  # 5% of 1-min avg dollar volume
+                whale_window = min(len(dv_bars), 60)
+                whale_cap = sum(dv_bars[-whale_window:]) * 0.25
+                val = min(val, whale_cap)
 
             # Absolute Hard Cap on position size
             val = min(val, self.max_position_usd)
