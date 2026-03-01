@@ -11,11 +11,7 @@ from QuantConnect.Securities import CashAmount
 
 
 class MakerTakerFeeModel(FeeModel):
-    """Custom Fee Model: 0.25% Maker (Limit), 0.40% Taker (Market).
-    Note: assumes all Limit orders rest in the book as maker orders. Aggressive
-    limit orders that cross the spread will be charged the taker rate by the exchange
-    at settlement, but this model applies the maker rate as an approximation for
-    backtesting purposes."""
+
     def GetOrderFee(self, parameters):
         order = parameters.Order
         fee_pct = 0.0025 if order.Type == OrderType.Limit else 0.0040
@@ -24,21 +20,18 @@ class MakerTakerFeeModel(FeeModel):
 
 
 class SimplifiedCryptoStrategy(QCAlgorithm):
-    """
-    Micro-Scalping System - v7.1.0
-    5-signal micro-scalp engine, regime-adaptive, bull/sideways/bear-aware.
-    """
+
 
     def Initialize(self):
         self.SetStartDate(2024, 1, 1)
-        self.SetCash(19)
+        self.SetCash(100)
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
-        # === Entry thresholds (scalp score 0-1) ===
+
         self.entry_threshold = 0.40   # Machine Gun: fires more frequently
         self.high_conviction_threshold = 0.60  # Machine Gun: high-conviction threshold
 
-        # === Exit parameters (aggressive profit-taking) ===
+
         self.quick_take_profit = self._get_param("quick_take_profit", 0.080)  # 8.0% base TP
         self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.025)  # 2.5% base SL
         self.atr_tp_mult  = self._get_param("atr_tp_mult",  4.0)   # ATR × 4.0 for TP
@@ -51,14 +44,14 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.extended_time_stop_pnl_max = self._get_param("extended_time_stop_pnl_max", 0.015) # +1.5% ceiling
         self.stale_position_hours       = self._get_param("stale_position_hours",       6.0)   # unconditional exit after 6h
 
-        # Keep legacy names used elsewhere
+
         self.trailing_activation = self.trail_activation
         self.trailing_stop_pct   = self.trail_stop_pct
         self.base_stop_loss      = self.tight_stop_loss
         self.base_take_profit    = self.quick_take_profit
         self.atr_trail_mult      = 2.0
 
-        # === Position sizing (aggressive compounding) ===
+
         self.position_size_pct  = 0.45   # Machine Gun: 45% per trade – capitalise on 68–74% win rate
         self.base_max_positions = 6
         self.max_positions      = 6
@@ -69,26 +62,26 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         # 50% buffer ensures post-fee qty stays above MinimumOrderSize.
         self.min_notional_fee_buffer = 1.5
 
-        # === Volatility / risk targets (kept for ATR sizing) ===
+
         self.target_position_ann_vol = self._get_param("target_position_ann_vol", 0.35)
         self.portfolio_vol_cap       = self._get_param("portfolio_vol_cap", 0.80)
         self.min_asset_vol_floor     = 0.05
 
-        # === Indicator periods (optimised for 1-minute scalping) ===
+
         self.ultra_short_period = 3
         self.short_period       = 6
         self.medium_period      = 12   # was 24
         self.lookback           = 48
         self.sqrt_annualization = np.sqrt(60 * 24 * 365)  # minute-resolution annualisation
 
-        # === Liquidity filters ===
+
         self.max_spread_pct         = 0.005   # 0.5% – tight spread required
         self.spread_median_window   = 12
         self.spread_widen_mult      = 2.5
-        self.min_dollar_volume_usd  = 50000   # $50k/hour minimum (checked via 3h avg in execute)
+        self.min_dollar_volume_usd  = 25000   # $25k/hour minimum (checked via 3h avg in execute)
         self.min_volume_usd         = 10000000  # $10M minimum VolumeInUsd for universe filter
 
-        # === Trade frequency & timing ===
+
         self.skip_hours_utc         = []      # 24/7 trading – no skip hours
         self.max_daily_trades       = 24      # increased to allow more opportunities
         self.daily_trade_count      = 0
@@ -97,13 +90,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.cancel_cooldown_minutes = 1
         self.max_symbol_trades_per_day = 4    # increased from 2 to allow more per-symbol trades
 
-        # === Fees & slippage ===
+
         self.expected_round_trip_fees = 0.0050   # 0.50% min (maker+maker)
         self.fee_slippage_buffer      = 0.001
-        self.min_expected_profit_pct  = 0.015    # 1.5% minimum net profit above fees+slippage
-        self.adx_min_period           = 14       # ADX indicator period
+        self.min_expected_profit_pct  = 0.010    # 1.0% minimum net profit above fees+slippage
+        self.adx_min_period           = 10       # ADX indicator period
 
-        # === Order management ===
+
         self.stale_order_timeout_seconds      = 30    # 30s limit-entry timeout
         self.live_stale_order_timeout_seconds = 60
         self.max_concurrent_open_orders       = 2
@@ -117,7 +110,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.retry_pending_cooldown_seconds     = 60
         self.rate_limit_cooldown_minutes        = 10
 
-        # === Risk management ===
+
         self.max_drawdown_limit    = 0.25   # 25% – pause 6h
         self.cooldown_hours        = 6
         self.consecutive_losses    = 0
@@ -125,7 +118,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._consecutive_loss_halve_remaining = 0
         self.circuit_breaker_expiry = None  # halt new entries for 12h after 3 consecutive losses
 
-        # === State ===
+
         self._positions_synced    = False
         self._session_blacklist   = set()
         self._max_session_blacklist_size = 100
@@ -170,13 +163,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._bad_symbol_counts = {}
         self._recent_tickets  = deque(maxlen=25)
 
-        # Rolling performance tracking (for Kelly)
+
         self._rolling_wins      = deque(maxlen=50)
         self._rolling_win_sizes = deque(maxlen=50)
         self._rolling_loss_sizes = deque(maxlen=50)
         self._last_live_trade_time = None
 
-        # Market context
+
         self.btc_symbol       = None
         self.btc_returns      = deque(maxlen=72)
         self.btc_prices       = deque(maxlen=72)
