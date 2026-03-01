@@ -28,7 +28,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.SetCash("USDT", 1000)
         self.SetCash("USD", 0)        # Wipe out the USD so ONLY USDT exists
 
-        # Force Margin account so short selling is legally permitted
+        # Force Margin account so we can use leverage
         self.SetBrokerageModel(BrokerageName.Bybit, AccountType.Margin)
 
         self.entry_threshold = 0.60
@@ -215,7 +215,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         """Sets slippage, fee model, AND MARGIN CAPABILITY."""
         security.SetSlippageModel(RealisticCryptoSlippage())
         security.SetFeeModel(MakerTakerFeeModel())
-        # CRITICAL: Force the security to use a margin model so shorting is legally allowed
+        # Add 3x leverage capability
         security.SetBuyingPowerModel(SecurityMarginModel(3.0))
 
     def _get_param(self, name, default):
