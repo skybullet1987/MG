@@ -370,7 +370,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             sync_existing_positions(self)
             self._positions_synced = True
             self._first_post_warmup = False
-                if self.kraken_status == "unknown":
+            if self.kraken_status == "unknown":
                 self.kraken_status = "online"
                 self.Debug("Fallback: kraken_status set to online after warmup")
             ready_count = sum(1 for c in self.crypto_data.values() if self._is_ready(c))
@@ -663,7 +663,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self._log_skip(f"drawdown {dd:.1%} > limit")
             return
         if self.consecutive_losses >= self.max_consecutive_losses:
-                self.drawdown_cooldown = 3
+            self.drawdown_cooldown = 3
             self._consecutive_loss_halve_remaining = 3
             self.consecutive_losses = 0
             self._log_skip("consecutive loss cooldown (5 losses)")
@@ -720,7 +720,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             composite_score = self._calculate_composite_score(factor_scores, crypto)
             net_score = self._apply_fee_adjustment(composite_score)
 
-                crypto['recent_net_scores'].append(net_score)
+            crypto['recent_net_scores'].append(net_score)
 
             adx_ind = crypto.get('adx')
             threshold_sym = threshold_now
