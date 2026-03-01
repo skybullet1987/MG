@@ -56,7 +56,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.base_take_profit    = self.quick_take_profit
         self.atr_trail_mult      = 2.0
 
-        self.position_size_pct  = 0.50
+        self.position_size_pct  = 0.70
         self.base_max_positions = 6
         self.max_positions      = 6
         self.min_notional       = 5.5
@@ -697,9 +697,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if self.circuit_breaker_expiry is not None and self.Time < self.circuit_breaker_expiry:
             self._log_skip("circuit breaker active")
             return
-        dynamic_max_pos = min(4, max(self.base_max_positions, int(val // self.max_position_usd) + 1))
         pos_count = get_actual_position_count(self)
-        if pos_count >= dynamic_max_pos:
+        if pos_count >= self.max_positions:
             self._log_skip("at max positions")
             return
         if len(self.Transactions.GetOpenOrders()) >= self.max_concurrent_open_orders:
@@ -769,13 +768,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             return
         scores.sort(key=lambda x: x['net_score'], reverse=True)
         self._last_skip_reason = None
-        self._execute_trades(scores, threshold_now, dynamic_max_pos)
+        self._execute_trades(scores, threshold_now)
 
     def _get_open_buy_orders_value(self):
         """Calculate total value reserved by open buy orders."""
         return get_open_buy_orders_value(self)
 
-    def _execute_trades(self, candidates, threshold_now, dynamic_max_pos):
+    def _execute_trades(self, candidates, threshold_now):
         if not self._positions_synced:
             return
         if self.LiveMode and self.kraken_status in ("maintenance", "cancel_only"):
@@ -817,7 +816,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         for cand in candidates:
             if self.daily_trade_count >= self._get_max_daily_trades():
                 break
-            if get_actual_position_count(self) >= dynamic_max_pos:
+            if get_actual_position_count(self) >= self.max_positions:
                 break
             sym = cand['symbol']
             net_score = cand.get('net_score', 0.5)
@@ -913,13 +912,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
             # Floor at min_notional to support small accounts
             val = max(val, self.min_notional)
-
-            # Cap position size at 25% of recent 1-minute dollar volume to avoid capacity issues while maintaining edge
-            dv_bars = list(crypto['dollar_volume'])
-            if len(dv_bars) >= 3:
-                whale_window = min(len(dv_bars), 60)
-                whale_cap = sum(dv_bars[-whale_window:]) * 0.25
-                val = min(val, whale_cap)
 
             # Absolute Hard Cap on position size
             val = min(val, self.max_position_usd)
