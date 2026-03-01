@@ -457,7 +457,6 @@ class MicroScalpEngine:
         Conservative position sizing prioritising capital preservation.
 
         Returns 70–90% of available capital depending on conviction.
-        Bear regime: base reduced by 30%.
         """
         if score >= 0.80:
             # 4+ signals firing – high conviction
@@ -470,12 +469,6 @@ class MicroScalpEngine:
             size = 0.70
         else:
             size = 0.50
-
-        if self.algo.market_regime == "bear":
-            size *= 0.50  # Bear: 50% of standard allocation
-        elif self.algo.market_regime == "sideways":
-            size *= 1.00  # Sideways: 100% of standard allocation
-        # Bull market: 100% of standard allocation (no adjustment needed)
 
         kelly = self.algo._kelly_fraction()
         return size * kelly
