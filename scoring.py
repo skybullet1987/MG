@@ -27,12 +27,12 @@ class MicroScalpEngine:
     """
 
     # Tunable signal thresholds (easy to adjust for backtesting)
-    OBI_STRONG_THRESHOLD    = 0.50   # strong bid-side imbalance
-    OBI_PARTIAL_THRESHOLD   = 0.25   # partial bid-side imbalance
-    VOL_SURGE_STRONG        = 3.0    # 3× average volume = strong ignition
-    VOL_SURGE_PARTIAL       = 2.0    # 2× volume = moderate spike
-    ADX_STRONG_THRESHOLD    = 20     # strong directional trend
-    ADX_MODERATE_THRESHOLD  = 15     # moderate directional trend
+    OBI_STRONG_THRESHOLD    = 0.40   # strong bid-side imbalance
+    OBI_PARTIAL_THRESHOLD   = 0.20   # partial bid-side imbalance
+    VOL_SURGE_STRONG        = 2.5    # 3× average volume = strong ignition
+    VOL_SURGE_PARTIAL       = 1.5    # 2× volume = moderate spike
+    ADX_STRONG_THRESHOLD    = 18     # strong directional trend
+    ADX_MODERATE_THRESHOLD  = 13     # moderate directional trend
     VWAP_BUFFER             = 1.0005  # 0.05% above VWAP for confirmed reclaim
     # Ranging-market mean reversion thresholds (used when ADX < ADX_MODERATE_THRESHOLD)
     RSI_OVERSOLD_THRESHOLD        = 45   # RSI < 45 → oversold, mean reversion buy signal
