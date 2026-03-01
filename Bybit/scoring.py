@@ -47,6 +47,9 @@ class MicroScalpEngine:
     RSI_OVERSOLD_THRESHOLD        = 45   # RSI < 45 → oversold, mean reversion buy signal
     RSI_MILDLY_OVERSOLD_THRESHOLD = 50   # RSI < 50 → mildly oversold, partial credit
     BB_NEAR_LOWER_PCT             = 0.03  # within 3% of lower Bollinger Band = near support
+    # Microstructure constraint: max score when neither vol_ignition nor OBI is present,
+    # keeping it just below the 0.60 entry threshold to prevent low-quality entries.
+    MICROSTRUCTURE_CONSTRAINT_MAX_SCORE = 0.59
 
     def __init__(self, algorithm):
         self.algo = algorithm
@@ -270,6 +273,12 @@ class MicroScalpEngine:
             self.algo.Debug(f"MicroScalpEngine.calculate_scalp_score error: {e}")
 
         score = sum(components.values())
+
+        # MICROSTRUCTURE CONSTRAINT: If no volume ignition and no orderbook imbalance,
+        # cap the score at 0.59 so it cannot trigger an entry.
+        if components.get('vol_ignition', 0) == 0 and components.get('obi', 0) == 0:
+            score = min(score, self.MICROSTRUCTURE_CONSTRAINT_MAX_SCORE)
+
         return min(score, 1.0), components
 
     # ------------------------------------------------------------------
@@ -469,6 +478,12 @@ class MicroScalpEngine:
             self.algo.Debug(f"MicroScalpEngine.calculate_short_score error: {e}")
 
         score = sum(components.values())
+
+        # MICROSTRUCTURE CONSTRAINT: If no volume ignition and no orderbook imbalance,
+        # cap the score at 0.59 so it cannot trigger an entry.
+        if components.get('vol_ignition', 0) == 0 and components.get('obi', 0) == 0:
+            score = min(score, self.MICROSTRUCTURE_CONSTRAINT_MAX_SCORE)
+
         return min(score, 1.0), components
 
     # ------------------------------------------------------------------
@@ -483,15 +498,15 @@ class MicroScalpEngine:
         """
         if score >= 0.80:
             # 4+ signals firing – high conviction
-            size = 0.90
+            size = 0.40  # Reduced from 0.90
         elif score >= self.algo.high_conviction_threshold:
             # 3+ signals: good conviction
-            size = 0.80
+            size = 0.30  # Reduced from 0.80
         elif score >= threshold:
             # Entry threshold met: moderate sizing
-            size = 0.70
+            size = 0.20  # Reduced from 0.70
         else:
-            size = 0.50
+            size = 0.10  # Reduced from 0.50
 
         if self.algo.market_regime == "bear":
             size *= 0.50  # Bear: 50% of standard allocation

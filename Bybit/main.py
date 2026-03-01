@@ -138,7 +138,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.partial_tp_threshold   = 0.025
         self.stagnation_minutes     = 45
         self.stagnation_pnl_threshold = 0.005
-        self.rsi_peaked_above_50 = {}
         self.trade_count      = 0
         self._pending_orders  = {}
         self._cancel_cooldowns = {}
@@ -569,8 +568,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             components['_short_score'] = 0.0
             return components
 
-        # FALLBACK: If no valid long, check for a valid short
-        elif short_score >= threshold:
+        # FALLBACK: If no valid long, check for a valid short ONLY if regime is bear
+        elif short_score >= threshold and self.market_regime == "bear":
             components = short_components.copy()
             components['_scalp_score'] = short_score
             components['_direction'] = -1
@@ -1073,13 +1072,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         trailing_activation = self.trail_activation
         trailing_stop_pct   = self.trail_stop_pct
 
-        if crypto and crypto['rsi'].IsReady:
-            rsi_now = crypto['rsi'].Current.Value
-            if not is_short and rsi_now > 70:
-                self.rsi_peaked_above_50[symbol] = True
-            elif is_short and rsi_now < 30:
-                self.rsi_peaked_above_50[symbol] = True
-
         if (not is_short
                 and not self._partial_tp_taken.get(symbol, False)
                 and pnl >= self.partial_tp_threshold):
@@ -1125,15 +1117,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     if crypto and crypto['trail_stop'] is not None and price <= crypto['trail_stop']:
                         tag = "ATR Trail"
 
-            if not tag and crypto and crypto['rsi'].IsReady:
-                rsi_now = crypto['rsi'].Current.Value
-                if not is_short:
-                    if self.rsi_peaked_above_50.get(symbol, False) and rsi_now < 40:
-                        tag = "RSI Momentum Exit"
-                else:
-                    if self.rsi_peaked_above_50.get(symbol, False) and rsi_now > 60:
-                        tag = "RSI Momentum Exit"
-
             if not tag and hours >= 2.0 and crypto and len(crypto['volume']) >= 2:
                 entry_vol = self.entry_volumes.get(symbol, 0)
                 if entry_vol > 0:
@@ -1159,7 +1142,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             sold = smart_liquidate(self, symbol, tag)
             if sold:
                 self._exit_cooldowns[symbol] = self.Time + timedelta(hours=self.exit_cooldown_hours)
-                self.rsi_peaked_above_50.pop(symbol, None)
                 self.entry_volumes.pop(symbol, None)
                 dir_label = "SHORT" if is_short else "LONG"
                 self.Debug(f"{tag} ({dir_label}): {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.1f}h")
@@ -1167,7 +1149,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
                 self.Debug(f"⚠️ EXIT FAILED ({tag}): {symbol.Value} | PnL:{pnl:+.2%}")
                 cleanup_position(self, symbol)
-                self.rsi_peaked_above_50.pop(symbol, None)
                 self.entry_volumes.pop(symbol, None)
 
     def _check_cash_mode(self):
@@ -1267,7 +1248,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                         crypto = self.crypto_data.get(symbol)
                         if crypto and len(crypto['volume']) >= 1:
                             self.entry_volumes[symbol] = crypto['volume'][-1]
-                        self.rsi_peaked_above_50.pop(symbol, None)
                 else:
                     if symbol in self.entry_prices and current_direction != -1:
                         if symbol in self._partial_sell_symbols:
@@ -1309,7 +1289,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                         crypto = self.crypto_data.get(symbol)
                         if crypto and len(crypto['volume']) >= 1:
                             self.entry_volumes[symbol] = crypto['volume'][-1]
-                        self.rsi_peaked_above_50.pop(symbol, None)
                 slip_log(self, symbol, event.Direction, event.FillPrice)
             elif event.Status == OrderStatus.Canceled:
                 self._pending_orders.pop(symbol, None)
