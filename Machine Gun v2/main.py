@@ -59,7 +59,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.atr_trail_mult      = 2.0
 
         # === Position sizing (aggressive compounding) ===
-        self.position_size_pct  = 0.15   # Machine Gun: 15% per trade for small capital
+        self.position_size_pct  = 0.45   # Machine Gun: 45% per trade – capitalise on 68–74% win rate
         self.base_max_positions = 6
         self.max_positions      = 6
         self.min_notional       = 5.5
@@ -149,10 +149,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._partial_tp_taken      = {}       # True after 50% sold at +2.5%
         self._breakeven_stops       = {}       # per-symbol breakeven SL price after partial TP
         self._partial_sell_symbols  = set()    # symbols with in-flight partial TP sell orders
+        self._choppy_regime_entries = {}       # True when position entered under ADX < 25 (choppy)
         self.partial_tp_threshold   = 0.025    # +2.5% triggers partial scale-out
         self.stagnation_minutes     = 45       # stagnation exit: trade must be > 45 min old
         self.stagnation_pnl_threshold = 0.005  # stagnation exit: pnl must be >= 0.5%
-        self.rsi_peaked_above_50 = {}  # for RSI momentum exit
+        self.rsi_peaked_overbought = {}  # True once RSI > 85; triggers exit when RSI drops back below 75
         self.trade_count      = 0
         self._pending_orders  = {}
         self._cancel_cooldowns = {}
@@ -994,10 +995,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 self.Debug(f"Warning: could not check min_order_size for {sym.Value}: {e}")
 
             try:
-                if self.LiveMode:
-                    ticket = place_limit_or_market(self, sym, qty, timeout_seconds=30, tag="Entry")
-                else:
-                    ticket = self.MarketOrder(sym, qty, tag="Entry")
+                ticket = place_limit_or_market(self, sym, qty, timeout_seconds=30, tag="Entry")
                 if ticket is not None:
                     self._recent_tickets.append(ticket)
                     components = cand.get('factors', {})
@@ -1010,6 +1008,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     success_count += 1
                     self.trade_count += 1
                     crypto['trade_count_today'] = crypto.get('trade_count_today', 0) + 1
+                    # Record ADX regime at entry for tighter TP in choppy markets
+                    adx_ind = crypto.get('adx')
+                    is_choppy = (adx_ind is not None and adx_ind.IsReady
+                                 and adx_ind.Current.Value < 25)
+                    self._choppy_regime_entries[sym] = is_choppy
                     if self._consecutive_loss_halve_remaining > 0:
                         self._consecutive_loss_halve_remaining -= 1
                     if self.LiveMode:
@@ -1103,14 +1106,18 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if tp < sl * 1.5:
             tp = sl * 1.5
 
+        # Tighten take-profit when this position was entered in a choppy (ADX < 25) regime
+        if self._choppy_regime_entries.get(symbol, False):
+            tp = tp * 0.65   # 35% tighter TP – trend continuation unlikely in choppy market
+
         trailing_activation = self.trail_activation
         trailing_stop_pct   = self.trail_stop_pct
 
 
         if crypto and crypto['rsi'].IsReady:
             rsi_now = crypto['rsi'].Current.Value
-            if rsi_now > 50:
-                self.rsi_peaked_above_50[symbol] = True
+            if rsi_now > 85:
+                self.rsi_peaked_overbought[symbol] = True
 
 
         if (not self._partial_tp_taken.get(symbol, False)
@@ -1159,7 +1166,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
             if not tag and crypto and crypto['rsi'].IsReady:
                 rsi_now = crypto['rsi'].Current.Value
-                if self.rsi_peaked_above_50.get(symbol, False) and rsi_now < 50:
+                if self.rsi_peaked_overbought.get(symbol, False) and rsi_now < 75:
                     tag = "RSI Momentum Exit"
 
 
@@ -1192,15 +1199,17 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if sold:
                 self._exit_cooldowns[symbol] = self.Time + timedelta(hours=self.exit_cooldown_hours)
 
-                self.rsi_peaked_above_50.pop(symbol, None)
+                self.rsi_peaked_overbought.pop(symbol, None)
                 self.entry_volumes.pop(symbol, None)
+                self._choppy_regime_entries.pop(symbol, None)
                 self.Debug(f"{tag}: {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.1f}h")
             else:
 
                 self.Debug(f"⚠️ EXIT FAILED ({tag}): {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.1f}h -- position unsellable, cleaning up")
                 cleanup_position(self, symbol)
-                self.rsi_peaked_above_50.pop(symbol, None)
+                self.rsi_peaked_overbought.pop(symbol, None)
                 self.entry_volumes.pop(symbol, None)
+                self._choppy_regime_entries.pop(symbol, None)
 
     def OnOrderEvent(self, event):
         try:
@@ -1252,7 +1261,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     crypto = self.crypto_data.get(symbol)
                     if crypto and len(crypto['volume']) >= 1:
                         self.entry_volumes[symbol] = crypto['volume'][-1]
-                    self.rsi_peaked_above_50.pop(symbol, None)
+                    self.rsi_peaked_overbought.pop(symbol, None)
                 else:
 
                     if symbol in self._partial_sell_symbols:

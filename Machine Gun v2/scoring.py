@@ -99,14 +99,21 @@ class MicroScalpEngine:
                     vol_baseline = float(np.mean(vol_long))
                 else:
                     vol_baseline = float(np.mean(volumes[-20:]))
+                # ADX regime filter: lower thresholds in choppy markets (ADX < 25)
+                # to fire more trades when trend continuation is unlikely.
+                adx_indicator = crypto.get('adx')
+                is_choppy = (adx_indicator is not None and adx_indicator.IsReady
+                             and adx_indicator.Current.Value < 25)
+                vol_strong  = 1.8 if is_choppy else self.VOL_SURGE_STRONG
+                vol_partial = 1.2 if is_choppy else self.VOL_SURGE_PARTIAL
                 if vol_baseline > 0:
                     ratio = current_vol / vol_baseline
-                    if ratio >= self.VOL_SURGE_STRONG:
+                    if ratio >= vol_strong:
                         components['vol_ignition'] = 0.20
                         if not self.algo.IsWarmingUp:
                             self.algo.Debug(
-                                f"Volume Ignition: vol={current_vol:.2f} baseline={vol_baseline:.2f} ratio={ratio:.1f}x")
-                    elif ratio >= self.VOL_SURGE_PARTIAL:
+                                f"Volume Ignition: vol={current_vol:.2f} baseline={vol_baseline:.2f} ratio={ratio:.1f}x choppy={is_choppy}")
+                    elif ratio >= vol_partial:
                         # Partial credit for a meaningful volume spike
                         components['vol_ignition'] = 0.10
 

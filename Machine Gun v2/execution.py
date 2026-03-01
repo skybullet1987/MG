@@ -282,13 +282,21 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
                         track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
                         return True
                 else:
-                    # Spread is acceptable, use market order
-                    ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
+                    # Spread is acceptable – use limit order to capture maker fee
+                    exit_price = algo.Securities[symbol].Price
+                    try:
+                        ticket = algo.LimitOrder(symbol, safe_qty * direction_mult, exit_price, tag=tag)
+                    except Exception:
+                        ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
                     track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
                     return True
             else:
-                # Spread unknown, use market order
-                ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
+                # Spread unknown – use limit order at last price to capture maker fee
+                exit_price = algo.Securities[symbol].Price
+                try:
+                    ticket = algo.LimitOrder(symbol, safe_qty * direction_mult, exit_price, tag=tag)
+                except Exception:
+                    ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
                 track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
                 return True
         else:
@@ -331,7 +339,11 @@ def partial_smart_sell(algo, symbol, fraction, tag="Partial TP"):
     if hasattr(algo, '_partial_sell_symbols'):
         algo._partial_sell_symbols.add(symbol)
     direction_mult = -1 if holding_qty > 0 else 1
-    ticket = algo.MarketOrder(symbol, sell_qty * direction_mult, tag=tag)
+    # Use limit order at current price to capture maker fee (0.25% vs 0.40% taker)
+    try:
+        ticket = algo.LimitOrder(symbol, sell_qty * direction_mult, price, tag=tag)
+    except Exception:
+        ticket = algo.MarketOrder(symbol, sell_qty * direction_mult, tag=tag)
     if ticket is not None:
         algo.Debug(f"PARTIAL SELL: {symbol.Value} | frac={fraction:.0%} qty={sell_qty:.6f} of {abs(holding_qty):.6f}")
     return ticket is not None
@@ -742,28 +754,24 @@ def get_slippage_penalty(algo, symbol):
 def place_limit_or_market(algo, symbol, quantity, timeout_seconds=30, tag="Entry"):
     """
     Place a limit order at mid-price with fallback to market order after timeout.
-    In backtest mode, use market orders directly.
+    Uses LimitOrder in both live and backtest mode to capture Maker fees (0.25%).
     Returns the ticket from the order placement.
     """
-    # In backtest mode, use market orders directly
-    if not algo.LiveMode:
-        return algo.MarketOrder(symbol, quantity, tag=tag)
-    
     try:
         sec = algo.Securities[symbol]
         bid = sec.BidPrice
         ask = sec.AskPrice
-        
-        # If bid/ask unavailable, use market order immediately
-        if bid <= 0 or ask <= 0:
-            algo.Debug(f"BID/ASK unavailable for {symbol.Value}, using market order")
-            return algo.MarketOrder(symbol, quantity, tag=tag)
-        
-        # Place limit order at or slightly above bid (Maker order for 0.25% fee)
-        # Placing just above bid keeps us in the order book as a maker while
-        # improving fill odds slightly vs. the raw bid.
-        limit_price = bid * 1.0005  # 0.05% above bid – still below mid, still maker
-        limit_price = min(limit_price, ask)  # never cross the spread
+
+        if bid > 0 and ask > 0:
+            # Place limit order just above best bid – still maker, improves fill odds
+            limit_price = bid * 1.0005  # 0.05% above bid – still below mid, still maker
+            limit_price = min(limit_price, ask)  # never cross the spread
+        else:
+            # No bid/ask data: use last price as limit price (fills immediately in backtest)
+            limit_price = sec.Price
+            if limit_price <= 0:
+                algo.Debug(f"Price unavailable for {symbol.Value}, using market order")
+                return algo.MarketOrder(symbol, quantity, tag=tag)
 
         # Place maker limit order
         limit_ticket = algo.LimitOrder(symbol, quantity, limit_price, tag=tag)
@@ -779,9 +787,10 @@ def place_limit_or_market(algo, symbol, quantity, timeout_seconds=30, tag="Entry
                 'intent': 'entry'
             }
 
-        algo.Debug(f"MAKER LIMIT: {symbol.Value} | qty={quantity} | bid=${bid:.4f} | limit=${limit_price:.4f} | timeout={timeout_seconds}s")
+        if algo.LiveMode:
+            algo.Debug(f"MAKER LIMIT: {symbol.Value} | qty={quantity} | bid=${bid:.4f} | limit=${limit_price:.4f} | timeout={timeout_seconds}s")
         return limit_ticket
-        
+
     except Exception as e:
         algo.Debug(f"Error placing limit order for {symbol.Value}: {e}, falling back to market")
         return algo.MarketOrder(symbol, quantity, tag=tag)
