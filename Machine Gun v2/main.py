@@ -63,7 +63,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.base_max_positions = 6
         self.max_positions      = 6
         self.min_notional       = 5.5
-        self.max_position_usd   = self._get_param("max_position_usd", 1500.0)
+        self.max_position_usd   = self._get_param("max_position_usd", 5000.0)
         self.min_price_usd      = 0.005
         self.cash_reserve_pct   = 0.0    # no dead-money reserve at $20
         # 50% buffer ensures post-fee qty stays above MinimumOrderSize.
@@ -87,6 +87,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.spread_widen_mult      = 2.5
         self.min_dollar_volume_usd  = 25000   # $25k/hour minimum (checked via 3h avg in execute)
         self.min_volume_usd         = 10000000  # $10M minimum VolumeInUsd for universe filter
+        self.adx_choppy_threshold   = 20      # ADX below this is considered a choppy/sideways market
+        self.adx_choppy_thresh_scale = 0.80   # scale entry threshold by this in choppy markets
+        self.rvol_min_multiplier    = 2.0     # require current volume >= 2x 20-period average
 
         # === Trade frequency & timing ===
         self.skip_hours_utc         = []      # 24/7 trading – no skip hours
@@ -178,6 +181,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
         # Market context
         self.btc_symbol       = None
+        self.btc_sma_50d      = None
         self.btc_returns      = deque(maxlen=72)
         self.btc_prices       = deque(maxlen=72)
         self.btc_volatility   = deque(maxlen=72)
@@ -208,6 +212,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         try:
             btc = self.AddCrypto("BTCUSD", Resolution.Minute, Market.Kraken)
             self.btc_symbol = btc.Symbol
+            self.btc_sma_50d = self.SMA(self.btc_symbol, 50, Resolution.Daily)
         except Exception as e:
             self.Debug(f"Warning: Could not add BTC - {e}")
 
@@ -781,7 +786,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             # Store for diagnostic purposes
             crypto['recent_net_scores'].append(net_score)
 
-            if net_score >= threshold_now:
+            # ADX regime filter: lower threshold in choppy (low-ADX) markets
+            adx_ind = crypto.get('adx')
+            threshold_sym = threshold_now
+            if adx_ind is not None and adx_ind.IsReady and adx_ind.Current.Value < self.adx_choppy_threshold:
+                threshold_sym = threshold_now * self.adx_choppy_thresh_scale
+
+            if net_score >= threshold_sym:
                 count_above_thresh += 1
                 scores.append({
                     'symbol': symbol,
@@ -848,6 +859,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         reject_min_qty_too_large = 0
         reject_dollar_volume = 0
         reject_notional = 0
+        reject_rvol = 0
         success_count = 0
 
         for cand in candidates:
@@ -929,9 +941,22 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     reject_dollar_volume += 1
                     continue
 
+            # RVOL entry filter: current volume must be >= rvol_min_multiplier x 20-period MA
+            if len(crypto['volume']) >= 20:
+                vol_ma_20 = np.mean(list(crypto['volume'])[-20:])
+                if vol_ma_20 > 0 and crypto['volume'][-1] < vol_ma_20 * self.rvol_min_multiplier:
+                    reject_rvol += 1
+                    continue
+
             # Position sizing: 70% base, Kelly-adjusted
             vol = self._annualized_vol(crypto)
             size = self._calculate_position_size(net_score, threshold_now, vol)
+
+            # BTC SMA killswitch: halve size when BTC is in a bear market (below 50d SMA)
+            if (self.btc_symbol is not None and self.btc_sma_50d is not None
+                    and self.btc_sma_50d.IsReady
+                    and self.Securities[self.btc_symbol].Price < self.btc_sma_50d.Current.Value):
+                size *= 0.50
 
             # Halve size if in consecutive-loss recovery mode
             if self._consecutive_loss_halve_remaining > 0:
@@ -956,6 +981,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
             # Absolute Hard Cap on position size
             val = min(val, self.max_position_usd)
+
+            # ADV-based position cap: limit to 1% of Average Daily Volume
+            if len(crypto['volume_long']) > 0:
+                adv_usd = sum(crypto['volume_long']) * price
+                val = min(val, adv_usd * 0.01)
 
             qty = round_quantity(self, sym, val / price)
             if qty < min_qty:
