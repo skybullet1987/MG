@@ -543,22 +543,26 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def _update_liquidity_tiers(self):
         """Scale position size, max positions, and min universe volume with portfolio equity."""
         val = self.Portfolio.TotalPortfolioValue
-        if val < 1000:          # Tier 1: < $1k
+        if val < 2000:          # Tier 1: < $2k
             self.position_size_pct = 0.40
             self.max_positions = 6
             self.min_volume_usd = 5_000_000
-        elif val < 10000:       # Tier 2: $1k–$10k
-            self.position_size_pct = 0.20
-            self.max_positions = 10
+        elif val < 10000:       # Tier 2: $2k–$10k
+            self.position_size_pct = 0.25
+            self.max_positions = 8
             self.min_volume_usd = 10_000_000
-        elif val < 50000:       # Tier 3: $10k–$50k
-            self.position_size_pct = 0.10
+        elif val < 25000:       # Tier 3: $10k–$25k
+            self.position_size_pct = 0.15
+            self.max_positions = 12
+            self.min_volume_usd = 15_000_000
+        elif val < 50000:       # Tier 4: $25k–$50k
+            self.position_size_pct = 0.08
             self.max_positions = 15
             self.min_volume_usd = 25_000_000
-        else:                   # Tier 4: > $50k
+        else:                   # Tier 5: > $50k
             self.position_size_pct = 0.05
             self.max_positions = 20
-            self.min_volume_usd = 50_000_000
+            self.min_volume_usd = 40_000_000
         self.base_max_positions = self.max_positions
 
     def _annualized_vol(self, crypto):
