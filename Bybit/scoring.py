@@ -496,17 +496,17 @@ class MicroScalpEngine:
         Returns 70–90% of available capital depending on conviction.
         Bear regime: base reduced by 30%.
         """
+        # With 3x leverage, we have 300% total buying power.
+        # We cap max size at 0.50 (50% of cash balance, which is 1/6th of total margin power)
+        # to ensure we never get liquidated by 1-minute wicks.
         if score >= 0.80:
-            # 4+ signals firing – high conviction
-            size = 0.40  # Reduced from 0.90
+            size = 0.50
         elif score >= self.algo.high_conviction_threshold:
-            # 3+ signals: good conviction
-            size = 0.30  # Reduced from 0.80
+            size = 0.40
         elif score >= threshold:
-            # Entry threshold met: moderate sizing
-            size = 0.20  # Reduced from 0.70
+            size = 0.30
         else:
-            size = 0.10  # Reduced from 0.50
+            size = 0.20
 
         if self.algo.market_regime == "bear":
             size *= 0.50  # Bear: 50% of standard allocation
