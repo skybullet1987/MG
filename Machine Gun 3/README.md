@@ -28,8 +28,24 @@ improvements on top:
 ### 1 – QuantConnect Cloud (recommended)
 
 1. Create a new **Algorithm** project.
-2. Upload all five files: `main.py`, `execution.py`, `scoring.py`, `alt_data.py`,
-   `config.py`.
+2. Upload **all** module files:
+
+   | File | Role |
+   |---|---|
+   | `main.py` | Thin entrypoint – `Initialize` + `CustomSecurityInitializer` |
+   | `app.py` | Bootstrap/wiring mixin (parameter loading, reconciliation, universe) |
+   | `data_layer.py` | Per-bar data ingestion and scoring pipeline |
+   | `orchestration.py` | `Rebalance` and `_execute_trades` entry logic |
+   | `exit_handler.py` | `CheckExits` and `_check_exit` exit logic |
+   | `reporting.py` | `OnOrderEvent`, `OnEndOfAlgorithm`, metrics, daily report |
+   | `config_loader.py` | Config validation helpers |
+   | `run_backtest.py` | Backtest flow documentation and helpers |
+   | `run_paper.py` | Paper/live-sim flow documentation and helpers |
+   | `execution.py` | Shared order-execution utilities |
+   | `scoring.py` | `MicroScalpEngine` signal calculations |
+   | `alt_data.py` | Alternative data helpers |
+   | `config.py` | All tunable parameters |
+
 3. Set the back-test date range and starting capital in `main.py`
    (`SetStartDate` / `SetCash`).
 4. Click **Backtest**.
@@ -46,7 +62,7 @@ pip install lean
 # Pull the project
 lean project-create mg3
 
-# Copy files into the project folder, then run
+# Copy ALL .py files into the project folder, then run
 lean backtest mg3
 ```
 
