@@ -10,10 +10,10 @@ from QuantConnect.Orders.Slippage import SlippageModel
 # endregion
 
 class MakerTakerFeeModel(FeeModel):
-    """Bybit: 0.1% Maker/Taker fee (spot margin)."""
+    """Bybit derivative fee tiers: 0.02% Maker (Limit), 0.05% Taker (Market)."""
     def GetOrderFee(self, parameters):
         order = parameters.Order
-        fee_pct = 0.001
+        fee_pct = 0.0002 if order.Type == OrderType.Limit else 0.0005
         trade_value = order.AbsoluteQuantity * parameters.Security.Price
         return OrderFee(CashAmount(trade_value * fee_pct, "USD"))
 
@@ -34,8 +34,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.entry_threshold = 0.60
         self.high_conviction_threshold = 0.80
 
-        self.quick_take_profit = self._get_param("quick_take_profit", 0.050)
-        self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.030)
+        self.quick_take_profit = self._get_param("quick_take_profit", 0.040)
+        self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.020)
         self.atr_tp_mult  = self._get_param("atr_tp_mult",  5.0)
         self.atr_sl_mult  = self._get_param("atr_sl_mult",  4.0)
         self.trail_activation  = self._get_param("trail_activation",  0.020)
@@ -74,8 +74,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.max_spread_pct         = 0.005
         self.spread_median_window   = 12
         self.spread_widen_mult      = 2.5
-        self.min_dollar_volume_usd  = 50000
-        self.min_volume_usd         = 10000000
+        self.min_dollar_volume_usd  = 5000
+        self.min_volume_usd         = 5000000
 
         self.skip_hours_utc         = []
         self.max_daily_trades       = 24
@@ -85,7 +85,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.cancel_cooldown_minutes = 1
         self.max_symbol_trades_per_day = 4
 
-        self.expected_round_trip_fees = 0.0020
+        self.expected_round_trip_fees = 0.0010
         self.fee_slippage_buffer      = 0.001
         self.min_expected_profit_pct  = 0.010
         self.adx_min_period           = 14
@@ -135,7 +135,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._partial_tp_taken      = {}
         self._breakeven_stops       = {}
         self._partial_sell_symbols  = set()
-        self.partial_tp_threshold   = 0.025
+        self.partial_tp_threshold   = 0.015
         self.stagnation_minutes     = 45
         self.stagnation_pnl_threshold = 0.005
         self.trade_count      = 0
@@ -553,27 +553,25 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         return max(0, min(1, (v - mn) / (mx - mn)))
 
     def _calculate_factor_scores(self, symbol, crypto):
-        """Evaluate both signals and prioritize Longs over Shorts."""
+        """Evaluate both signals organically; long_score → direction 1, short_score → direction -1."""
         long_score, long_components = self._scoring_engine.calculate_scalp_score(crypto)
         short_score, short_components = self._scoring_engine.calculate_short_score(crypto)
 
         threshold = self._get_threshold()
 
-        # MG FIRST: Always prioritize long setups if they meet the threshold
-        if long_score >= threshold:
+        if long_score >= threshold and long_score >= short_score:
             components = long_components.copy()
             components['_scalp_score'] = long_score
             components['_direction'] = 1
             components['_long_score'] = long_score
-            components['_short_score'] = 0.0
+            components['_short_score'] = short_score
             return components
 
-        # FALLBACK: If no valid long, check for a valid short ONLY if regime is bear
-        elif short_score >= threshold and self.market_regime == "bear":
+        if short_score >= threshold:
             components = short_components.copy()
             components['_scalp_score'] = short_score
             components['_direction'] = -1
-            components['_long_score'] = 0.0
+            components['_long_score'] = long_score
             components['_short_score'] = short_score
             return components
 
