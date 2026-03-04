@@ -285,8 +285,8 @@ class MicroScalpEngine:
     # Short scoring: bearish microstructure signals (mirror of long)
     # ------------------------------------------------------------------
     # Short-specific thresholds (aligned with Machine Gun v2 logic + inverted OBI)
-    OBI_SHORT_STRONG_THRESHOLD   = 0.70    # ask_size / total_size > 0.70 → strong ask pressure (equivalent to 0.40 spread)
-    OBI_SHORT_PARTIAL_THRESHOLD  = 0.60    # ask_size / total_size > 0.60 → partial ask pressure
+    OBI_SHORT_STRONG_THRESHOLD   = 0.75    # ask_size / total_size > 0.75 → strong ask pressure
+    OBI_SHORT_PARTIAL_THRESHOLD  = 0.625   # ask_size / total_size > 0.625 → partial ask pressure
     RSI_OVERBOUGHT_THRESHOLD     = 55      # RSI > 55 → overbought, mean reversion sell signal
     RSI_MILDLY_OVERBOUGHT_THRESHOLD = 50  # RSI > 50 → mildly overbought, partial credit
     BB_NEAR_UPPER_PCT            = 0.03   # within 3% of upper Bollinger Band = near resistance
@@ -313,7 +313,7 @@ class MicroScalpEngine:
             # ----------------------------------------------------------
             # Signal 1: Order Book Imbalance (OBI) – Ask-side pressure
             # OBI = ask_size / total_size (heavy ask pressure → bearish)
-            # Strong sell pressure when ask_size / total_size > 0.70.
+            # Strong sell pressure when ask_size / total_size > 0.75.
             # ----------------------------------------------------------
             bid_size = crypto.get('bid_size', 0.0)
             ask_size = crypto.get('ask_size', 0.0)
