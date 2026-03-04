@@ -280,40 +280,7 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
         return False
 
 
-def partial_smart_sell(algo, symbol, fraction, tag="Partial TP"):
-    """
-    Sell a fraction (0.0–1.0) of the current position.
-    Both the sell portion and the remaining portion must meet the minimum
-    order size; otherwise falls back to a full smart_liquidate.
-    Returns True if an order was placed successfully, False otherwise.
-    """
-    if symbol not in algo.Portfolio or algo.Portfolio[symbol].Quantity == 0:
-        return False
-    if len(algo.Transactions.GetOpenOrders(symbol)) > 0:
-        return False
-    holding_qty = algo.Portfolio[symbol].Quantity
-    if holding_qty == 0:
-        return False
-    price = algo.Securities[symbol].Price if symbol in algo.Securities else 0
-    if price <= 0:
-        return False
-    min_qty = get_min_quantity(algo, symbol)
-    min_notional = get_min_notional_usd(algo, symbol)
-    sell_qty = round_quantity(algo, symbol, abs(holding_qty) * fraction)
-    remaining_qty = round_quantity(algo, symbol, abs(holding_qty) * (1.0 - fraction))
-    # Both halves must be tradeable; fall back to full exit if not
-    if sell_qty < min_qty or remaining_qty < min_qty:
-        return smart_liquidate(algo, symbol, tag)
-    if sell_qty * price < min_notional * 0.9:
-        return smart_liquidate(algo, symbol, tag)
-    # Flag as partial so OnOrderEvent skips position cleanup
-    if hasattr(algo, '_partial_sell_symbols'):
-        algo._partial_sell_symbols.add(symbol)
-    direction_mult = -1 if holding_qty > 0 else 1
-    ticket = algo.MarketOrder(symbol, sell_qty * direction_mult, tag=tag)
-    if ticket is not None:
-        algo.Debug(f"PARTIAL SELL: {symbol.Value} | frac={fraction:.0%} qty={sell_qty:.6f} of {abs(holding_qty):.6f}")
-    return ticket is not None
+
 
 
 
@@ -486,10 +453,6 @@ def cleanup_position(algo, symbol, record_pnl=False, exit_price=None):
         algo.crypto_data[symbol]['trail_stop'] = None
     if hasattr(algo, '_spike_entries'):
         algo._spike_entries.pop(symbol, None)
-    if hasattr(algo, '_partial_tp_taken'):
-        algo._partial_tp_taken.pop(symbol, None)
-    if hasattr(algo, '_breakeven_stops'):
-        algo._breakeven_stops.pop(symbol, None)
 
 
 def sync_existing_positions(algo):

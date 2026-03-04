@@ -31,27 +31,27 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         # Force Margin account so we can use leverage
         self.SetBrokerageModel(BrokerageName.Bybit, AccountType.Margin)
 
-        self.entry_threshold = 0.60
-        self.high_conviction_threshold = 0.80
+        self.entry_threshold = 0.40
+        self.high_conviction_threshold = 0.60
 
         self.quick_take_profit = self._get_param("quick_take_profit", 0.080)
         self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.025)
         self.atr_tp_mult  = self._get_param("atr_tp_mult",  4.0)
         self.atr_sl_mult  = self._get_param("atr_sl_mult",  2.0)
-        self.trail_activation  = self._get_param("trail_activation",  0.015)
+        self.trail_activation  = self._get_param("trail_activation",  0.010)
         self.trail_stop_pct    = self._get_param("trail_stop_pct",    0.005)
-        self.time_stop_hours   = self._get_param("time_stop_hours",   4.0)
+        self.time_stop_hours   = self._get_param("time_stop_hours",   2.0)
         self.time_stop_pnl_min = self._get_param("time_stop_pnl_min", 0.003)
-        self.extended_time_stop_hours   = self._get_param("extended_time_stop_hours",   8.0)
+        self.extended_time_stop_hours   = self._get_param("extended_time_stop_hours",   4.0)
         self.extended_time_stop_pnl_max = self._get_param("extended_time_stop_pnl_max", 0.015) # +1.5% ceiling
-        self.stale_position_hours       = self._get_param("stale_position_hours",       12.0)
+        self.stale_position_hours       = self._get_param("stale_position_hours",       6.0)
 
         self.trailing_activation = self.trail_activation
         self.trailing_stop_pct   = self.trail_stop_pct
         self.base_stop_loss      = self.tight_stop_loss
         self.base_take_profit    = self.quick_take_profit
 
-        self.position_size_pct  = 0.28
+        self.position_size_pct  = 0.45
         self.base_max_positions = 6
         self.max_positions      = 6
         self.min_notional       = 5.5
@@ -133,7 +133,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.entry_volumes    = {}
         self.stagnation_minutes     = 120
         self.stagnation_pnl_threshold = 0.005
-        self.counter_trend_penalty  = 0.10
+        self.counter_trend_penalty  = 0.30
         self.trade_count      = 0
         self._pending_orders  = {}
         self._cancel_cooldowns = {}
@@ -1059,16 +1059,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         hours = (self.Time - self.entry_times.get(symbol, self.Time)).total_seconds() / 3600
         minutes = hours * 60
 
-        atr = crypto['atr'].Current.Value if crypto and crypto['atr'].IsReady else None
-        if atr and entry > 0:
-            sl = max((atr * self.atr_sl_mult) / entry, self.tight_stop_loss)
-            tp = max((atr * self.atr_tp_mult) / entry, self.quick_take_profit)
-        else:
-            sl = self.tight_stop_loss
-            tp = self.quick_take_profit
-
-        if tp < sl * 1.5:
-            tp = sl * 1.5
+        sl = self.tight_stop_loss
+        tp = self.quick_take_profit
 
         trailing_activation = self.trail_activation
         trailing_stop_pct   = self.trail_stop_pct
