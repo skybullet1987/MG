@@ -34,12 +34,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.entry_threshold = 0.60
         self.high_conviction_threshold = 0.80
 
-        self.quick_take_profit = self._get_param("quick_take_profit", 0.040)
-        self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.020)
-        self.atr_tp_mult  = self._get_param("atr_tp_mult",  5.0)
-        self.atr_sl_mult  = self._get_param("atr_sl_mult",  4.0)
-        self.trail_activation  = self._get_param("trail_activation",  0.020)
-        self.trail_stop_pct    = self._get_param("trail_stop_pct",    0.010)
+        self.quick_take_profit = self._get_param("quick_take_profit", 0.080)
+        self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.025)
+        self.atr_tp_mult  = self._get_param("atr_tp_mult",  4.0)
+        self.atr_sl_mult  = self._get_param("atr_sl_mult",  2.0)
+        self.trail_activation  = self._get_param("trail_activation",  0.015)
+        self.trail_stop_pct    = self._get_param("trail_stop_pct",    0.005)
         self.time_stop_hours   = self._get_param("time_stop_hours",   4.0)
         self.time_stop_pnl_min = self._get_param("time_stop_pnl_min", 0.003)
         self.extended_time_stop_hours   = self._get_param("extended_time_stop_hours",   8.0)
@@ -50,9 +50,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.trailing_stop_pct   = self.trail_stop_pct
         self.base_stop_loss      = self.tight_stop_loss
         self.base_take_profit    = self.quick_take_profit
-        self.atr_trail_mult      = 8.0
 
-        self.position_size_pct  = 0.15
+        self.position_size_pct  = 0.28
         self.base_max_positions = 6
         self.max_positions      = 6
         self.min_notional       = 5.5
@@ -132,12 +131,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.position_directions = {}
         self.entry_times      = {}
         self.entry_volumes    = {}
-        self._partial_tp_taken      = {}
-        self._breakeven_stops       = {}
-        self._partial_sell_symbols  = set()
-        self.partial_tp_threshold   = 0.015
-        self.stagnation_minutes     = 45
+        self.stagnation_minutes     = 120
         self.stagnation_pnl_threshold = 0.005
+        self.counter_trend_penalty  = 0.10
         self.trade_count      = 0
         self._pending_orders  = {}
         self._cancel_cooldowns = {}
@@ -726,6 +722,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
             composite_score = self._calculate_composite_score(factor_scores, crypto)
             net_score = self._apply_fee_adjustment(composite_score)
+            direction = factor_scores.get('_direction', 1)
+
+            # Regime-aware directional filtering: penalize counter-trend setups
+            if self.market_regime == "bull" and direction == -1:
+                net_score -= self.counter_trend_penalty
+            elif self.market_regime == "bear" and direction == 1:
+                net_score -= self.counter_trend_penalty
 
             crypto['recent_net_scores'].append(net_score)
 
@@ -735,7 +738,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     'symbol': symbol,
                     'composite_score': composite_score,
                     'net_score': net_score,
-                    'direction': factor_scores.get('_direction', 1),
+                    'direction': direction,
                     'factors': factor_scores,
                     'volatility': crypto['volatility'][-1] if len(crypto['volatility']) > 0 else 0.05,
                     'dollar_volume': list(crypto['dollar_volume'])[-6:] if len(crypto['dollar_volume']) >= 6 else [],
@@ -1070,67 +1073,22 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         trailing_activation = self.trail_activation
         trailing_stop_pct   = self.trail_stop_pct
 
-        if (not self._partial_tp_taken.get(symbol, False)
-                and pnl >= self.partial_tp_threshold):
-            if partial_smart_sell(self, symbol, 0.50, "Partial TP"):
-                self._partial_tp_taken[symbol] = True
-                self._breakeven_stops[symbol] = entry * 0.998 if is_short else entry * 1.002
-                be_label = "entry-0.2%" if is_short else "entry+0.2%"
-                self.Debug(f"PARTIAL TP: {symbol.Value} | PnL:{pnl:+.2%} | SL→{be_label}")
-                return  # Don't trigger full exit this bar
-
         tag = ""
 
-        if self._partial_tp_taken.get(symbol, False):
-            be_price = self._breakeven_stops.get(symbol, entry)
-            if (is_short and price >= be_price) or (not is_short and price <= be_price):
-                tag = "Breakeven Stop"
-        elif pnl <= -sl:
+        if pnl <= -sl:
             tag = "Stop Loss"
-
-        if not tag and minutes > self.stagnation_minutes and pnl > self.stagnation_pnl_threshold:
+        elif pnl >= tp:
+            tag = "Take Profit"
+        elif pnl >= trailing_activation and dd >= trailing_stop_pct:
+            tag = "Trailing Stop"
+        elif minutes > self.stagnation_minutes and pnl < self.stagnation_pnl_threshold:
             tag = "Stagnation Exit"
-
-        elif not tag:
-            if not self._partial_tp_taken.get(symbol, False) and pnl >= tp:
-                tag = "Take Profit"
-
-            elif pnl > trailing_activation and dd >= trailing_stop_pct:
-                tag = "Trailing Stop"
-
-            elif pnl > self.trail_activation and atr and entry > 0 and holding.Quantity != 0:
-                trail_offset = atr * self.atr_trail_mult
-                if is_short:
-                    lowest_ref = self.lowest_prices.get(symbol, entry)
-                    trail_level = lowest_ref + trail_offset
-                    if crypto:
-                        crypto['trail_stop'] = trail_level
-                    if crypto and crypto['trail_stop'] is not None and price >= crypto['trail_stop']:
-                        tag = "ATR Trail"
-                else:
-                    highest_ref = self.highest_prices.get(symbol, entry)
-                    trail_level = highest_ref - trail_offset
-                    if crypto:
-                        crypto['trail_stop'] = trail_level
-                    if crypto and crypto['trail_stop'] is not None and price <= crypto['trail_stop']:
-                        tag = "ATR Trail"
-
-            if not tag and hours >= 2.0 and crypto and len(crypto['volume']) >= 2:
-                entry_vol = self.entry_volumes.get(symbol, 0)
-                if entry_vol > 0:
-                    v1 = crypto['volume'][-1]
-                    v2 = crypto['volume'][-2]
-                    if v1 < entry_vol * 0.50 and v2 < entry_vol * 0.50:
-                        tag = "Volume Dry-up"
-
-            if not tag and hours >= self.time_stop_hours and pnl < self.time_stop_pnl_min:
-                tag = "Time Stop"
-
-            if not tag and hours >= self.extended_time_stop_hours and pnl < self.extended_time_stop_pnl_max:
-                tag = "Extended Time Stop"
-
-            if not tag and hours >= self.stale_position_hours:
-                tag = "Stale Position Exit"
+        elif hours >= self.time_stop_hours and pnl < self.time_stop_pnl_min:
+            tag = "Time Stop"
+        elif hours >= self.extended_time_stop_hours and pnl < self.extended_time_stop_pnl_max:
+            tag = "Extended Time Stop"
+        elif hours >= self.stale_position_hours:
+            tag = "Stale Position Exit"
 
         if tag:
             if price * abs(holding.Quantity) < min_notional_usd * 0.9:
@@ -1248,36 +1206,33 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                             self.entry_volumes[symbol] = crypto['volume'][-1]
                 else:
                     if symbol in self.entry_prices and current_direction != -1:
-                        if symbol in self._partial_sell_symbols:
-                            self._partial_sell_symbols.discard(symbol)
+                        entry = self.entry_prices.get(symbol, None)
+                        if entry is None:
+                            entry = event.FillPrice
+                            self.Debug(f"⚠️ Missing entry price for {symbol.Value}, using fill price")
+                        pnl = (event.FillPrice - entry) / entry if entry > 0 else 0
+                        self._rolling_wins.append(1 if pnl > 0 else 0)
+                        self._recent_trade_outcomes.append(1 if pnl > 0 else 0)
+                        if pnl > 0:
+                            self._rolling_win_sizes.append(pnl)
+                            self.winning_trades += 1
+                            self.consecutive_losses = 0
                         else:
-                            entry = self.entry_prices.get(symbol, None)
-                            if entry is None:
-                                entry = event.FillPrice
-                                self.Debug(f"⚠️ Missing entry price for {symbol.Value}, using fill price")
-                            pnl = (event.FillPrice - entry) / entry if entry > 0 else 0
-                            self._rolling_wins.append(1 if pnl > 0 else 0)
-                            self._recent_trade_outcomes.append(1 if pnl > 0 else 0)
-                            if pnl > 0:
-                                self._rolling_win_sizes.append(pnl)
-                                self.winning_trades += 1
-                                self.consecutive_losses = 0
-                            else:
-                                self._rolling_loss_sizes.append(abs(pnl))
-                                self.losing_trades += 1
-                                self.consecutive_losses += 1
-                            self.total_pnl += pnl
-                            self.trade_log.append({
-                                'time': self.Time,
-                                'symbol': symbol.Value,
-                                'pnl_pct': pnl,
-                                'direction': 'long',
-                                'exit_reason': 'filled_sell',
-                            })
-                            self._check_cash_mode()
-                            cleanup_position(self, symbol)
-                            self._failed_exit_attempts.pop(symbol, None)
-                            self._failed_exit_counts.pop(symbol, None)
+                            self._rolling_loss_sizes.append(abs(pnl))
+                            self.losing_trades += 1
+                            self.consecutive_losses += 1
+                        self.total_pnl += pnl
+                        self.trade_log.append({
+                            'time': self.Time,
+                            'symbol': symbol.Value,
+                            'pnl_pct': pnl,
+                            'direction': 'long',
+                            'exit_reason': 'filled_sell',
+                        })
+                        self._check_cash_mode()
+                        cleanup_position(self, symbol)
+                        self._failed_exit_attempts.pop(symbol, None)
+                        self._failed_exit_counts.pop(symbol, None)
                     else:
                         self.entry_prices[symbol] = event.FillPrice
                         self.lowest_prices[symbol] = event.FillPrice
