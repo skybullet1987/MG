@@ -36,12 +36,12 @@ class MicroScalpEngine:
     """
 
     # Tunable signal thresholds (easy to adjust for backtesting)
-    OBI_STRONG_THRESHOLD    = 0.50   # strong bid-side imbalance
-    OBI_PARTIAL_THRESHOLD   = 0.25   # partial bid-side imbalance
-    VOL_SURGE_STRONG        = 3.0    # 3× average volume = strong ignition
-    VOL_SURGE_PARTIAL       = 2.0    # 2× volume = moderate spike
-    ADX_STRONG_THRESHOLD    = 20     # strong directional trend
-    ADX_MODERATE_THRESHOLD  = 15     # moderate directional trend
+    OBI_STRONG_THRESHOLD    = 0.40   # strong bid-side imbalance
+    OBI_PARTIAL_THRESHOLD   = 0.20   # partial bid-side imbalance
+    VOL_SURGE_STRONG        = 2.5    # 3× average volume = strong ignition
+    VOL_SURGE_PARTIAL       = 1.5    # 2× volume = moderate spike
+    ADX_STRONG_THRESHOLD    = 18     # strong directional trend
+    ADX_MODERATE_THRESHOLD  = 13     # moderate directional trend
     VWAP_BUFFER             = 1.0005  # 0.05% above VWAP for confirmed reclaim
     # Ranging-market mean reversion thresholds (used when ADX < ADX_MODERATE_THRESHOLD)
     RSI_OVERSOLD_THRESHOLD        = 45   # RSI < 45 → oversold, mean reversion buy signal
@@ -284,9 +284,9 @@ class MicroScalpEngine:
     # ------------------------------------------------------------------
     # Short scoring: bearish microstructure signals (mirror of long)
     # ------------------------------------------------------------------
-    # Short-specific thresholds
-    OBI_SHORT_STRONG_THRESHOLD   = 0.75    # ask_size / total_size > 0.75 → strong ask pressure
-    OBI_SHORT_PARTIAL_THRESHOLD  = 0.625   # ask_size / total_size > 0.625 → partial ask pressure
+    # Short-specific thresholds (aligned with Machine Gun v2 logic + inverted OBI)
+    OBI_SHORT_STRONG_THRESHOLD   = 0.70    # ask_size / total_size > 0.70 → strong ask pressure (equivalent to 0.40 spread)
+    OBI_SHORT_PARTIAL_THRESHOLD  = 0.60    # ask_size / total_size > 0.60 → partial ask pressure
     RSI_OVERBOUGHT_THRESHOLD     = 55      # RSI > 55 → overbought, mean reversion sell signal
     RSI_MILDLY_OVERBOUGHT_THRESHOLD = 50  # RSI > 50 → mildly overbought, partial credit
     BB_NEAR_UPPER_PCT            = 0.03   # within 3% of upper Bollinger Band = near resistance
@@ -313,7 +313,7 @@ class MicroScalpEngine:
             # ----------------------------------------------------------
             # Signal 1: Order Book Imbalance (OBI) – Ask-side pressure
             # OBI = ask_size / total_size (heavy ask pressure → bearish)
-            # Strong sell pressure when ask_size / total_size > 0.75.
+            # Strong sell pressure when ask_size / total_size > 0.70.
             # ----------------------------------------------------------
             bid_size = crypto.get('bid_size', 0.0)
             ask_size = crypto.get('ask_size', 0.0)
