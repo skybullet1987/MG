@@ -1070,20 +1070,20 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         trailing_activation = self.trail_activation
         trailing_stop_pct   = self.trail_stop_pct
 
-        if (not is_short
-                and not self._partial_tp_taken.get(symbol, False)
+        if (not self._partial_tp_taken.get(symbol, False)
                 and pnl >= self.partial_tp_threshold):
             if partial_smart_sell(self, symbol, 0.50, "Partial TP"):
                 self._partial_tp_taken[symbol] = True
-                self._breakeven_stops[symbol] = entry * 1.002
-                self.Debug(f"PARTIAL TP: {symbol.Value} | PnL:{pnl:+.2%} | SL→entry+0.2%")
+                self._breakeven_stops[symbol] = entry * 0.998 if is_short else entry * 1.002
+                be_label = "entry-0.2%" if is_short else "entry+0.2%"
+                self.Debug(f"PARTIAL TP: {symbol.Value} | PnL:{pnl:+.2%} | SL→{be_label}")
                 return  # Don't trigger full exit this bar
 
         tag = ""
 
-        if not is_short and self._partial_tp_taken.get(symbol, False):
+        if self._partial_tp_taken.get(symbol, False):
             be_price = self._breakeven_stops.get(symbol, entry)
-            if price <= be_price:
+            if (is_short and price >= be_price) or (not is_short and price <= be_price):
                 tag = "Breakeven Stop"
         elif pnl <= -sl:
             tag = "Stop Loss"
