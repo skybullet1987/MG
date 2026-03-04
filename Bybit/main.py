@@ -50,7 +50,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.trailing_stop_pct   = self.trail_stop_pct
         self.base_stop_loss      = self.tight_stop_loss
         self.base_take_profit    = self.quick_take_profit
-        self.atr_trail_mult      = 4.0
+        self.atr_trail_mult      = 8.0
 
         self.position_size_pct  = 0.15
         self.base_max_positions = 6
@@ -1088,7 +1088,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         elif pnl <= -sl:
             tag = "Stop Loss"
 
-        if not tag and minutes > self.stagnation_minutes and pnl < self.stagnation_pnl_threshold:
+        if not tag and minutes > self.stagnation_minutes and pnl > self.stagnation_pnl_threshold:
             tag = "Stagnation Exit"
 
         elif not tag:
@@ -1098,7 +1098,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             elif pnl > trailing_activation and dd >= trailing_stop_pct:
                 tag = "Trailing Stop"
 
-            elif atr and entry > 0 and holding.Quantity != 0:
+            elif pnl > self.trail_activation and atr and entry > 0 and holding.Quantity != 0:
                 trail_offset = atr * self.atr_trail_mult
                 if is_short:
                     lowest_ref = self.lowest_prices.get(symbol, entry)
