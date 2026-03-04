@@ -9,7 +9,7 @@ trail_activation = 0.010
 trail_stop_pct = 0.005
 time_stop_hours = 2.0
 time_stop_pnl_min = 0.003
-position_size_pct = 0.45
+position_size_pct = 0.70
 
 # Regime Filtering for Rebalance
 # Require minimum score of 0.85 for counter-trend entries.
