@@ -37,12 +37,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.entry_threshold = 0.40
         self.high_conviction_threshold = 0.60
 
-        self.quick_take_profit = self._get_param("quick_take_profit", 0.080)
-        self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.025)
+        self.quick_take_profit = self._get_param("quick_take_profit", 0.150)
+        self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.035)
         self.atr_tp_mult  = self._get_param("atr_tp_mult",  4.0)
         self.atr_sl_mult  = self._get_param("atr_sl_mult",  2.0)
-        self.trail_activation  = self._get_param("trail_activation",  0.010)
-        self.trail_stop_pct    = self._get_param("trail_stop_pct",    0.005)
+        self.trail_activation  = self._get_param("trail_activation",  0.020)
+        self.trail_stop_pct    = self._get_param("trail_stop_pct",    0.015)
         self.time_stop_hours   = self._get_param("time_stop_hours",   2.0)
         self.time_stop_pnl_min = self._get_param("time_stop_pnl_min", 0.003)
         self.extended_time_stop_hours   = self._get_param("extended_time_stop_hours",   4.0)
@@ -60,8 +60,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.base_max_positions = 6
         self.max_positions      = 6
         self.min_notional       = 5.5
-        self.max_position_usd   = self._get_param("max_position_usd", 1500.0)
-        self.min_price_usd      = 0.005
+        self.max_position_usd   = self._get_param("max_position_usd", 300.0)
+        self.min_price_usd      = 0.001
         self.cash_reserve_pct   = 0.0
         self.min_notional_fee_buffer = 1.5
 
@@ -75,11 +75,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.lookback           = 48
         self.sqrt_annualization = np.sqrt(60 * 24 * 365)
 
-        self.max_spread_pct         = 0.003
+        self.max_spread_pct         = 0.008
         self.spread_median_window   = 12
         self.spread_widen_mult      = 2.5
         self.min_dollar_volume_usd  = 50000
-        self.min_volume_usd         = 15000000
+        self.min_volume_usd         = 2000000
 
         self.skip_hours_utc         = []
         self.max_daily_trades       = 24
