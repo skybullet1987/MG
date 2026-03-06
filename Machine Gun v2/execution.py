@@ -1299,16 +1299,10 @@ def daily_report(algo):
 
 
 def execute_buy(algo, symbol, quantity):
-    """Place a Maker limit buy order at the best bid to capture 0.25% Maker fees."""
-    security = algo.Securities[symbol]
-    # Use BidPrice to post a resting order; fall back to 0.05% below last price if unavailable
-    limit_price = security.BidPrice if security.BidPrice > 0 else security.Price * 0.9995
-    algo.LimitOrder(symbol, quantity, limit_price, "MG Maker Buy")
+    """Place a market buy order for immediate fill."""
+    algo.MarketOrder(symbol, quantity, tag="MG Market Buy")
 
 
 def execute_sell(algo, symbol, quantity):
-    """Place a Maker limit sell order at the best ask to capture 0.25% Maker fees."""
-    security = algo.Securities[symbol]
-    # Use AskPrice to post a resting order; fall back to 0.05% above last price if unavailable
-    limit_price = security.AskPrice if security.AskPrice > 0 else security.Price * 1.0005
-    algo.LimitOrder(symbol, -quantity, limit_price, "MG Maker Sell")
+    """Place a market sell order for immediate fill."""
+    algo.MarketOrder(symbol, -quantity, tag="MG Market Sell")
