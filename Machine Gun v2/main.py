@@ -6,7 +6,7 @@ from collections import deque
 import numpy as np
 from QuantConnect.Orders.Fees import FeeModel, OrderFee
 from QuantConnect.Securities import CashAmount
-# from QuantConnect.Orders.Slippage import SlippageModel
+from QuantConnect.Orders.Slippage import ConstantSlippageModel
 # endregion
 
 
@@ -61,6 +61,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.max_positions      = 6
         self.min_notional       = 5.5
         self.max_position_usd   = self._get_param("max_position_usd", 10000.0)
+        # Dynamic sizing: cap each trade to this fraction of total portfolio equity
+        self.max_pct_per_trade  = self._get_param("max_pct_per_trade", 0.05)
+        # ADV cap: max fraction of estimated 24h dollar volume per single position
+        self.max_adv_pct        = self._get_param("max_adv_pct", 0.01)
         self.min_price_usd      = 0.001
         self.cash_reserve_pct   = 0.0
         self.min_notional_fee_buffer = 1.5
@@ -216,9 +220,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self.Debug(f"Capital: ${self.Portfolio.Cash:.2f} | Max pos: {self.max_positions} | Size: {self.position_size_pct:.0%}")
 
     def CustomSecurityInitializer(self, security):
-        """Applies volume-aware slippage (RealisticCryptoSlippage) and the custom
-        Maker/Taker fee model (0.25% for Limit orders, 0.40% for Market orders)."""
-        security.SetSlippageModel(RealisticCryptoSlippage())
+        """Applies a realistic constant slippage model (0.3%) to stress-test against
+        live conditions, and the custom Maker/Taker fee model (0.25% for Limit orders,
+        0.40% for Market orders)."""
+        security.SetSlippageModel(ConstantSlippageModel(0.003))
         security.SetFeeModel(MakerTakerFeeModel())
 
     def _get_param(self, name, default):
@@ -912,6 +917,18 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
             # Floor at min_notional to support small accounts
             val = max(val, self.min_notional)
+
+            # Dynamic equity-based cap: max % of total portfolio equity per trade
+            equity_cap = total_value * self.max_pct_per_trade
+            val = min(val, equity_cap)
+
+            # ADV cap: never exceed max_adv_pct of estimated 24h dollar volume to prevent
+            # liquidity issues and unrealistic backtest fills. volume_long stores raw coin
+            # volumes per minute (maxlen=1440 = 24h); current price is used as an
+            # approximation for the 24h average price, which is sufficient for a guardrail.
+            if len(crypto['volume_long']) > 0:
+                adv_24h_usd = sum(crypto['volume_long']) * price
+                val = min(val, adv_24h_usd * self.max_adv_pct)
 
             # Absolute Hard Cap on position size
             val = min(val, self.max_position_usd)
