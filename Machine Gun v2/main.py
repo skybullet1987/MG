@@ -60,7 +60,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.base_max_positions = 6
         self.max_positions      = 6
         self.min_notional       = 5.5
-        self.max_position_usd   = self._get_param("max_position_usd", 300.0)
+        self.max_position_usd   = self._get_param("max_position_usd", 10000.0)
         self.min_price_usd      = 0.001
         self.cash_reserve_pct   = 0.0
         self.min_notional_fee_buffer = 1.5
