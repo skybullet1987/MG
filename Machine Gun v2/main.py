@@ -842,6 +842,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         reject_price_too_low = 0
         reject_cash_reserve = 0
         reject_min_qty_too_large = 0
+        reject_atr_gate = 0
+        reject_symbol_daily_limit = 0
         reject_dollar_volume = 0
         reject_notional = 0
         success_count = 0
@@ -912,6 +914,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
             # Per-symbol daily trade limit
             if crypto.get('trade_count_today', 0) >= self.max_symbol_trades_per_day:
+                reject_symbol_daily_limit += 1
                 continue
 
             # Fee-adjusted profit gate: ATR-projected move must cover fees + slippage.
@@ -921,6 +924,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 min_profit_gate = self.min_expected_profit_pct
                 min_required = self.expected_round_trip_fees + self.fee_slippage_buffer + min_profit_gate
                 if expected_move_pct < min_required:
+                    reject_atr_gate += 1
                     continue
 
             # Dollar-volume liquidity gate: use 12-bar average for more stable assessment
@@ -1024,6 +1028,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
         if success_count > 0 or (reject_exit_cooldown + reject_loss_cooldown) > 3:
             debug_limited(self, f"EXECUTE: {success_count}/{len(candidates)} | rejects: cd={reject_exit_cooldown} loss={reject_loss_cooldown} corr={reject_correlation} dv={reject_dollar_volume}")
+        # Always log full reject breakdown for live diagnostics
+        debug_limited(self, f"REJECT DETAIL: {success_count}/{len(candidates)} | pending={reject_pending_orders} open={reject_open_orders} invested={reject_already_invested} spread={reject_spread} cd={reject_exit_cooldown} loss={reject_loss_cooldown} corr={reject_correlation} price={reject_price_invalid}/{reject_price_too_low} cash={reject_cash_reserve} minqty={reject_min_qty_too_large} atr={reject_atr_gate} symbday={reject_symbol_daily_limit} dv={reject_dollar_volume} notional={reject_notional}")
 
     def _is_ready(self, c):
         return len(c['prices']) >= 10 and c['rsi'].IsReady
