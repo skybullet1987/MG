@@ -8,35 +8,6 @@ from collections import deque
 from datetime import timedelta
 # endregion
 
-# Age threshold (in seconds) after which an uncancelable order is marked dead
-DEAD_ORDER_AGE_THRESHOLD_SECONDS = 3600
-
-
-def safe_cancel_order(algo, order_id, context=""):
-    """
-    Safely cancel an order with a hard limit per time step to prevent Isolator timeouts.
-    """
-    if not hasattr(algo, '_cancel_count_this_step'):
-        algo._cancel_count_this_step = 0
-        algo._last_cancel_time = algo.Time
-
-    # Reset counter if time has advanced
-    if algo.Time > algo._last_cancel_time:
-        algo._cancel_count_this_step = 0
-        algo._last_cancel_time = algo.Time
-
-    # Hard limit of 5 cancels per time step to prevent 10-minute hangs
-    if algo._cancel_count_this_step >= 5:
-        return False
-
-    try:
-        algo.Transactions.CancelOrder(order_id)
-        algo._cancel_count_this_step += 1
-        return True
-    except Exception as e:
-        algo.Debug(f"Error canceling order {order_id} in {context}: {e}")
-        return False
-
 # Constants from main_qa.py lines 31-68
 SYMBOL_BLACKLIST = {
     "BTCUSD",  # Reference symbol only — never trade (too expensive for small capital, always dust)
@@ -54,7 +25,7 @@ SYMBOL_BLACKLIST = {
     # Forex pairs
     "EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "JPYUSD", "CADUSD", "CHFUSD", "CNYUSD", "HKDUSD", "SGDUSD",
     "SEKUSD", "NOKUSD", "DKKUSD", "KRWUSD", "TRYUSD", "ZARUSD", "MXNUSD", "INRUSD", "BRLUSD",
-    "PLNUSD", "THBUSD",
+    "PLNUSD", "THBUSD", "WENUSD"
 }
 
 # Known fiat currency codes used to filter forex pairs from the crypto universe
@@ -391,8 +362,6 @@ def effective_stale_timeout(algo):
 
 def cancel_stale_new_orders(algo):
     # Allow cancel gate when venue is online or unknown (fallback handled elsewhere)
-    if not hasattr(algo, '_dead_orders'):
-        algo._dead_orders = set()
     try:
         open_orders = algo.Transactions.GetOpenOrders()
         timeout_seconds = effective_stale_timeout(algo)
@@ -400,15 +369,6 @@ def cancel_stale_new_orders(algo):
             sym_val = order.Symbol.Value
             if sym_val in algo._session_blacklist:
                 continue
-
-            # Skip orders in cooldown to prevent API spam
-            if order.Symbol in getattr(algo, '_cancel_cooldowns', {}) and algo.Time < algo._cancel_cooldowns[order.Symbol]:
-                continue
-
-            # Skip permanently dead orders that cannot be canceled
-            if order.Id in algo._dead_orders:
-                continue
-
             order_time = order.Time
             if order_time.tzinfo is not None:
                 order_time = order_time.replace(tzinfo=None)
@@ -425,20 +385,11 @@ def cancel_stale_new_orders(algo):
                     algo.entry_prices[order.Symbol] = holding.AveragePrice
                     algo.highest_prices[order.Symbol] = holding.AveragePrice
                     algo.entry_times[order.Symbol] = algo.Time
-                    if not safe_cancel_order(algo, order.Id, "cancel_stale_new_orders"):
-                        algo.Debug("Max cancels reached for this step, deferring remaining stale orders")
-                        break  # Abort loop if quota reached
+                    algo.Transactions.CancelOrder(order.Id)  # Cancel the stale order
                     continue  # Don't blacklist
                 
-                if not safe_cancel_order(algo, order.Id, "cancel_stale_new_orders"):
-                    algo.Debug("Max cancels reached for this step, deferring remaining stale orders")
-                    break  # Abort loop if quota reached
+                algo.Transactions.CancelOrder(order.Id)
                 algo._cancel_cooldowns[order.Symbol] = algo.Time + timedelta(minutes=algo.cancel_cooldown_minutes)
-
-                # Mark extremely old orders as dead to prevent infinite cancel loops
-                if order_age > DEAD_ORDER_AGE_THRESHOLD_SECONDS:
-                    algo._dead_orders.add(order.Id)
-                    algo.Debug(f"Marked order {order.Id} for {sym_val} as DEAD (age: {order_age/60:.1f}m)")
                 
                 # Only blacklist stale ENTRY orders, not EXIT orders
                 # Exit orders that are stale just get cooldown to allow retry
@@ -919,18 +870,12 @@ def health_check(algo):
                 continue  # Has non-stale orders, skip this symbol
             
             # All orders are stale - cancel them
-            if not hasattr(algo, '_dead_orders'):
-                algo._dead_orders = set()
             for o in open_orders:
-                if o.Id in algo._dead_orders:
-                    continue
-                if not safe_cancel_order(algo, o.Id, "health_check"):
-                    break
-                issues.append(f"Canceled stale order: {symbol.Value} (order {o.Id})")
-                order_time = normalize_order_time(o.Time)
-                if (algo.Time - order_time).total_seconds() > DEAD_ORDER_AGE_THRESHOLD_SECONDS:
-                    algo._dead_orders.add(o.Id)
-                    algo.Debug(f"Marked order {o.Id} for {symbol.Value} as DEAD in health_check")
+                try:
+                    algo.Transactions.CancelOrder(o.Id)
+                    issues.append(f"Canceled stale order: {symbol.Value} (order {o.Id})")
+                except Exception as e:
+                    algo.Debug(f"Error canceling stale order for {symbol.Value}: {e}")
         
         if not is_invested_not_dust(algo, symbol):
             issues.append(f"Orphan tracking: {symbol.Value}")
@@ -1036,18 +981,12 @@ def resync_holdings_full(algo):
                     continue  # Has non-stuck orders, wait
                 
                 # All orders are stuck - cancel them
-                if not hasattr(algo, '_dead_orders'):
-                    algo._dead_orders = set()
                 for o in open_orders:
-                    if o.Id in algo._dead_orders:
-                        continue
-                    if not safe_cancel_order(algo, o.Id, "resync_holdings_full"):
-                        break
-                    algo.Debug(f"PHANTOM: Canceling stuck order {o.Id} for {symbol.Value}")
-                    order_time = normalize_order_time(o.Time)
-                    if (algo.Time - order_time).total_seconds() > DEAD_ORDER_AGE_THRESHOLD_SECONDS:
-                        algo._dead_orders.add(o.Id)
-                        algo.Debug(f"Marked order {o.Id} for {symbol.Value} as DEAD in resync")
+                    try:
+                        algo.Transactions.CancelOrder(o.Id)
+                        algo.Debug(f"PHANTOM: Canceling stuck order {o.Id} for {symbol.Value}")
+                    except Exception as e:
+                        algo.Debug(f"Error canceling stuck order for {symbol.Value}: {e}")
             
             phantoms.append(symbol)
     
@@ -1183,21 +1122,29 @@ def verify_order_fills(algo):
             retry_count = algo._order_retries.get(order_id, 0)
             
             if retry_count == 0:
-                if not safe_cancel_order(algo, order_id, "verify_order_fills"):
-                    continue  # Skip to next so we don't process it as cancelled yet
-                algo.Debug(f"ORDER TIMEOUT (attempt 1): {symbol.Value} - cancel requested, will retry after cooldown")
-
-                # Set cooldown flag - do NOT retry immediately
-                algo._retry_pending[symbol] = current_time
-                algo._order_retries[order_id] = 1
-                symbols_to_remove.append(symbol)
+                try:
+                    algo.Transactions.CancelOrder(order_id)
+                    algo.Debug(f"ORDER TIMEOUT (attempt 1): {symbol.Value} - cancel requested, will retry after cooldown")
+                    
+                    # Set cooldown flag - do NOT retry immediately
+                    algo._retry_pending[symbol] = current_time
+                    algo._order_retries[order_id] = 1
+                    symbols_to_remove.append(symbol)
+                except Exception as e:
+                    algo.Debug(f"Error canceling order for {symbol.Value}: {e}")
+                    symbols_to_remove.append(symbol)
+                    algo._order_retries.pop(order_id, None)
             else:
-                if not safe_cancel_order(algo, order_id, "verify_order_fills"):
-                    continue  # Skip to next so we don't process it as cancelled yet
-                algo._session_blacklist.add(symbol.Value)
-                symbols_to_remove.append(symbol)
-                algo._order_retries.pop(order_id, None)
-                algo.Debug(f"ORDER TIMEOUT (attempt 2): {symbol.Value} - blacklisted")
+                try:
+                    algo.Transactions.CancelOrder(order_id)
+                    algo._session_blacklist.add(symbol.Value)
+                    symbols_to_remove.append(symbol)
+                    algo._order_retries.pop(order_id, None)
+                    algo.Debug(f"ORDER TIMEOUT (attempt 2): {symbol.Value} - blacklisted")
+                except Exception as e:
+                    algo.Debug(f"Error canceling order {order_id} on second timeout: {e}")
+                    symbols_to_remove.append(symbol)
+                    algo._order_retries.pop(order_id, None)
     
     # Remove processed orders
     for symbol in symbols_to_remove:
