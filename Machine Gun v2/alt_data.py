@@ -13,7 +13,10 @@ class FearGreedData(PythonData):
 
     def GetSource(self, config, date, isLiveMode):
         url = "https://api.alternative.me/fng/?limit=1&format=json"
-        return SubscriptionDataSource(url, SubscriptionTransportMedium.RemoteFile)
+        # Use Rest instead of RemoteFile so the entire JSON response is
+        # delivered to Reader() as a single string, avoiding the line-by-line
+        # split that breaks JSON parsing in live mode.
+        return SubscriptionDataSource(url, SubscriptionTransportMedium.Rest)
 
     def Reader(self, config, line, date, isLiveMode):
         if not line or line.strip() == "":
@@ -38,22 +41,17 @@ class FearGreedData(PythonData):
 
 class WhaleAlertData(PythonData):
     """
-    Custom data feed for Whale Alert exchange flow data.
-    Tracks large on-chain transactions to/from exchanges.
-    Requires whale_alert_api_key parameter; degrades gracefully if absent.
+    Custom data feed for Whale Alert large transaction monitoring.
+    Tracks large BTC transfers as a sentiment/flow indicator.
+    Value: total USD volume of large transactions in the period.
     """
 
     def GetSource(self, config, date, isLiveMode):
-        try:
-            api_key = config.Symbol.Value.replace("WHALE", "").strip() or ""
-        except Exception:
-            api_key = ""
-        start = int((date - timedelta(hours=1)).timestamp())
-        url = (
-            f"https://api.whale-alert.io/v1/transactions"
-            f"?api_key={api_key}&min_value=500000&start={start}"
-        )
-        return SubscriptionDataSource(url, SubscriptionTransportMedium.RemoteFile)
+        # Whale Alert free tier: last 1 hour of transactions > $500k
+        # Note: requires API key for production use
+        url = "https://api.whale-alert.io/v1/transactions?min_value=500000&api_key=demo"
+        # Use Rest to receive the full JSON body as a single string
+        return SubscriptionDataSource(url, SubscriptionTransportMedium.Rest)
 
     def Reader(self, config, line, date, isLiveMode):
         if not line or line.strip() == "":
@@ -61,19 +59,14 @@ class WhaleAlertData(PythonData):
         try:
             obj = json.loads(line)
             transactions = obj.get("transactions", [])
-            exchange_inflow = sum(
-                1 for tx in transactions
-                if tx.get("to", {}).get("owner_type") == "exchange"
-            )
-            exchange_outflow = sum(
-                1 for tx in transactions
-                if tx.get("from", {}).get("owner_type") == "exchange"
-            )
+            if not transactions:
+                return None
+            # Aggregate total USD volume of whale transactions
+            total_usd = sum(float(tx.get("amount_usd", 0)) for tx in transactions)
             result = WhaleAlertData()
             result.Symbol = config.Symbol
-            result.Time = date
-            result.Value = float(len(transactions))
-            result.net_exchange_flow = float(exchange_inflow - exchange_outflow)
+            result.Time = datetime.utcnow()
+            result.Value = total_usd
             result.EndTime = result.Time + timedelta(hours=1)
             return result
         except Exception:
