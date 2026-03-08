@@ -123,6 +123,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._positions_synced    = False
         self._session_blacklist   = set()
         self._max_session_blacklist_size = 100
+        self._symbol_entry_cooldowns = {}
+        self._spread_warning_times = {}
         self._first_post_warmup   = True
         self._submitted_orders    = {}
         self._symbol_slippage_history = {}
@@ -263,6 +265,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if len(self._session_blacklist) > 0:
             self.Debug(f"Clearing session blacklist ({len(self._session_blacklist)} items)")
             self._session_blacklist.clear()
+        self._symbol_entry_cooldowns.clear()
         persist_state(self)
 
     def HealthCheck(self):
@@ -707,11 +710,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self.consecutive_losses = 0
             self._log_skip("consecutive loss cooldown (5 losses)")
             return
-        # Circuit breaker: halt new entries for 12h after 3 consecutive losses
-        if self.consecutive_losses >= 3:
-            self.circuit_breaker_expiry = self.Time + timedelta(hours=2)
+        # Circuit breaker: halt new entries for 1h after 4 consecutive losses (reduced from 2h/3 losses)
+        if self.consecutive_losses >= 4:
+            self.circuit_breaker_expiry = self.Time + timedelta(hours=1)
             self.consecutive_losses = 0
-            self._log_skip("circuit breaker triggered (3 consecutive losses)")
+            self._log_skip("circuit breaker triggered (4 consecutive losses)")
             return
         if self.circuit_breaker_expiry is not None and self.Time < self.circuit_breaker_expiry:
             self._log_skip("circuit breaker active")
@@ -744,6 +747,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         threshold_now = self._get_threshold()
         for symbol in list(self.crypto_data.keys()):
             if symbol.Value in SYMBOL_BLACKLIST or symbol.Value in self._session_blacklist:
+                continue
+            if symbol.Value in self._symbol_entry_cooldowns and self.Time < self._symbol_entry_cooldowns[symbol.Value]:
                 continue
             count_not_blacklisted += 1
 
@@ -832,6 +837,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         reject_spread = 0
         reject_exit_cooldown = 0
         reject_loss_cooldown = 0
+        reject_correlation = 0
         reject_price_invalid = 0
         reject_price_too_low = 0
         reject_cash_reserve = 0
@@ -862,8 +868,14 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if sym in self._exit_cooldowns and self.Time < self._exit_cooldowns[sym]:
                 reject_exit_cooldown += 1
                 continue
+            if sym.Value in self._symbol_entry_cooldowns and self.Time < self._symbol_entry_cooldowns[sym.Value]:
+                reject_loss_cooldown += 1
+                continue
             if sym in self._symbol_loss_cooldowns and self.Time < self._symbol_loss_cooldowns[sym]:
                 reject_loss_cooldown += 1
+                continue
+            if not self._check_correlation(sym):
+                reject_correlation += 1
                 continue
             sec = self.Securities[sym]
             price = sec.Price
@@ -1011,7 +1023,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 break
 
         if success_count > 0 or (reject_exit_cooldown + reject_loss_cooldown) > 3:
-            debug_limited(self, f"EXECUTE: {success_count}/{len(candidates)} | rejects: cd={reject_exit_cooldown} loss={reject_loss_cooldown} dv={reject_dollar_volume}")
+            debug_limited(self, f"EXECUTE: {success_count}/{len(candidates)} | rejects: cd={reject_exit_cooldown} loss={reject_loss_cooldown} corr={reject_correlation} dv={reject_dollar_volume}")
 
     def _is_ready(self, c):
         return len(c['prices']) >= 10 and c['rsi'].IsReady
@@ -1283,8 +1295,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                         if len(self._recent_trade_outcomes) >= 12:
                             recent_wr = sum(self._recent_trade_outcomes) / len(self._recent_trade_outcomes)
                             if recent_wr < 0.25:
-                                self._cash_mode_until = self.Time + timedelta(hours=4)
-                                self.Debug(f"⚠️ CASH MODE: WR={recent_wr:.0%} over {len(self._recent_trade_outcomes)} trades. Pausing 4h.")
+                                self._cash_mode_until = self.Time + timedelta(hours=2)
+                                self.Debug(f"⚠️ CASH MODE: WR={recent_wr:.0%} over {len(self._recent_trade_outcomes)} trades. Pausing 2h.")
                         cleanup_position(self, symbol)
                         self._failed_exit_attempts.pop(symbol, None)
                         self._failed_exit_counts.pop(symbol, None)
