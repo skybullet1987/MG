@@ -3,6 +3,7 @@ from AlgorithmImports import *
 import json
 import math
 import numpy as np
+import random
 from collections import deque
 from datetime import timedelta
 # endregion
@@ -70,20 +71,22 @@ KRAKEN_SELL_FEE_BUFFER = 0.006  # 0.6% (0.4% base fee + 0.2% safety margin)
 
 
 class RealisticCryptoSlippage:
-    """Volume-aware slippage model for crypto."""
-    
+    """Volume-aware slippage model for crypto.
+    Calibrated against empirical Kraken fill data.
+    Altcoins under $1 routinely have 0.3-0.5% effective slippage."""
+
     def __init__(self):
-        self.base_slippage_pct = 0.001
-        self.volume_impact_factor = 0.10
-        self.max_slippage_pct = 0.02
-    
+        self.base_slippage_pct = 0.002    # 0.2% base (was 0.1% — too optimistic)
+        self.volume_impact_factor = 0.15   # was 0.10
+        self.max_slippage_pct = 0.03       # 3% cap (was 2%)
+
     def get_slippage_approximation(self, asset, order):
         price = asset.Price
         if price <= 0:
             return 0
-        
+
         slippage_pct = self.base_slippage_pct
-        
+
         volume = asset.Volume
         if volume > 0:
             order_value = abs(order.Quantity) * price
@@ -92,16 +95,19 @@ class RealisticCryptoSlippage:
                 participation_rate = order_value / volume_value
                 volume_impact = self.volume_impact_factor * (participation_rate ** 1.5)
                 slippage_pct += volume_impact
-        
+
+        # Price tier penalties — low-price alts have wider spreads
         if price < 0.01:
-            slippage_pct *= 3.0
+            slippage_pct *= 4.0    # was 3.0
         elif price < 0.10:
-            slippage_pct *= 2.0
+            slippage_pct *= 2.5    # was 2.0
         elif price < 1.0:
-            slippage_pct *= 1.5
-        
+            slippage_pct *= 1.8    # was 1.5
+        elif price < 10.0:
+            slippage_pct *= 1.2    # NEW — mid-price alts still have wider spreads
+
         slippage_pct = min(slippage_pct, self.max_slippage_pct)
-        
+
         return price * slippage_pct
 
 
@@ -759,6 +765,11 @@ def place_limit_or_market(algo, symbol, quantity, timeout_seconds=30, tag="Entry
             if limit_price <= 0:
                 algo.Debug(f"Price unavailable for {symbol.Value}, using market order")
                 return algo.MarketOrder(symbol, quantity, tag=tag)
+
+        # BACKTEST REALISM: simulate ~25% of limit orders not filling
+        # (order sits in book, price moves away, times out)
+        if not algo.LiveMode and random.random() < 0.25:
+            return None
 
         # Place maker limit order
         limit_ticket = algo.LimitOrder(symbol, quantity, limit_price, tag=tag)
