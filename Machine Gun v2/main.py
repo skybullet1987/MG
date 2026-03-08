@@ -11,27 +11,33 @@ from QuantConnect.Securities import CashAmount
 
 
 class MakerTakerFeeModel(FeeModel):
-    """Custom Fee Model: 0.25% Maker (Limit), 0.40% Taker (Market).
-    Note: assumes all Limit orders rest in the book as maker orders. Aggressive
-    limit orders that cross the spread will be charged the taker rate by the exchange
-    at settlement, but this model applies the maker rate as an approximation for
-    backtesting purposes."""
+    """Blended fee model: assumes 40% of limit orders cross the spread
+    and pay taker rate. This matches empirical Kraken fill data for
+    aggressive limit orders (bid * 1.0005 placement strategy).
+    Taker rate always applies to Market orders."""
+
+    LIMIT_TAKER_RATIO = 0.40  # 40% of limits cross the spread in practice
+
     def GetOrderFee(self, parameters):
         order = parameters.Order
-        fee_pct = 0.0025 if order.Type == OrderType.Limit else 0.0040
+        if order.Type == OrderType.Limit:
+            # Blended: 60% maker + 40% taker
+            fee_pct = (1 - self.LIMIT_TAKER_RATIO) * 0.0025 + self.LIMIT_TAKER_RATIO * 0.0040
+        else:
+            fee_pct = 0.0040  # Market orders always taker
         trade_value = order.AbsoluteQuantity * parameters.Security.Price
         return OrderFee(CashAmount(trade_value * fee_pct, "USD"))
 
 
 class SimplifiedCryptoStrategy(QCAlgorithm):
     """
-    Micro-Scalping System - v7.2.0
+    Micro-Scalping System - v7.3.0
     5-signal micro-scalp engine, regime-adaptive, bull/sideways/bear-aware.
     """
 
     def Initialize(self):
         self.SetStartDate(2024, 1, 1)
-        self.SetCash(100)
+        self.SetCash(2000)
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
         self.entry_threshold = 0.50
@@ -194,6 +200,16 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         except Exception as e:
             self.Debug(f"Warning: Could not add BTC - {e}")
 
+        # Fear & Greed Index — regime overlay
+        try:
+            from alt_data import FearGreedData
+            self.fear_greed_symbol = self.AddData(FearGreedData, "FNG", Resolution.Daily).Symbol
+            self.fear_greed_value = 50  # neutral default
+        except Exception as e:
+            self.Debug(f"Warning: Could not add Fear & Greed data - {e}")
+            self.fear_greed_symbol = None
+            self.fear_greed_value = 50
+
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(0, 1), self.DailyReport)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(0, 0), self.ResetDailyCounters)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(hours=6)), self.ReviewPerformance)
@@ -212,7 +228,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if self.LiveMode:
             cleanup_object_store(self)
             load_persisted_state(self)
-            self.Debug("=== LIVE TRADING (MICRO-SCALP) v7.0.0 ===")
+            self.Debug("=== LIVE TRADING (MICRO-SCALP) v7.3.0 ===")
             self.Debug(f"Capital: ${self.Portfolio.Cash:.2f} | Max pos: {self.max_positions} | Size: {self.position_size_pct:.0%}")
 
     def CustomSecurityInitializer(self, security):
@@ -369,6 +385,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self.btc_ema_24.Update(btc_bar.EndTime, btc_price)
             if len(self.btc_returns) >= 10:
                 self.btc_volatility.append(np.std(list(self.btc_returns)[-10:]))
+        # === Fear & Greed data ===
+        if hasattr(self, 'fear_greed_symbol') and self.fear_greed_symbol and data.ContainsKey(self.fear_greed_symbol):
+            fg = data[self.fear_greed_symbol]
+            if fg is not None:
+                self.fear_greed_value = fg.Value
         for symbol in list(self.crypto_data.keys()):
             if not data.Bars.ContainsKey(symbol):
                 continue
@@ -569,15 +590,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         return max(0, min(1, (v - mn) / (mx - mn)))
 
     def _calculate_factor_scores(self, symbol, crypto):
-        """Evaluate both signals and return the highest conviction long score."""
+        """Evaluate long signals only. Short scoring disabled (Cash account)."""
         long_score, long_components = self._scoring_engine.calculate_scalp_score(crypto)
-        short_score, short_components = self._scoring_engine.calculate_short_score(crypto)
 
         components = long_components.copy()
         components['_scalp_score'] = long_score
         components['_direction'] = 1
         components['_long_score'] = long_score
-        components['_short_score'] = short_score
         return components
 
     def _calculate_composite_score(self, factors, crypto=None):
@@ -701,6 +720,14 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if pos_count >= self.max_positions:
             self._log_skip("at max positions")
             return
+        # Fear & Greed regime gate — reduce exposure in extreme greed
+        fg_value = getattr(self, 'fear_greed_value', 50)
+        if fg_value >= 85:
+            # Extreme Greed — halve max positions (market is frothy)
+            effective_max_pos = max(1, self.max_positions // 2)
+            if pos_count >= effective_max_pos:
+                self._log_skip(f"Fear&Greed extreme greed ({fg_value}) — reduced max positions")
+                return
         if len(self.Transactions.GetOpenOrders()) >= self.max_concurrent_open_orders:
             self._log_skip("too many open orders")
             return

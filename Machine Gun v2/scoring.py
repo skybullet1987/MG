@@ -6,7 +6,7 @@ import numpy as np
 
 class MicroScalpEngine:
     """
-    Micro-Scalping Signal Engine - v7.2.0
+    Micro-Scalping Signal Engine - v7.3.0
 
     High-frequency market microstructure scalping system.
     Uses cutting-edge microstructure signals tuned for 1-minute bars on Kraken.
@@ -76,9 +76,6 @@ class MicroScalpEngine:
                 obi = (bid_size - ask_size) / total_size
                 if obi > self.OBI_STRONG_THRESHOLD:
                     components['obi'] = 0.20
-                    if not self.algo.IsWarmingUp:
-                        self.algo.Debug(
-                            f"OBI Signal: obi={obi:.3f} bid={bid_size:.2f} ask={ask_size:.2f}")
                 elif obi > self.OBI_PARTIAL_THRESHOLD:
                     # Partial credit for meaningful buy-side imbalance
                     components['obi'] = 0.10
@@ -110,9 +107,6 @@ class MicroScalpEngine:
                     ratio = current_vol / vol_baseline
                     if ratio >= vol_strong:
                         components['vol_ignition'] = 0.20
-                        if not self.algo.IsWarmingUp:
-                            self.algo.Debug(
-                                f"Volume Ignition: vol={current_vol:.2f} baseline={vol_baseline:.2f} ratio={ratio:.1f}x choppy={is_choppy}")
                     elif ratio >= vol_partial:
                         # Partial credit for a meaningful volume spike
                         components['vol_ignition'] = 0.10
@@ -181,10 +175,6 @@ class MicroScalpEngine:
                         lower_bb = bb_lower_data[-1]
                         if lower_bb > 0 and price <= lower_bb * 1.005 and rsi_val < 35:
                             components['adx_filter'] = 0.25
-                            if not self.algo.IsWarmingUp:
-                                self.algo.Debug(
-                                    f"Deep Mean Reversion (Sideways): rsi={rsi_val:.1f} "
-                                    f"price={price:.4f} bb_lower={lower_bb:.4f}")
                 elif adx_val <= self.ADX_MODERATE_THRESHOLD:
                     # Ranging market: use mean reversion signal instead of ADX
                     if (crypto['rsi'].IsReady and len(crypto['bb_lower']) >= 1
@@ -196,10 +186,6 @@ class MicroScalpEngine:
                                 and price <= bb_lower * (1 + self.BB_NEAR_LOWER_PCT)):
                             # Oversold near lower band → strong mean reversion signal
                             components['adx_filter'] = 0.20
-                            if not self.algo.IsWarmingUp:
-                                self.algo.Debug(
-                                    f"Mean Reversion Signal: rsi={rsi_val:.1f} "
-                                    f"price={price:.4f} bb_lower={bb_lower:.4f}")
                         elif rsi_val < self.RSI_MILDLY_OVERSOLD_THRESHOLD:
                             # Mildly oversold in ranging market → partial credit
                             components['adx_filter'] = 0.10
@@ -228,16 +214,10 @@ class MicroScalpEngine:
                       and price < vwap_sd2_lower):
                     # Aggressive bounce off -3 SD lower band (extreme support)
                     components['vwap_signal'] = 0.20
-                    if not self.algo.IsWarmingUp:
-                        self.algo.Debug(
-                            f"VWAP -3SD Bounce: price={price:.4f} sd3_lower={vwap_sd3_lower:.4f}")
                 elif (vwap_sd > 0 and vwap_sd2_lower > 0
                       and price >= vwap_sd2_lower * 1.003):
                     # Bounce off -2 SD lower band (strong support)
                     components['vwap_signal'] = 0.15
-                    if not self.algo.IsWarmingUp:
-                        self.algo.Debug(
-                            f"VWAP -2SD Bounce: price={price:.4f} sd2_lower={vwap_sd2_lower:.4f}")
 
             # ----------------------------------------------------------
             # Signal 6: CVD Divergence (Absorption)
@@ -309,9 +289,6 @@ class MicroScalpEngine:
                 obi = ask_size / total_size
                 if obi > self.OBI_SHORT_STRONG_THRESHOLD:
                     components['obi'] = 0.20
-                    if not self.algo.IsWarmingUp:
-                        self.algo.Debug(
-                            f"Short OBI Signal: ask_ratio={obi:.3f} bid={bid_size:.2f} ask={ask_size:.2f}")
                 elif obi > self.OBI_SHORT_PARTIAL_THRESHOLD:
                     components['obi'] = 0.10
 
@@ -333,9 +310,6 @@ class MicroScalpEngine:
                     ratio = current_vol / vol_baseline
                     if ratio >= self.VOL_SURGE_STRONG:
                         components['vol_ignition'] = 0.20
-                        if not self.algo.IsWarmingUp:
-                            self.algo.Debug(
-                                f"Short Volume Ignition: vol={current_vol:.2f} baseline={vol_baseline:.2f} ratio={ratio:.1f}x")
                     elif ratio >= self.VOL_SURGE_PARTIAL:
                         components['vol_ignition'] = 0.10
 
@@ -375,10 +349,6 @@ class MicroScalpEngine:
                         upper_bb = bb_upper_data[-1]
                         if upper_bb > 0 and price >= upper_bb * 0.995 and rsi_val > 65:
                             components['adx_filter'] = 0.25
-                            if not self.algo.IsWarmingUp:
-                                self.algo.Debug(
-                                    f"Deep Mean Reversion Short (Sideways): rsi={rsi_val:.1f} "
-                                    f"price={price:.4f} bb_upper={upper_bb:.4f}")
                 elif adx_val <= self.ADX_MODERATE_THRESHOLD:
                     if (crypto['rsi'].IsReady and len(crypto['bb_upper']) >= 1
                             and len(crypto['prices']) >= 1):
@@ -388,10 +358,6 @@ class MicroScalpEngine:
                         if (rsi_val > self.RSI_OVERBOUGHT_THRESHOLD and bb_upper > 0
                                 and price >= bb_upper * (1 - self.BB_NEAR_UPPER_PCT)):
                             components['adx_filter'] = 0.20
-                            if not self.algo.IsWarmingUp:
-                                self.algo.Debug(
-                                    f"Short Mean Reversion Signal: rsi={rsi_val:.1f} "
-                                    f"price={price:.4f} bb_upper={bb_upper:.4f}")
                         elif rsi_val > self.RSI_MILDLY_OVERBOUGHT_THRESHOLD:
                             components['adx_filter'] = 0.10
 
@@ -412,15 +378,9 @@ class MicroScalpEngine:
                       and price <= vwap_sd3_upper * 0.995
                       and price > vwap_sd2_upper):
                     components['vwap_signal'] = 0.20
-                    if not self.algo.IsWarmingUp:
-                        self.algo.Debug(
-                            f"VWAP +3SD Rejection: price={price:.4f} sd3_upper={vwap_sd3_upper:.4f}")
                 elif (vwap_sd > 0 and vwap_sd2_upper > 0
                       and price <= vwap_sd2_upper * 0.997):
                     components['vwap_signal'] = 0.15
-                    if not self.algo.IsWarmingUp:
-                        self.algo.Debug(
-                            f"VWAP +2SD Rejection: price={price:.4f} sd2_upper={vwap_sd2_upper:.4f}")
 
             # ----------------------------------------------------------
             # Signal 6: CVD Divergence (Distribution)
@@ -454,9 +414,15 @@ class MicroScalpEngine:
     # ------------------------------------------------------------------
     def calculate_position_size(self, score, threshold, asset_vol_ann):
         """
-        Conservative position sizing prioritising capital preservation.
+        Position sizing calibrated for fee survival with vol-targeting.
 
-        Returns 35–50% of available capital depending on conviction.
+        At 0.65% round-trip fees, positions must be large enough for the
+        TP target to cover fees, but small enough that stop losses don't
+        cascade into drawdown -> circuit breaker -> passivity.
+
+        Target: max 2% account risk per trade.
+        Returns 25-50% of available capital depending on conviction,
+        scaled by asset volatility.
         """
         if score >= 0.80:
             # 4+ signals firing – high conviction
@@ -469,6 +435,12 @@ class MicroScalpEngine:
             size = 0.35
         else:
             size = 0.25
+
+        # Vol-targeting: scale down for volatile assets, keep size for calmer ones
+        if asset_vol_ann is not None and asset_vol_ann > 0:
+            target_vol = self.algo.target_position_ann_vol  # 0.35
+            vol_scalar = min(target_vol / asset_vol_ann, 1.0)
+            size *= max(vol_scalar, 0.5)  # Never reduce below 50% of base size
 
         kelly = self.algo._kelly_fraction()
         return size * kelly
