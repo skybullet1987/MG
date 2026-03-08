@@ -220,7 +220,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(minutes=2)), self.VerifyOrderFills)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(minutes=15)), self.PortfolioSanityCheck)
 
-        self.SetWarmUp(timedelta(hours=4))
+        self.SetWarmUp(timedelta(days=2))
         self.SetSecurityInitializer(self.CustomSecurityInitializer)
         self.Settings.FreePortfolioValuePercentage = 0.01
         self.Settings.InsightScore = False
