@@ -8,6 +8,9 @@ from collections import deque
 from datetime import timedelta
 # endregion
 
+# Age threshold (in seconds) after which an uncancelable order is marked dead
+DEAD_ORDER_AGE_THRESHOLD_SECONDS = 3600
+
 # Constants from main_qa.py lines 31-68
 SYMBOL_BLACKLIST = {
     "BTCUSD",  # Reference symbol only — never trade (too expensive for small capital, always dust)
@@ -362,6 +365,8 @@ def effective_stale_timeout(algo):
 
 def cancel_stale_new_orders(algo):
     # Allow cancel gate when venue is online or unknown (fallback handled elsewhere)
+    if not hasattr(algo, '_dead_orders'):
+        algo._dead_orders = set()
     try:
         open_orders = algo.Transactions.GetOpenOrders()
         timeout_seconds = effective_stale_timeout(algo)
@@ -369,6 +374,15 @@ def cancel_stale_new_orders(algo):
             sym_val = order.Symbol.Value
             if sym_val in algo._session_blacklist:
                 continue
+
+            # Skip orders in cooldown to prevent API spam
+            if order.Symbol in getattr(algo, '_cancel_cooldowns', {}) and algo.Time < algo._cancel_cooldowns[order.Symbol]:
+                continue
+
+            # Skip permanently dead orders that cannot be canceled
+            if order.Id in algo._dead_orders:
+                continue
+
             order_time = order.Time
             if order_time.tzinfo is not None:
                 order_time = order_time.replace(tzinfo=None)
@@ -390,6 +404,11 @@ def cancel_stale_new_orders(algo):
                 
                 algo.Transactions.CancelOrder(order.Id)
                 algo._cancel_cooldowns[order.Symbol] = algo.Time + timedelta(minutes=algo.cancel_cooldown_minutes)
+
+                # Mark extremely old orders as dead to prevent infinite cancel loops
+                if order_age > DEAD_ORDER_AGE_THRESHOLD_SECONDS:
+                    algo._dead_orders.add(order.Id)
+                    algo.Debug(f"Marked order {order.Id} for {sym_val} as DEAD (age: {order_age/60:.1f}m)")
                 
                 # Only blacklist stale ENTRY orders, not EXIT orders
                 # Exit orders that are stale just get cooldown to allow retry
@@ -870,10 +889,18 @@ def health_check(algo):
                 continue  # Has non-stale orders, skip this symbol
             
             # All orders are stale - cancel them
+            if not hasattr(algo, '_dead_orders'):
+                algo._dead_orders = set()
             for o in open_orders:
+                if o.Id in algo._dead_orders:
+                    continue
                 try:
                     algo.Transactions.CancelOrder(o.Id)
                     issues.append(f"Canceled stale order: {symbol.Value} (order {o.Id})")
+                    order_time = normalize_order_time(o.Time)
+                    if (algo.Time - order_time).total_seconds() > DEAD_ORDER_AGE_THRESHOLD_SECONDS:
+                        algo._dead_orders.add(o.Id)
+                        algo.Debug(f"Marked order {o.Id} for {symbol.Value} as DEAD in health_check")
                 except Exception as e:
                     algo.Debug(f"Error canceling stale order for {symbol.Value}: {e}")
         
@@ -981,10 +1008,18 @@ def resync_holdings_full(algo):
                     continue  # Has non-stuck orders, wait
                 
                 # All orders are stuck - cancel them
+                if not hasattr(algo, '_dead_orders'):
+                    algo._dead_orders = set()
                 for o in open_orders:
+                    if o.Id in algo._dead_orders:
+                        continue
                     try:
                         algo.Transactions.CancelOrder(o.Id)
                         algo.Debug(f"PHANTOM: Canceling stuck order {o.Id} for {symbol.Value}")
+                        order_time = normalize_order_time(o.Time)
+                        if (algo.Time - order_time).total_seconds() > DEAD_ORDER_AGE_THRESHOLD_SECONDS:
+                            algo._dead_orders.add(o.Id)
+                            algo.Debug(f"Marked order {o.Id} for {symbol.Value} as DEAD in resync")
                     except Exception as e:
                         algo.Debug(f"Error canceling stuck order for {symbol.Value}: {e}")
             
