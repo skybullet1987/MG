@@ -30,7 +30,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     """
 
     def Initialize(self):
-        self.SetStartDate(2022, 1, 1)
+        self.SetStartDate(2024, 1, 1)
         self.SetCash(100)
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
@@ -56,11 +56,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.base_take_profit    = self.quick_take_profit
         self.atr_trail_mult      = 2.0
 
-        self.position_size_pct  = 0.70
+        self.position_size_pct  = 0.80
         self.base_max_positions = 6
         self.max_positions      = 6
         self.min_notional       = 5.5
-        self.max_position_usd   = self._get_param("max_position_usd", 5000.0)
+        self.max_position_usd   = self._get_param("max_position_usd", 100000000000.0)
         self.min_price_usd      = 0.001
         self.cash_reserve_pct   = 0.0
         self.min_notional_fee_buffer = 1.5
