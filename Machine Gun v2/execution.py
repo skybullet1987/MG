@@ -400,8 +400,8 @@ def cancel_stale_new_orders(algo):
                 if has_position_or_tracked:
                     algo.Debug(f"STALE EXIT: {sym_val} - cooldown only, not blacklisted")
                 else:
-                    algo._session_blacklist.add(sym_val)
-                    algo.Debug(f"⚠️ ZOMBIE ORDER DETECTED: {sym_val} - blacklisted for session")
+                    algo._symbol_entry_cooldowns[sym_val] = algo.Time + timedelta(minutes=15)
+                    algo.Debug(f"⚠️ ZOMBIE ORDER DETECTED: {sym_val} - entry cooldown 15min")
     except Exception as e:
         algo.Debug(f"Error in _cancel_stale_new_orders: {e}")
 
@@ -470,7 +470,11 @@ def spread_ok(algo, symbol):
         # Allow unknown spreads in both live and backtest — the spread cap
         # check below will catch genuinely wide spreads once data arrives.
         if algo.LiveMode:
-            debug_limited(algo, f"SPREAD UNKNOWN: {symbol.Value} — allowing (no bid/ask yet)")
+            now = algo.Time
+            last_warn = algo._spread_warning_times.get(symbol.Value)
+            if last_warn is None or (now - last_warn).total_seconds() >= 3600:
+                debug_limited(algo, f"SPREAD UNKNOWN: {symbol.Value} — allowing (no bid/ask yet)")
+                algo._spread_warning_times[symbol.Value] = now
         return True
     effective_spread_cap = algo.max_spread_pct
     if algo.LiveMode and (algo.volatility_regime == "high" or algo.market_regime == "sideways"):
@@ -683,10 +687,10 @@ def live_safety_checks(algo):
         debug_limited(algo, "LIVE SAFETY: Cash below $2, pausing new entries")
         return False
     
-    # Rate limit: don't trade more than once per 60 seconds in live
+    # Rate limit: don't trade more than once per 90 seconds in live
     if hasattr(algo, '_last_live_trade_time') and algo._last_live_trade_time is not None:
         seconds_since = (algo.Time - algo._last_live_trade_time).total_seconds()
-        if seconds_since < 60:
+        if seconds_since < 90:
             return False
     
     return True
