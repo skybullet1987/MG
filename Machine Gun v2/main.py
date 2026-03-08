@@ -68,7 +68,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.min_notional       = 5.5
         self.max_position_usd   = self._get_param("max_position_usd", 100000000000.0)
         self.min_price_usd      = 0.001
-        self.cash_reserve_pct   = 0.0
+        self.cash_reserve_pct   = 0.02
         self.min_notional_fee_buffer = 1.5
 
         self.target_position_ann_vol = self._get_param("target_position_ann_vol", 0.35)
@@ -894,7 +894,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             available_cash = max(0, available_cash - open_buy_orders_value)
             total_value = self.Portfolio.TotalPortfolioValue
             # Minimal fee reserve only
-            fee_reserve = max(total_value * 0.01, 0.10)
+            fee_reserve = max(total_value * self.cash_reserve_pct, 0.50)
             reserved_cash = available_cash - fee_reserve
             if reserved_cash <= 0:
                 reject_cash_reserve += 1
