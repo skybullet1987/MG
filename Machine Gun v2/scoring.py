@@ -38,6 +38,8 @@ class MicroScalpEngine:
     RSI_OVERSOLD_THRESHOLD        = 45   # RSI < 45 → oversold, mean reversion buy signal
     RSI_MILDLY_OVERSOLD_THRESHOLD = 50   # RSI < 50 → mildly oversold, partial credit
     BB_NEAR_LOWER_PCT             = 0.03  # within 3% of lower Bollinger Band = near support
+    # Microstructure gate: without OBI or vol_ignition, cap score below entry threshold
+    MICROSTRUCTURE_CONSTRAINT_MAX_SCORE = 0.59
 
     def __init__(self, algorithm):
         self.algo = algorithm
@@ -248,6 +250,14 @@ class MicroScalpEngine:
             self.algo.Debug(f"MicroScalpEngine.calculate_scalp_score error: {e}")
 
         score = sum(components.values())
+
+        # Microstructure constraint: require at least OBI or vol_ignition to fire.
+        # Without real microstructure confirmation, cap the score below entry threshold
+        # to prevent low-quality entries that get eaten by fees.
+        has_microstructure = components.get('obi', 0) > 0 or components.get('vol_ignition', 0) > 0
+        if not has_microstructure:
+            score = min(score, self.MICROSTRUCTURE_CONSTRAINT_MAX_SCORE)
+
         return min(score, 1.0), components
 
     # ------------------------------------------------------------------
