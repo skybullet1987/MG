@@ -25,7 +25,7 @@ SYMBOL_BLACKLIST = {
     # Forex pairs
     "EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "JPYUSD", "CADUSD", "CHFUSD", "CNYUSD", "HKDUSD", "SGDUSD",
     "SEKUSD", "NOKUSD", "DKKUSD", "KRWUSD", "TRYUSD", "ZARUSD", "MXNUSD", "INRUSD", "BRLUSD",
-    "PLNUSD", "THBUSD", "WENUSD"
+    "PLNUSD", "THBUSD",
 }
 
 # Known fiat currency codes used to filter forex pairs from the crypto universe
