@@ -6,7 +6,7 @@ import numpy as np
 
 class MicroScalpEngine:
     """
-    Micro-Scalping Signal Engine - v7.1.0
+    Micro-Scalping Signal Engine - v7.2.0
 
     High-frequency market microstructure scalping system.
     Uses cutting-edge microstructure signals tuned for 1-minute bars on Kraken.
@@ -456,19 +456,19 @@ class MicroScalpEngine:
         """
         Conservative position sizing prioritising capital preservation.
 
-        Returns 70–90% of available capital depending on conviction.
+        Returns 35–50% of available capital depending on conviction.
         """
         if score >= 0.80:
             # 4+ signals firing – high conviction
-            size = 0.90
+            size = 0.50
         elif score >= self.algo.high_conviction_threshold:
             # 3+ signals: good conviction
-            size = 0.80
+            size = 0.40
         elif score >= threshold:
             # Entry threshold met: moderate sizing
-            size = 0.70
+            size = 0.35
         else:
-            size = 0.50
+            size = 0.25
 
         kelly = self.algo._kelly_fraction()
         return size * kelly

@@ -25,7 +25,7 @@ class MakerTakerFeeModel(FeeModel):
 
 class SimplifiedCryptoStrategy(QCAlgorithm):
     """
-    Micro-Scalping System - v7.1.0
+    Micro-Scalping System - v7.2.0
     5-signal micro-scalp engine, regime-adaptive, bull/sideways/bear-aware.
     """
 
@@ -34,7 +34,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.SetCash(100)
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
-        self.entry_threshold = 0.40
+        self.entry_threshold = 0.50
         self.high_conviction_threshold = 0.60
 
         self.quick_take_profit = self._get_param("quick_take_profit", 0.150)
@@ -96,7 +96,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
         self.stale_order_timeout_seconds      = 30
         self.live_stale_order_timeout_seconds = 60
-        self.max_concurrent_open_orders       = 2
+        self.max_concurrent_open_orders       = 5
         self.open_orders_cash_threshold       = 0.5
         self.order_fill_check_threshold_seconds = 60
         self.order_timeout_seconds              = 30
@@ -690,7 +690,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             return
         # Circuit breaker: halt new entries for 12h after 3 consecutive losses
         if self.consecutive_losses >= 3:
-            self.circuit_breaker_expiry = self.Time + timedelta(hours=12)
+            self.circuit_breaker_expiry = self.Time + timedelta(hours=2)
             self.consecutive_losses = 0
             self._log_skip("circuit breaker triggered (3 consecutive losses)")
             return
@@ -980,7 +980,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 self.Debug(f"ORDER FAILED: {sym.Value} - {e}")
                 self._session_blacklist.add(sym.Value)
                 continue
-            if self.LiveMode and success_count >= 1:
+            if self.LiveMode and success_count >= 3:
                 break
 
         if success_count > 0 or (reject_exit_cooldown + reject_loss_cooldown) > 3:
@@ -1253,11 +1253,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                             'exit_reason': 'filled_sell',
                         })
 
-                        if len(self._recent_trade_outcomes) >= 8:
+                        if len(self._recent_trade_outcomes) >= 12:
                             recent_wr = sum(self._recent_trade_outcomes) / len(self._recent_trade_outcomes)
                             if recent_wr < 0.25:
-                                self._cash_mode_until = self.Time + timedelta(hours=24)
-                                self.Debug(f"⚠️ CASH MODE: WR={recent_wr:.0%} over {len(self._recent_trade_outcomes)} trades. Pausing 24h.")
+                                self._cash_mode_until = self.Time + timedelta(hours=4)
+                                self.Debug(f"⚠️ CASH MODE: WR={recent_wr:.0%} over {len(self._recent_trade_outcomes)} trades. Pausing 4h.")
                         cleanup_position(self, symbol)
                         self._failed_exit_attempts.pop(symbol, None)
                         self._failed_exit_counts.pop(symbol, None)
@@ -1327,7 +1327,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if "rate limit" in txt or "too many" in txt:
                 self.Debug(f"⚠️ RATE LIMIT - pausing {self.rate_limit_cooldown_minutes}min")
                 self._rate_limit_until = self.Time + timedelta(minutes=self.rate_limit_cooldown_minutes)
-                self._last_live_trade_time = self.Time
         except Exception as e:
             self.Debug(f"BrokerageMessage parse error: {e}")
 

@@ -350,16 +350,6 @@ def partial_smart_sell(algo, symbol, fraction, tag="Partial TP"):
 
 
 
-    try:
-        open_orders = algo.Transactions.GetOpenOrders()
-        if len(open_orders) > 0:
-            algo.Debug(f"Found {len(open_orders)} open orders - canceling all...")
-            for order in open_orders:
-                algo.Transactions.CancelOrder(order.Id)
-    except Exception as e:
-        algo.Debug(f"Error canceling stale orders: {e}")
-
-
 def effective_stale_timeout(algo):
     return algo.live_stale_order_timeout_seconds if algo.LiveMode else algo.stale_order_timeout_seconds
 
@@ -471,13 +461,10 @@ def get_spread_pct(algo, symbol):
 def spread_ok(algo, symbol):
     sp = get_spread_pct(algo, symbol)
     if sp is None:
-        # In live mode with small accounts (< $100), allow unknown spreads
-        # Otherwise in live mode, fail-closed (reject if spread unknown); in backtest, allow
+        # Allow unknown spreads in both live and backtest — the spread cap
+        # check below will catch genuinely wide spreads once data arrives.
         if algo.LiveMode:
-            portfolio_value = algo.Portfolio.TotalPortfolioValue
-            if portfolio_value < 100:
-                return True
-            return False
+            debug_limited(algo, f"SPREAD UNKNOWN: {symbol.Value} — allowing (no bid/ask yet)")
         return True
     effective_spread_cap = algo.max_spread_pct
     if algo.LiveMode and (algo.volatility_regime == "high" or algo.market_regime == "sideways"):
@@ -690,10 +677,10 @@ def live_safety_checks(algo):
         debug_limited(algo, "LIVE SAFETY: Cash below $2, pausing new entries")
         return False
     
-    # Rate limit: don't trade more than once per 5 minutes in live
+    # Rate limit: don't trade more than once per 60 seconds in live
     if hasattr(algo, '_last_live_trade_time') and algo._last_live_trade_time is not None:
         seconds_since = (algo.Time - algo._last_live_trade_time).total_seconds()
-        if seconds_since < 300:
+        if seconds_since < 60:
             return False
     
     return True
