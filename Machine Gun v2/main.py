@@ -68,7 +68,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.min_notional       = 5.5
         self.max_position_usd   = self._get_param("max_position_usd", 100000000000.0)
         self.min_price_usd      = 0.001
-        self.cash_reserve_pct   = 0.02
+        self.cash_reserve_pct   = 0.00
         self.min_notional_fee_buffer = 1.5
 
         self.target_position_ann_vol = self._get_param("target_position_ann_vol", 0.35)
@@ -84,8 +84,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.max_spread_pct         = 0.008
         self.spread_median_window   = 12
         self.spread_widen_mult      = 2.5
-        self.min_dollar_volume_usd  = 50000
-        self.min_volume_usd         = 2000000
+        self.min_dollar_volume_usd  = 10000
+        self.min_volume_usd         = 10000
 
         self.skip_hours_utc         = []
         self.max_daily_trades       = 24
@@ -95,15 +95,15 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.cancel_cooldown_minutes = 1
         self.max_symbol_trades_per_day = 3
 
-        self.expected_round_trip_fees = 0.0050
-        self.fee_slippage_buffer      = 0.005
-        self.min_expected_profit_pct  = 0.010
+        self.expected_round_trip_fees = 0.0025
+        self.fee_slippage_buffer      = 0.001
+        self.min_expected_profit_pct  = 0.005
         self.adx_min_period           = 10
 
         self.stale_order_timeout_seconds      = 30
         self.live_stale_order_timeout_seconds = 60
         self.max_concurrent_open_orders       = 5
-        self.open_orders_cash_threshold       = 0.5
+        self.open_orders_cash_threshold       = 0.90
         self.order_fill_check_threshold_seconds = 60
         self.order_timeout_seconds              = 30
         self.resync_log_interval_seconds        = 1800
