@@ -523,9 +523,9 @@ def sync_existing_positions(algo):
     synced_count = 0
     positions_to_close = []
     for symbol in algo.Portfolio.Keys:
-        holding = algo.Portfolio[symbol]
-        if not holding.Invested or holding.Quantity == 0:
+        if not is_invested_not_dust(algo, symbol):
             continue
+        holding = algo.Portfolio[symbol]
         ticker = symbol.Value
         if symbol in algo.entry_prices:
             continue
@@ -919,9 +919,9 @@ def resync_holdings_full(algo):
     # Forward resync: find holdings we're not tracking
     missing = []
     for symbol in algo.Portfolio.Keys:
-        holding = algo.Portfolio[symbol]
-        if not holding.Invested or holding.Quantity == 0:
+        if not is_invested_not_dust(algo, symbol):
             continue
+        holding = algo.Portfolio[symbol]
         if symbol in algo.entry_prices:
             continue
         # Skip symbols being tracked by VerifyOrderFills to avoid conflicts
