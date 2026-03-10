@@ -84,7 +84,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.max_spread_pct         = 0.008
         self.spread_median_window   = 12
         self.spread_widen_mult      = 2.5
-        self.min_dollar_volume_usd  = 10000
+        self.min_dollar_volume_usd  = 5000
         self.min_volume_usd         = 10000
 
         self.skip_hours_utc         = []
