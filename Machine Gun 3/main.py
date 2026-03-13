@@ -145,11 +145,11 @@ class SimplifiedCryptoStrategy(
         self.max_spread_pct         = 0.003
         self.spread_median_window   = 12
         self.spread_widen_mult      = 2.5
-        self.min_dollar_volume_usd  = 50000
-        self.min_volume_usd         = 15000000
+        self.min_dollar_volume_usd  = 5000
+        self.min_volume_usd         = 10000
 
         self.skip_hours_utc         = []
-        self.max_daily_trades       = 24
+        self.max_daily_trades       = 24000
         self.daily_trade_count      = 0
         self.last_trade_date        = None
         self.exit_cooldown_hours    = 1.0
