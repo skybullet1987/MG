@@ -88,7 +88,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.min_volume_usd         = 10000
 
         self.skip_hours_utc         = []
-        self.max_daily_trades       = 24
+        self.max_daily_trades       = 24000
         self.daily_trade_count      = 0
         self.last_trade_date        = None
         self.exit_cooldown_hours    = 1.0
