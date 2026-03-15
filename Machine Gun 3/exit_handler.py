@@ -5,7 +5,11 @@ from execution import (
     partial_smart_sell, cleanup_position,
 )
 from datetime import timedelta
-from app import POSITION_STATE_FLAT, POSITION_STATE_OPEN, POSITION_STATE_EXITING
+import config as MG3Config
+from app import (
+    POSITION_STATE_FLAT, POSITION_STATE_OPEN, POSITION_STATE_EXITING,
+    POSITION_STATE_RECOVERING,
+)
 # endregion
 
 
@@ -26,14 +30,28 @@ class ExitHandlerMixin:
         if self._rate_limit_until is not None and self.Time < self._rate_limit_until:
             return
         for kvp in self.Portfolio:
-            if not is_invested_not_dust(self, kvp.Key):
-                self._failed_exit_attempts.pop(kvp.Key, None)
-                self._failed_exit_counts.pop(kvp.Key, None)
+            symbol = kvp.Key
+            if not is_invested_not_dust(self, symbol):
+                self._failed_exit_attempts.pop(symbol, None)
+                self._failed_exit_counts.pop(symbol, None)
                 continue
 
-            if self._failed_exit_counts.get(kvp.Key, 0) >= 3:
+            state = self._get_position_state(symbol)
+
+            # RECOVERING: exit retries exhausted — use a direct market order.
+            if state == POSITION_STATE_RECOVERING:
+                self._force_market_liquidate(symbol)
                 continue
-            self._check_exit(kvp.Key, self.Securities[kvp.Key].Price, kvp.Value)
+
+            # Belt-and-suspenders: if failure count reached threshold but state
+            # was not updated (e.g. failures counted via OnOrderEvent Invalid),
+            # escalate now.
+            if self._failed_exit_counts.get(symbol, 0) >= MG3Config.MAX_EXIT_RETRIES:
+                self._set_position_state(symbol, POSITION_STATE_RECOVERING)
+                self._force_market_liquidate(symbol)
+                continue
+
+            self._check_exit(symbol, self.Securities[symbol].Price, kvp.Value)
 
         for kvp in self.Portfolio:
             symbol = kvp.Key
@@ -44,6 +62,37 @@ class ExitHandlerMixin:
                 self.highest_prices[symbol] = kvp.Value.AveragePrice
                 self.entry_times[symbol] = self.Time
                 self.Debug(f"ORPHAN RECOVERY: {symbol.Value} re-tracked")
+
+    def _force_market_liquidate(self, symbol):
+        """Force market liquidation for a position stuck in RECOVERING state.
+
+        Called when the normal limit-exit path has failed MAX_EXIT_RETRIES times.
+        Uses a market order so the position is closed regardless of spread.
+        Does NOT call cleanup_position – OnOrderEvent handles cleanup on fill.
+        """
+        if len(self.Transactions.GetOpenOrders(symbol)) > 0:
+            return  # exit already in flight
+        if symbol not in self.Portfolio or self.Portfolio[symbol].Quantity == 0:
+            self._set_position_state(symbol, POSITION_STATE_FLAT)
+            self._failed_exit_counts.pop(symbol, None)
+            return
+        holding = self.Portfolio[symbol]
+        qty = abs(holding.Quantity)
+        if qty == 0:
+            self._set_position_state(symbol, POSITION_STATE_FLAT)
+            return
+        direction_mult = -1 if holding.Quantity > 0 else 1
+        entry = self.entry_prices.get(symbol, holding.AveragePrice)
+        price = self.Securities[symbol].Price if symbol in self.Securities else 0
+        pnl = (price - entry) / entry if entry > 0 and price > 0 else 0
+        self.Debug(f"⚠️ FORCE MARKET LIQUIDATE (recovering): {symbol.Value} qty={qty:.6f} PnL:{pnl:+.2%}")
+        try:
+            self.MarketOrder(symbol, qty * direction_mult, tag="Force Recovery Exit")
+            self._set_position_state(symbol, POSITION_STATE_EXITING)
+            self._failed_exit_counts.pop(symbol, None)
+            self.mg3_recovery_events += 1
+        except Exception as e:
+            self.Debug(f"FORCE MARKET LIQUIDATE failed for {symbol.Value}: {e}")
 
     def _check_exit(self, symbol, price, holding):
         if len(self.Transactions.GetOpenOrders(symbol)) > 0:
@@ -190,10 +239,25 @@ class ExitHandlerMixin:
                 self.mg3_pnl_by_tag[tag].append(pnl)
                 self.Debug(f"{tag}: {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.1f}h")
             else:
-                self.Debug(f"⚠️ EXIT FAILED ({tag}): {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.1f}h -- position unsellable, cleaning up")
-                # MG3: revert to OPEN since the exit did not execute
-                self._set_position_state(symbol, POSITION_STATE_OPEN)
-                cleanup_position(self, symbol)
-                self.rsi_peaked_overbought.pop(symbol, None)
-                self.entry_volumes.pop(symbol, None)
-                self._choppy_regime_entries.pop(symbol, None)
+                # smart_liquidate returned False: the position is STILL held.
+                # Do NOT call cleanup_position here — that would wipe entry_prices,
+                # highest_prices, and entry_times while the position is open, which
+                # causes the next exit check to lose PnL context and re-track the
+                # position as an orphan with a wrong entry price.
+                # Instead: increment the failure counter and keep all tracking intact.
+                # After MAX_EXIT_RETRIES failures the position is escalated to
+                # RECOVERING and a force market order is used.
+                fail_count = self._failed_exit_counts.get(symbol, 0) + 1
+                self._failed_exit_counts[symbol] = fail_count
+                if fail_count >= MG3Config.MAX_EXIT_RETRIES:
+                    self._set_position_state(symbol, POSITION_STATE_RECOVERING)
+                    self.Debug(
+                        f"⚠️ EXIT FAILED ({fail_count}×, RECOVERING): {symbol.Value} "
+                        f"| PnL:{pnl:+.2%} | Held:{hours:.1f}h — escalating to force-market"
+                    )
+                else:
+                    self._set_position_state(symbol, POSITION_STATE_OPEN)
+                    self.Debug(
+                        f"⚠️ EXIT FAILED ({fail_count}/{MG3Config.MAX_EXIT_RETRIES}): "
+                        f"{symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.1f}h — will retry"
+                    )

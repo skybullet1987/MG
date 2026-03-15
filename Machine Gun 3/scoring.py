@@ -453,22 +453,31 @@ class MicroScalpEngine:
     # Position sizing
     # ------------------------------------------------------------------
     def calculate_position_size(self, score, threshold, asset_vol_ann):
-        """
-        Conservative position sizing prioritising capital preservation.
+        """Position sizing calibrated for a small (~$2,000) account.
 
-        Returns 70–90% of available capital depending on conviction.
+        Returns a fraction of available reserved cash to allocate to a single
+        position.  Fractions are intentionally modest so that the hard cap
+        ``MAX_SYMBOL_EXPOSURE_USD`` (config.py) is the binding constraint at
+        normal account sizes, not the fraction itself.
+
+        With $2,000 and MAX_SYMBOL_EXPOSURE_USD = $250:
+          - 0.15 × $1,980 available = $297 → capped at $250  ✓
+          - 0.10 × $1,980 available = $198                   ✓
+
+        Kelly adjustment is applied on top; it multiplies by 0.5–1.5 based on
+        recent win/loss history, providing adaptive sizing without risk blowup.
         """
         if score >= 0.80:
-            # 4+ signals firing – high conviction
-            size = 0.90
+            # 4+ signals: high conviction
+            size = 0.15
         elif score >= self.algo.high_conviction_threshold:
             # 3+ signals: good conviction
-            size = 0.80
+            size = 0.12
         elif score >= threshold:
             # Entry threshold met: moderate sizing
-            size = 0.70
+            size = 0.10
         else:
-            size = 0.50
+            size = 0.07
 
         kelly = self.algo._kelly_fraction()
         return size * kelly

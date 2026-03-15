@@ -14,11 +14,14 @@ improvements on top:
 |---|---|
 | Configuration | Single `config.py` – all parameters in one place with conservative defaults |
 | Safety | `mode` toggle (`backtest` / `paper` / `live`); live mode must be explicitly set |
-| Risk | `MAX_DAILY_LOSS_PCT` guard added; positions, drawdown and loss limits sourced from config |
-| State machine | Position lifecycle states: `flat → entering → open → exiting → flat` |
-| Reconciliation | `ReconcilePositions()` hook compares local state vs brokerage holdings |
-| Backtest metrics | Cancel-to-fill ratio, invalid order count, PnL by exit tag – all logged at end of run |
-| Kraken prep | Price/lot normalisation hooks, reconciliation cadence, retry back-off wired to config |
+| Risk | `MAX_DAILY_LOSS_PCT` guard; positions, drawdown and loss limits from config |
+| State machine | Lifecycle states: `flat → entering → open → exiting → recovering → flat` |
+| Failed-exit fix | Failed exits no longer wipe tracking data; retries use the original entry price |
+| Recovery path | After `MAX_EXIT_RETRIES` failures a position escalates to `recovering` and is force-market liquidated |
+| Reconciliation | `ReconcilePositions()` compares local state vs brokerage; force-exits stuck recovering positions |
+| Backtest metrics | Cancel-to-fill ratio, invalid orders, avg hold time, peak positions, PnL by exit tag |
+| Realism | Slippage base raised to 0.25 %, daily order cap removed, volume thresholds tuned for small accounts |
+| $2 k defaults | Max 3 positions × $250 cap; 3 % daily loss guard; 15 % drawdown limit |
 | Direction toggles | Longs enabled, **shorts disabled by default** until short pipeline is validated |
 
 ---
@@ -39,15 +42,12 @@ improvements on top:
    | `exit_handler.py` | `CheckExits` and `_check_exit` exit logic |
    | `reporting.py` | `OnOrderEvent`, `OnEndOfAlgorithm`, metrics, daily report |
    | `config_loader.py` | Config validation helpers |
-   | `run_backtest.py` | Backtest flow documentation and helpers |
-   | `run_paper.py` | Paper/live-sim flow documentation and helpers |
    | `execution.py` | Shared order-execution utilities |
    | `scoring.py` | `MicroScalpEngine` signal calculations |
-   | `alt_data.py` | Alternative data helpers |
    | `config.py` | All tunable parameters |
 
 3. Set the back-test date range and starting capital in `main.py`
-   (`SetStartDate` / `SetCash`).
+   (`SetStartDate` / `SetCash`).  Default: `2025-01-01`, `$2,000`.
 4. Click **Backtest**.
 
 The algorithm starts in `backtest` mode by default (set in `config.py` →
@@ -62,7 +62,7 @@ pip install lean
 # Pull the project
 lean project-create mg3
 
-# Copy ALL .py files into the project folder, then run
+# Copy all .py files into the project folder, then run
 lean backtest mg3
 ```
 
@@ -103,23 +103,44 @@ QuantConnect algorithm parameters (the strategy reads them via `GetParameter()`)
 | Parameter | Default | Purpose |
 |---|---|---|
 | `MODE_DEFAULT` | `"backtest"` | Execution mode; must be `"live"` for live trading |
-| `MAX_DAILY_LOSS_PCT` | `0.05` | Pause entries when daily drawdown ≥ 5 % |
-| `MAX_OPEN_POSITIONS` | `6` | Hard cap on simultaneous open positions |
-| `MAX_SYMBOL_EXPOSURE_USD` | `1500` | Max USD exposure per single symbol |
-| `MAX_DRAWDOWN_LIMIT` | `0.25` | Portfolio drawdown limit before cooldown |
+| `MAX_DAILY_LOSS_PCT` | `0.03` | Pause entries when daily loss ≥ 3 % (~$60 on $2 k) |
+| `MAX_OPEN_POSITIONS` | `3` | Hard cap on simultaneous open positions |
+| `MAX_SYMBOL_EXPOSURE_USD` | `250` | Max USD per single symbol (~12.5 % of $2 k) |
+| `MAX_DRAWDOWN_LIMIT` | `0.15` | Portfolio drawdown limit before cooldown (was 25 %) |
+| `OPEN_ORDERS_CASH_THRESHOLD` | `0.90` | Max fraction of cash reserved by open buy orders |
 | `ORDER_TIMEOUT_SECONDS` | `30` | Stale order timeout in backtest/paper |
 | `LIVE_ORDER_TIMEOUT_SECONDS` | `60` | Stale order timeout in live mode |
 | `REPLACE_THROTTLE_SECONDS` | `60` | Min seconds between replace/re-submit for same symbol |
-| `MAX_EXIT_RETRIES` | `3` | Max retries for a failed exit before cleanup |
+| `MAX_EXIT_RETRIES` | `3` | Failed-exit retries before force-market recovery |
 | `LONG_ENABLED` | `True` | Enable long entries |
 | `SHORT_ENABLED` | `False` | Shorts disabled – enable only after short-pipeline validation |
 | `FEE_ASSUMPTION_RT` | `0.0050` | Round-trip fee assumption (0.50 %) |
-| `SLIPPAGE_BUFFER` | `0.001` | Extra slippage buffer on top of fee assumption |
+| `SLIPPAGE_BUFFER` | `0.002` | Slippage buffer on top of fee (0.20 %, raised for realism) |
 | `STRICT_LIMIT_FILL` | `True` | Limit orders only fill when market trades through the price |
 | `MIN_EXPECTED_PROFIT_PCT` | `0.010` | Min net profit (after fees + slippage) required to enter |
 | `KRAKEN_PRICE_PRECISION` | `None` | Price decimal precision; None = exchange default |
 | `KRAKEN_LOT_SIZE` | `None` | Lot-size increment; None = exchange default |
 | `RECONCILIATION_CADENCE_SECONDS` | `300` | How often to run local-vs-exchange state check |
+
+### $2,000 test-account quick reference
+
+```python
+# main.py defaults
+SetCash(2000)
+SetStartDate(2025, 1, 1)
+position_size_pct = 0.20          # high-vol size cap; effective trade ≈ $150–$250
+
+# config.py defaults (do not change for initial validation)
+MAX_OPEN_POSITIONS      = 3       # 3 × $250 = $750 max deployed
+MAX_SYMBOL_EXPOSURE_USD = 250.0   # hard cap per position
+MAX_DAILY_LOSS_PCT      = 0.03    # $60 daily stop
+MAX_DRAWDOWN_LIMIT      = 0.15    # $300 drawdown limit
+
+# Volume thresholds (tuned for small accounts – PR #47/#49)
+min_dollar_volume_usd   = 5000    # bar-level liquidity filter
+min_volume_usd          = 10000   # universe inclusion filter
+max_daily_trades        = 24000   # effectively unlimited (PR #49)
+```
 
 ---
 
@@ -127,12 +148,14 @@ QuantConnect algorithm parameters (the strategy reads them via `GetParameter()`)
 
 ### Phase 1 – Backtest validation (before any real money)
 
-1. Set `MODE_DEFAULT = "backtest"` in `config.py`.
-2. Run a minimum 3-month backtest on Kraken data.
+1. Set `MODE_DEFAULT = "backtest"` in `config.py` (it is the default).
+2. Run a minimum 3-month backtest on Kraken data with `SetCash(2000)`.
 3. Review **MG3 Backtest Metrics** at the end of the run:
    - Cancel-to-fill ratio < 2
    - Invalid orders < 5 % of fills
-   - Positive expectancy per exit tag in the direction you expect
+   - Recovery events ≈ 0 (> 5 indicates a systemic exit-failure problem)
+   - "Stop Loss" avg PnL less negative than `-tight_stop_loss` (check for slippage overshoot)
+   - Positive expectancy per exit tag in the expected direction
 4. Cross-check equity curve, max drawdown, and Sharpe ratio.
 
 ### Phase 2 – Paper / live-sim
@@ -142,20 +165,23 @@ QuantConnect algorithm parameters (the strategy reads them via `GetParameter()`)
 3. Verify order logs match expected fill/cancel rates from Phase 1.
 4. Monitor reconciliation logs (`[RECONCILE]` prefix) – phantom positions or missed states
    indicate an integration issue that must be fixed before live.
+5. Confirm `Recovery events = 0` in live paper; any non-zero count needs investigation.
 
 ### Phase 3 – Micro live
 
 1. Set `MODE_DEFAULT = "live"` in `config.py`.
-2. Start with minimum capital (e.g. $25–$50) and `MAX_OPEN_POSITIONS = 2`.
+2. Start with minimum capital (~$250–$500) and `MAX_OPEN_POSITIONS = 2`.
 3. Watch for Kraken-specific issues:
    - `KRAKEN_PRICE_PRECISION` / `KRAKEN_LOT_SIZE` may need tuning for illiquid pairs.
    - Monitor rate-limit messages in the log; adjust `rate_limit_cooldown_minutes` if needed.
 4. Only scale capital after at least 20 live trades with results consistent with Phase 1.
 
-### Phase 4 – Full deployment
+### Phase 4 – Full $2,000 deployment
 
-- Gradually raise `MAX_OPEN_POSITIONS` and `MAX_SYMBOL_EXPOSURE_USD` as confidence grows.
-- Keep `MAX_DAILY_LOSS_PCT = 0.05` (or tighten) as a permanent safety rail.
+- Set `MAX_OPEN_POSITIONS = 3` and `MAX_SYMBOL_EXPOSURE_USD = 250` (already the defaults).
+- Keep `MAX_DAILY_LOSS_PCT = 0.03` as a permanent safety rail.
+- Gradually raise `MAX_SYMBOL_EXPOSURE_USD` (up to $500) only after confirming
+  backtest-vs-live performance gap is < 30 %.
 
 ---
 
@@ -166,3 +192,5 @@ QuantConnect algorithm parameters (the strategy reads them via `GetParameter()`)
   call `self.Error(...)` and refuse to trade.
 - All risk limits are sourced from `config.py` so changes are auditable and reversible.
 - Short positions are disabled until short-signal validation is completed.
+- Failed exits are **never silently abandoned**: after `MAX_EXIT_RETRIES` the position
+  escalates to `recovering` and is force-market liquidated via `ReconcilePositions`.

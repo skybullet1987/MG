@@ -2,7 +2,7 @@
 from AlgorithmImports import *
 from execution import (
     is_invested_not_dust, get_min_notional_usd, cleanup_position,
-    persist_state, slip_log, daily_report,
+    persist_state, slip_log, daily_report, get_actual_position_count,
 )
 from datetime import timedelta
 import config as MG3Config
@@ -69,6 +69,10 @@ class ReportingMixin:
                     self.daily_trade_count += 1
                     # MG3: position fully entered → OPEN
                     self._set_position_state(symbol, POSITION_STATE_OPEN)
+                    # MG3: track peak simultaneous open positions
+                    current_pos = get_actual_position_count(self)
+                    if current_pos > self.mg3_peak_positions:
+                        self.mg3_peak_positions = current_pos
 
                     crypto = self.crypto_data.get(symbol)
                     if crypto and len(crypto['volume']) >= 1:
@@ -83,6 +87,11 @@ class ReportingMixin:
                             entry = event.FillPrice
                             self.Debug(f"⚠️ WARNING: Missing entry price for {symbol.Value} sell, using fill price")
                         pnl = (event.FillPrice - entry) / entry if entry > 0 else 0
+                        # MG3: record hold duration for avg-hold-time metric
+                        hold_hours = (
+                            (self.Time - self.entry_times[symbol]).total_seconds() / 3600
+                            if symbol in self.entry_times else 0.0
+                        )
                         self._rolling_wins.append(1 if pnl > 0 else 0)
                         self._recent_trade_outcomes.append(1 if pnl > 0 else 0)
                         if pnl > 0:
@@ -98,6 +107,7 @@ class ReportingMixin:
                             'time': self.Time,
                             'symbol': symbol.Value,
                             'pnl_pct': pnl,
+                            'hold_hours': hold_hours,
                             'exit_reason': 'filled_sell',
                         })
 
@@ -202,17 +212,62 @@ class ReportingMixin:
         persist_state(self)
 
     def _log_mg3_metrics(self):
-        """Log MG3-specific backtest validation metrics to the algorithm output."""
+        """Log MG3-specific backtest validation and forensic metrics.
+
+        These numbers are the primary signal-quality gate before moving from
+        backtest to paper or live (see README Phased Rollout – Phase 1).
+
+        Acceptance thresholds:
+          - Cancel-to-fill ratio  < 2
+          - Invalid orders        < 5 % of fills
+          - Stop Loss avg PnL     more positive than -tight_stop_loss (slippage check)
+          - Recovery events       ideally 0; > 5 indicates systemic exit failure
+        """
         self.Debug("=== MG3 BACKTEST METRICS ===")
-        # Cancel-to-fill ratio
+
+        # --- Order quality ---
         if self.mg3_fill_count > 0:
             ctf = self.mg3_cancel_count / self.mg3_fill_count
-            self.Debug(f"Cancel-to-fill ratio: {ctf:.2f} ({self.mg3_cancel_count} cancels / {self.mg3_fill_count} fills)")
+            invalid_pct = self.mg3_invalid_count / self.mg3_fill_count
+            self.Debug(
+                f"Cancel-to-fill ratio : {ctf:.2f}  "
+                f"({self.mg3_cancel_count} cancels / {self.mg3_fill_count} fills)"
+            )
+            self.Debug(
+                f"Invalid orders       : {self.mg3_invalid_count}  "
+                f"({invalid_pct:.1%} of fills)"
+            )
         else:
-            self.Debug(f"Cancel-to-fill ratio: N/A (fills=0, cancels={self.mg3_cancel_count})")
-        # Invalid order count
-        self.Debug(f"Invalid orders: {self.mg3_invalid_count}")
-        # PnL by exit tag
+            self.Debug(f"Cancel-to-fill ratio : N/A  (fills=0, cancels={self.mg3_cancel_count})")
+            self.Debug(f"Invalid orders       : {self.mg3_invalid_count}")
+
+        # --- Recovery events (failed exits escalated to force-market) ---
+        self.Debug(f"Recovery events      : {self.mg3_recovery_events}")
+
+        # --- Peak concurrent positions ---
+        self.Debug(f"Peak open positions  : {self.mg3_peak_positions}")
+
+        # --- Hold-time statistics (from trade_log) ---
+        hold_times = [t.get('hold_hours', 0) for t in self.trade_log if t.get('hold_hours', 0) > 0]
+        if hold_times:
+            avg_hold = sum(hold_times) / len(hold_times)
+            max_hold = max(hold_times)
+            self.Debug(f"Avg hold time        : {avg_hold:.2f}h  (max {max_hold:.1f}h)")
+        else:
+            self.Debug("Avg hold time        : N/A")
+
+        # --- Estimated round-trip fees paid ---
+        # Approximation: fills / 2 round trips × FEE_ASSUMPTION_RT × avg position size.
+        # Exact fee data is in the QC trade blotter; this is a sanity-check estimate.
+        rt_count = self.mg3_fill_count // 2
+        est_fee_pct = MG3Config.FEE_ASSUMPTION_RT + MG3Config.SLIPPAGE_BUFFER
+        self.Debug(
+            f"Est. cost per RT     : {est_fee_pct:.2%}  "
+            f"(fee {MG3Config.FEE_ASSUMPTION_RT:.2%} + slip {MG3Config.SLIPPAGE_BUFFER:.2%})  "
+            f"× ~{rt_count} round trips"
+        )
+
+        # --- PnL by exit tag ---
         if self.mg3_pnl_by_tag:
             self.Debug("PnL by exit tag:")
             for tag, pnls in sorted(self.mg3_pnl_by_tag.items()):
@@ -222,7 +277,8 @@ class ReportingMixin:
                 wr = wins / n if n > 0 else 0.0
                 self.Debug(f"  {tag:<30} n={n:>4}  avg={avg:+.3%}  wr={wr:.0%}")
         else:
-            self.Debug("PnL by exit tag: (no tagged exits recorded)")
+            self.Debug("PnL by exit tag      : (no tagged exits recorded)")
+
         self.Debug("=== END MG3 METRICS ===")
 
     def DailyReport(self):
