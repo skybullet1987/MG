@@ -9,7 +9,12 @@ from QuantConnect.Securities import CashAmount
 import config as MG3Config
 # from QuantConnect.Orders.Slippage import SlippageModel
 
-# Modular mixins – each module owns one concern of SimplifiedCryptoStrategy
+# Modular helper modules – each owns one concern of SimplifiedCryptoStrategy.
+# Methods are injected onto the class after definition (see bottom of this file)
+# to work around the PythonNet limitation: a Python class that inherits from a
+# C# managed class (QCAlgorithm) cannot simultaneously use Python multiple
+# inheritance.  Injecting methods at class-definition time achieves the same
+# effect as mixin inheritance while remaining fully QC/PythonNet compatible.
 from app import AppMixin, POSITION_STATE_FLAT, POSITION_STATE_ENTERING, POSITION_STATE_OPEN, POSITION_STATE_EXITING
 from data_layer import DataLayerMixin
 from orchestration import OrchestrationMixin
@@ -31,10 +36,7 @@ class MakerTakerFeeModel(FeeModel):
         return OrderFee(CashAmount(trade_value * fee_pct, "USD"))
 
 
-class SimplifiedCryptoStrategy(
-    AppMixin, DataLayerMixin, OrchestrationMixin, ExitHandlerMixin, ReportingMixin,
-    QCAlgorithm,
-):
+class SimplifiedCryptoStrategy(QCAlgorithm):
     """
     Machine Gun 3 - Micro-Scalping System v8.0.0
     =============================================
@@ -47,21 +49,28 @@ class SimplifiedCryptoStrategy(
     * Backtest metrics: cancel-to-fill ratio, invalid order count, PnL by exit tag.
     * Strategy toggles: long enabled, short disabled by default.
     * Conservative safe defaults – live trading must be explicitly enabled.
+    * Small-account auto-scaling: works with accounts as small as $120.
 
-    Module layout (post file-size refactor)
-    ----------------------------------------
-    main.py          – this file; thin entrypoint, Initialize, CustomSecurityInitializer
+    Architecture
+    ------------
+    MG3 uses a single QCAlgorithm subclass (required for PythonNet/QC compatibility).
+    Methods from each helper module are injected onto the class at load time; see the
+    method-injection block at the bottom of this file.
+
+    Module layout
+    -------------
+    main.py          – this file; thin entrypoint + method injection
     app.py           – bootstrap/wiring helpers (AppMixin)
     data_layer.py    – per-bar data ingestion and scoring pipeline (DataLayerMixin)
     orchestration.py – Rebalance and _execute_trades entry logic (OrchestrationMixin)
     exit_handler.py  – CheckExits and _check_exit exit logic (ExitHandlerMixin)
     reporting.py     – OnOrderEvent, OnEndOfAlgorithm, metrics (ReportingMixin)
     config_loader.py – config helpers and mode validation
-    run_backtest.py  – backtest flow documentation and helpers
-    run_paper.py     – paper/live-sim flow documentation and helpers
     execution.py     – shared order-execution utilities
     scoring.py       – MicroScalpEngine signal calculations
     config.py        – all tunable parameters
+
+    ALL ten .py files must be present in the same QC project / directory.
     """
 
     def Initialize(self):
@@ -254,6 +263,30 @@ class SimplifiedCryptoStrategy(
         self.kraken_status = "unknown"
         self._last_skip_reason = None
 
+        # --- MG3: small-account auto-scaling ---
+        # When SetCash() is below SMALL_ACCOUNT_THRESHOLD_USD (or SMALL_ACCOUNT_MODE
+        # is forced on in config.py), parameters are automatically scaled down so the
+        # strategy is compatible with accounts as small as $120.
+        # This override runs *after* all default parameters are set, so it takes
+        # precedence over any config.py values.
+        initial_cash = self.Portfolio.Cash
+        _small_account = (
+            MG3Config.SMALL_ACCOUNT_MODE
+            or initial_cash < MG3Config.SMALL_ACCOUNT_THRESHOLD_USD
+        )
+        if _small_account:
+            self.base_max_positions = MG3Config.SMALL_ACCOUNT_MAX_POSITIONS
+            self.max_positions      = MG3Config.SMALL_ACCOUNT_MAX_POSITIONS
+            # Cap per-position size to 30 % of cash, not exceeding the config hard limit.
+            self.max_position_usd   = min(
+                MG3Config.SMALL_ACCOUNT_MAX_EXPOSURE_USD,
+                max(initial_cash * 0.30, self.min_notional * 3),
+            )
+            self.Debug(
+                f"[MG3] Small-account mode: ${initial_cash:.0f} → "
+                f"max_pos={self.max_positions}  max_usd=${self.max_position_usd:.1f}"
+            )
+
         self.UniverseSettings.Resolution = Resolution.Minute
         self.AddUniverse(CryptoUniverse.Kraken(self.UniverseFilter))
 
@@ -302,3 +335,34 @@ class SimplifiedCryptoStrategy(
         Maker/Taker fee model (0.25% for Limit orders, 0.40% for Market orders)."""
         security.SetSlippageModel(RealisticCryptoSlippage())
         security.SetFeeModel(MakerTakerFeeModel())
+
+
+# ---------------------------------------------------------------------------
+# QC-compatible mixin method injection
+# ---------------------------------------------------------------------------
+# PythonNet prevents Python classes from using multiple inheritance when one
+# of the base classes is a C# managed class (such as QCAlgorithm).  To keep
+# the modular file layout while remaining compatible, we copy each helper
+# module's methods onto SimplifiedCryptoStrategy at module-load time.  This
+# is semantically equivalent to "class SimplifiedCryptoStrategy(AppMixin,
+# DataLayerMixin, ...)" but does not trigger the PythonNet restriction.
+#
+# Injection order mirrors the old MRO: AppMixin → DataLayerMixin →
+# OrchestrationMixin → ExitHandlerMixin → ReportingMixin.  Later entries
+# override earlier ones on name collision (there are none in practice).
+def _inject_mixin(target_cls, mixin_cls):
+    for _name, _attr in vars(mixin_cls).items():
+        if not _name.startswith("__"):
+            setattr(target_cls, _name, _attr)
+
+
+for _mixin_cls in (
+    AppMixin,
+    DataLayerMixin,
+    OrchestrationMixin,
+    ExitHandlerMixin,
+    ReportingMixin,
+):
+    _inject_mixin(SimplifiedCryptoStrategy, _mixin_cls)
+
+del _inject_mixin, _mixin_cls
