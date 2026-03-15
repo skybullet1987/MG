@@ -277,7 +277,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if _small_account:
             self.base_max_positions = MG3Config.SMALL_ACCOUNT_MAX_POSITIONS
             self.max_positions      = MG3Config.SMALL_ACCOUNT_MAX_POSITIONS
-            # Cap per-position size to 30 % of cash, not exceeding the config hard limit.
+            # Cap per-position size to 30% of cash, not exceeding the config hard limit.
             self.max_position_usd   = min(
                 MG3Config.SMALL_ACCOUNT_MAX_EXPOSURE_USD,
                 max(initial_cash * 0.30, self.min_notional * 3),

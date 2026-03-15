@@ -32,7 +32,7 @@ improvements on top:
 
 ### Why single-inheritance + method injection?
 
-QuantConnect uses **PythonNet** to bridge Python and C# (the Lean engine).  PythonNet
+QuantConnect uses **PythonNet** to bridge Python and C# (the Lean engine). PythonNet
 has a hard restriction: a Python class that inherits from a C# managed class
 (`QCAlgorithm`) **cannot simultaneously use Python multiple inheritance**.
 
@@ -194,12 +194,12 @@ SetStartDate(2025, 1, 1)
 # Auto-applied overrides (from config.py SMALL_ACCOUNT_* constants)
 # SMALL_ACCOUNT_MAX_POSITIONS    = 2      → max 2 simultaneous positions
 # SMALL_ACCOUNT_MAX_EXPOSURE_USD = 40.0   → $40 cap per position
-# Effective max deployed: 2 × $40 = $80 (~67 % of $120)
+# Effective max deployed: 2 × $40 = $80 (~67% of $120)
 
 # Unchanged constraints that still apply:
-MIN_EXPECTED_PROFIT_PCT = 0.010   # 1 % min net profit gate – $0.40 on a $40 position
-MAX_DAILY_LOSS_PCT      = 0.03    # 3 % = ~$3.60 daily stop on $120
-MAX_DRAWDOWN_LIMIT      = 0.15    # 15 % = $18 max portfolio drawdown before cooldown
+MIN_EXPECTED_PROFIT_PCT = 0.010   # 1% min net profit gate – $0.40 on a $40 position
+MAX_DAILY_LOSS_PCT      = 0.03    # 3% = ~$3.60 daily stop on $120
+MAX_DRAWDOWN_LIMIT      = 0.15    # 15% = $18 max portfolio drawdown before cooldown
 ```
 
 > **Tip:** With $120 the minimum order notional (`min_notional = $5.50`) is still
