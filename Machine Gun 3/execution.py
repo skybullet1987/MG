@@ -70,20 +70,29 @@ KRAKEN_SELL_FEE_BUFFER = 0.006  # 0.6% (0.4% base fee + 0.2% safety margin)
 
 
 class RealisticCryptoSlippage:
-    """Volume-aware slippage model for crypto."""
-    
+    """Volume-aware slippage model for crypto.
+
+    Calibrated to narrow the backtest-vs-live gap:
+      - base_slippage_pct raised to 0.0025 (0.25 %) to better capture bid-ask
+        spread cost and market-impact friction on small crypto orders.
+      - max_slippage_pct raised to 0.03 (3 %) to allow realistic outlier fills
+        on illiquid pairs (e.g. micro-cap alts at market open or close).
+      - volume_impact_factor slightly increased to penalise orders that are a
+        meaningful fraction of the bar's traded volume.
+    """
+
     def __init__(self):
-        self.base_slippage_pct = 0.001
-        self.volume_impact_factor = 0.10
-        self.max_slippage_pct = 0.02
-    
+        self.base_slippage_pct = 0.0025   # 0.25 % base (was 0.10 %)
+        self.volume_impact_factor = 0.12  # slightly higher market-impact (was 0.10)
+        self.max_slippage_pct = 0.03      # 3 % cap (was 2 %)
+
     def get_slippage_approximation(self, asset, order):
         price = asset.Price
         if price <= 0:
             return 0
-        
+
         slippage_pct = self.base_slippage_pct
-        
+
         volume = asset.Volume
         if volume > 0:
             order_value = abs(order.Quantity) * price
@@ -92,16 +101,16 @@ class RealisticCryptoSlippage:
                 participation_rate = order_value / volume_value
                 volume_impact = self.volume_impact_factor * (participation_rate ** 1.5)
                 slippage_pct += volume_impact
-        
+
         if price < 0.01:
             slippage_pct *= 3.0
         elif price < 0.10:
             slippage_pct *= 2.0
         elif price < 1.0:
             slippage_pct *= 1.5
-        
+
         slippage_pct = min(slippage_pct, self.max_slippage_pct)
-        
+
         return price * slippage_pct
 
 

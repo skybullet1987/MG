@@ -14,10 +14,11 @@ import config as MG3Config
 # Each open position progresses: FLAT -> ENTERING -> OPEN -> EXITING -> FLAT
 # These constants are imported by other modules that need them.
 # ---------------------------------------------------------------------------
-POSITION_STATE_FLAT     = "flat"
-POSITION_STATE_ENTERING = "entering"
-POSITION_STATE_OPEN     = "open"
-POSITION_STATE_EXITING  = "exiting"
+POSITION_STATE_FLAT      = "flat"
+POSITION_STATE_ENTERING  = "entering"
+POSITION_STATE_OPEN      = "open"
+POSITION_STATE_EXITING   = "exiting"
+POSITION_STATE_RECOVERING = "recovering"  # failed exits escalated to force-market liquidation
 
 
 class AppMixin:
@@ -125,6 +126,33 @@ class AppMixin:
         for sym in untracked:
             self.Debug(f"[RECONCILE] untracked holding {sym.Value} — setting state to open")
             self._set_position_state(sym, POSITION_STATE_OPEN)
+
+        # 3. Force-market exit for RECOVERING positions that have no open orders.
+        # RECOVERING means the normal limit-exit path has exhausted its retries;
+        # we escalate here so the position cannot be silently abandoned.
+        for sym in list(self._position_states.keys()):
+            if self._position_states[sym] != POSITION_STATE_RECOVERING:
+                continue
+            if not is_invested_not_dust(self, sym):
+                # Position already gone — clean up state
+                self._set_position_state(sym, POSITION_STATE_FLAT)
+                self._failed_exit_counts.pop(sym, None)
+                continue
+            if len(self.Transactions.GetOpenOrders(sym)) > 0:
+                continue  # exit order already in flight
+            holding = self.Portfolio[sym]
+            qty = abs(holding.Quantity)
+            if qty == 0:
+                self._set_position_state(sym, POSITION_STATE_FLAT)
+                continue
+            direction_mult = -1 if holding.Quantity > 0 else 1
+            self.Debug(f"[RECONCILE] FORCE MARKET EXIT for RECOVERING {sym.Value} qty={qty:.6f}")
+            try:
+                self.MarketOrder(sym, qty * direction_mult, tag="Reconcile Force Exit")
+                self._set_position_state(sym, POSITION_STATE_EXITING)
+                self._failed_exit_counts.pop(sym, None)
+            except Exception as e:
+                self.Debug(f"[RECONCILE] force market exit failed for {sym.Value}: {e}")
 
         # Kraken preparation placeholder:
         # In a future live integration, call self._kraken_api_reconcile() here.

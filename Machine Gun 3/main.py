@@ -65,8 +65,8 @@ class SimplifiedCryptoStrategy(
     """
 
     def Initialize(self):
-        self.SetStartDate(2024, 1, 1)
-        self.SetCash(19)
+        self.SetStartDate(2025, 1, 1)
+        self.SetCash(2000)  # $2,000 test-account baseline
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
         # --- MG3: load mode from config (overridable via QC parameter) ---
@@ -91,9 +91,11 @@ class SimplifiedCryptoStrategy(
         self._position_states = {}
 
         # --- MG3: backtest metrics counters ---
-        self.mg3_cancel_count  = 0   # total orders cancelled
-        self.mg3_fill_count    = 0   # total orders filled
-        self.mg3_invalid_count = 0   # total invalid orders received
+        self.mg3_cancel_count    = 0   # total orders cancelled
+        self.mg3_fill_count      = 0   # total orders filled
+        self.mg3_invalid_count   = 0   # total invalid orders received
+        self.mg3_peak_positions  = 0   # max simultaneous open positions seen
+        self.mg3_recovery_events = 0   # positions escalated to force-market recovery
         # PnL by exit tag: tag -> [pnl_pct, ...]
         self.mg3_pnl_by_tag    = {}
         # Last reconciliation timestamp
@@ -123,7 +125,7 @@ class SimplifiedCryptoStrategy(
         self.base_take_profit    = self.quick_take_profit
         self.atr_trail_mult      = 2.0
 
-        self.position_size_pct  = 0.70
+        self.position_size_pct  = 0.20  # cap for high-vol size boost; base sizing in scoring.py
         self.base_max_positions = MG3Config.MAX_OPEN_POSITIONS
         self.max_positions      = MG3Config.MAX_OPEN_POSITIONS
         self.min_notional       = 5.5
@@ -164,7 +166,7 @@ class SimplifiedCryptoStrategy(
         self.stale_order_timeout_seconds      = MG3Config.ORDER_TIMEOUT_SECONDS
         self.live_stale_order_timeout_seconds = MG3Config.LIVE_ORDER_TIMEOUT_SECONDS
         self.max_concurrent_open_orders       = MG3Config.MAX_CONCURRENT_OPEN_ORDERS
-        self.open_orders_cash_threshold       = 0.5
+        self.open_orders_cash_threshold       = MG3Config.OPEN_ORDERS_CASH_THRESHOLD
         self.order_fill_check_threshold_seconds = 60
         self.order_timeout_seconds              = MG3Config.ORDER_TIMEOUT_SECONDS
         self.resync_log_interval_seconds        = 1800
