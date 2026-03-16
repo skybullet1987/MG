@@ -39,32 +39,33 @@ hard restrictions that previous MG3 drafts hit:
 |---|---|
 | `cannot use multiple inheritance with managed classes` | Class inherited from both Python mixins and `QCAlgorithm` |
 | `attribute is read-only` | `setattr()` was used to graft mixin methods onto the class at load time |
+| `File main.py not saved. It exceeds the maximum size of 64000 characters` | All logic was inlined into one file |
 
-The fix is simple: one concrete class, one base class.
+The fix: one concrete class, one base class, logic split across plain helper modules.
 
 ```python
 class SimplifiedCryptoStrategy(QCAlgorithm):
-    # All logic lives here directly — no mixin inheritance, no setattr injection
+    # Thin wrappers only — actual logic in mg3_*.py helper modules
 ```
 
-All logic previously split across `app.py`, `data_layer.py`, `orchestration.py`,
-`exit_handler.py`, and `reporting.py` is now inlined as methods of
-`SimplifiedCryptoStrategy`.  The stateless helper modules (`execution.py`,
-`scoring.py`, `config.py`, `config_loader.py`) remain as separate files.
-
-### Required files (5 files total)
+### Required files (10 files total)
 
 | File | Role |
 |---|---|
-| `main.py` | **Single-class entrypoint** — `Initialize`, all trading logic, all event handlers |
+| `main.py` | **Single-class entrypoint** — `Initialize`, event handlers, thin wrappers (< 64,000 chars) |
 | `config.py` | All tunable parameters |
 | `config_loader.py` | Config validation helpers |
 | `execution.py` | Shared order-execution utilities (stateless functions) |
 | `scoring.py` | `MicroScalpEngine` signal calculations (stateless) |
+| `mg3_constants.py` | Position lifecycle state constants shared across modules |
+| `mg3_data.py` | Per-bar symbol-data and market-context update helpers |
+| `mg3_rebalance.py` | Entry-selection loop and trade-execution helpers |
+| `mg3_exits.py` | Exit condition checks and force-liquidation helpers |
+| `mg3_reporting.py` | Order-event handling, brokerage messages, end-of-algo metrics |
 
-**Only these 5 files are needed.**  The old mixin files (`app.py`, `data_layer.py`,
-`orchestration.py`, `exit_handler.py`, `reporting.py`) have been deleted — do not
-upload them to your QC project.
+**All 10 files are required.** Upload every `.py` file to your QC project.
+The old mixin files (`app.py`, `data_layer.py`, `orchestration.py`,
+`exit_handler.py`, `reporting.py`) have been deleted — do not upload them.
 
 ---
 
@@ -73,15 +74,20 @@ upload them to your QC project.
 ### 1 – QuantConnect Cloud (recommended)
 
 1. Create a new **Algorithm** project in the QC Cloud IDE.
-2. Upload **all five module files** into that project.
+2. Upload **all ten module files** into that project.
 
    | File | Role |
    |---|---|
-   | `main.py` | Single-class entrypoint – all logic |
+   | `main.py` | Single-class entrypoint (< 64,000 chars) |
    | `config.py` | All tunable parameters |
    | `config_loader.py` | Config validation helpers |
    | `execution.py` | Shared order-execution utilities |
    | `scoring.py` | `MicroScalpEngine` signal calculations |
+   | `mg3_constants.py` | Position lifecycle state constants |
+   | `mg3_data.py` | Per-bar data update helpers |
+   | `mg3_rebalance.py` | Entry-selection and trade-execution helpers |
+   | `mg3_exits.py` | Exit condition and liquidation helpers |
+   | `mg3_reporting.py` | Order-event handling and metrics helpers |
 
 3. Set the back-test date range and starting capital in `main.py`
    (`SetStartDate` / `SetCash`).  Default: `2025-01-01`, `$2,000`.
