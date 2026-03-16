@@ -141,3 +141,26 @@ PORTFOLIO_MISMATCH_MIN_DOLLARS = 1.00
 
 # Cooldown (seconds) between consecutive mismatch warnings for the same symbol.
 PORTFOLIO_MISMATCH_COOLDOWN_SECONDS = 3600
+
+# ---------------------------------------------------------------------------
+# Small-account support  (for accounts < $500 – e.g. a $120 evaluation)
+# ---------------------------------------------------------------------------
+# Set SMALL_ACCOUNT_MODE = True to force small-account parameters regardless
+# of starting cash.  When False (default), the mode auto-activates whenever
+# SetCash() is below SMALL_ACCOUNT_THRESHOLD_USD at Initialize time.
+
+# Force small-account mode regardless of cash (False = auto-detect).
+SMALL_ACCOUNT_MODE = False
+
+# Cash threshold that triggers automatic small-account scaling.
+# Accounts funded below this amount get fewer positions and smaller per-trade caps.
+SMALL_ACCOUNT_THRESHOLD_USD = 500
+
+# Hard cap on simultaneously open positions in small-account mode.
+# 2 positions × $40 ≈ $80 deployed on a $120 account (~67 % max exposure).
+SMALL_ACCOUNT_MAX_POSITIONS = 2
+
+# Maximum USD exposure per single position in small-account mode.
+# ~33 % of a $120 account per position; high enough to generate meaningful $
+# profit on an 8 % take-profit, low enough not to blow the account on one loss.
+SMALL_ACCOUNT_MAX_EXPOSURE_USD = 40.0

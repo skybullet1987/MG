@@ -23,6 +23,38 @@ improvements on top:
 | Realism | Slippage base raised to 0.25 %, daily order cap removed, volume thresholds tuned for small accounts |
 | $2 k defaults | Max 3 positions × $250 cap; 3 % daily loss guard; 15 % drawdown limit |
 | Direction toggles | Longs enabled, **shorts disabled by default** until short pipeline is validated |
+| Small account | Auto-scaling for accounts < $500 (e.g. $120); see Small-account guide below |
+| QC architecture | Single `QCAlgorithm` subclass with method injection – fully PythonNet-compatible |
+
+---
+
+## Architecture Notes
+
+### Why single-inheritance + method injection?
+
+QuantConnect uses **PythonNet** to bridge Python and C# (the Lean engine). PythonNet
+has a hard restriction: a Python class that inherits from a C# managed class
+(`QCAlgorithm`) **cannot simultaneously use Python multiple inheritance**.
+
+MG3's earlier draft used:
+```python
+class SimplifiedCryptoStrategy(AppMixin, DataLayerMixin, ..., QCAlgorithm):
+```
+This triggers the PythonNet error:
+```
+cannot use multiple inheritance with managed classes
+```
+
+The fix is to keep `SimplifiedCryptoStrategy` as a single-inheritance class
+(`class SimplifiedCryptoStrategy(QCAlgorithm):`) and inject each helper module's
+methods onto the class at load time.  This is semantically identical to mixin
+inheritance from Python's perspective, but does not trigger the PythonNet restriction.
+The injection block lives at the bottom of `main.py`.
+
+### `No module named 'data_layer'` error
+
+This error means QC cannot find one of the module files.  **All ten `.py` files must
+be present in the same QC project / Lean directory.**  See the deployment section below.
 
 ---
 
@@ -30,13 +62,15 @@ improvements on top:
 
 ### 1 – QuantConnect Cloud (recommended)
 
-1. Create a new **Algorithm** project.
-2. Upload **all** module files:
+1. Create a new **Algorithm** project in the QC Cloud IDE.
+2. Upload **all ten module files** into that project — QC requires every imported
+   file to be part of the same project.  Missing even one file causes an import error
+   (e.g. `No module named 'data_layer'`).
 
    | File | Role |
    |---|---|
-   | `main.py` | Thin entrypoint – `Initialize` + `CustomSecurityInitializer` |
-   | `app.py` | Bootstrap/wiring mixin (parameter loading, reconciliation, universe) |
+   | `main.py` | Thin entrypoint – `Initialize`, `CustomSecurityInitializer`, method injection |
+   | `app.py` | Bootstrap/wiring helpers (parameter loading, reconciliation, universe) |
    | `data_layer.py` | Per-bar data ingestion and scoring pipeline |
    | `orchestration.py` | `Rebalance` and `_execute_trades` entry logic |
    | `exit_handler.py` | `CheckExits` and `_check_exit` exit logic |
@@ -59,10 +93,11 @@ The algorithm starts in `backtest` mode by default (set in `config.py` →
 # Install Lean CLI if not already installed
 pip install lean
 
-# Pull the project
+# Create a new project and copy all .py files into it
 lean project-create mg3
+cp "Machine Gun 3"/*.py mg3/
 
-# Copy all .py files into the project folder, then run
+# Run a backtest
 lean backtest mg3
 ```
 
@@ -121,6 +156,10 @@ QuantConnect algorithm parameters (the strategy reads them via `GetParameter()`)
 | `KRAKEN_PRICE_PRECISION` | `None` | Price decimal precision; None = exchange default |
 | `KRAKEN_LOT_SIZE` | `None` | Lot-size increment; None = exchange default |
 | `RECONCILIATION_CADENCE_SECONDS` | `300` | How often to run local-vs-exchange state check |
+| `SMALL_ACCOUNT_MODE` | `False` | Force small-account scaling (auto-detect when cash < 500) |
+| `SMALL_ACCOUNT_THRESHOLD_USD` | `500` | Cash threshold that triggers small-account mode |
+| `SMALL_ACCOUNT_MAX_POSITIONS` | `2` | Max positions in small-account mode |
+| `SMALL_ACCOUNT_MAX_EXPOSURE_USD` | `40` | Max USD per position in small-account mode |
 
 ### $2,000 test-account quick reference
 
@@ -141,6 +180,31 @@ min_dollar_volume_usd   = 5000    # bar-level liquidity filter
 min_volume_usd          = 10000   # universe inclusion filter
 max_daily_trades        = 24000   # effectively unlimited (PR #49)
 ```
+
+### $120 small-account quick reference
+
+For accounts between ~$100–$500, small-account mode is activated automatically
+(no code changes needed – just set `SetCash(120)` in `main.py`).
+
+```python
+# main.py – change only this line
+SetCash(120)          # triggers auto-scaling since 120 < SMALL_ACCOUNT_THRESHOLD_USD (500)
+SetStartDate(2025, 1, 1)
+
+# Auto-applied overrides (from config.py SMALL_ACCOUNT_* constants)
+# SMALL_ACCOUNT_MAX_POSITIONS    = 2      → max 2 simultaneous positions
+# SMALL_ACCOUNT_MAX_EXPOSURE_USD = 40.0   → $40 cap per position
+# Effective max deployed: 2 × $40 = $80 (~67% of $120)
+
+# Unchanged constraints that still apply:
+MIN_EXPECTED_PROFIT_PCT = 0.010   # 1% min net profit gate – $0.40 on a $40 position
+MAX_DAILY_LOSS_PCT      = 0.03    # 3% = ~$3.60 daily stop on $120
+MAX_DRAWDOWN_LIMIT      = 0.15    # 15% = $18 max portfolio drawdown before cooldown
+```
+
+> **Tip:** With $120 the minimum order notional (`min_notional = $5.50`) is still
+> met by the auto-scaled position cap.  If entries are consistently rejected as
+> "too small", raise `SMALL_ACCOUNT_MAX_EXPOSURE_USD` slightly (e.g. to `50`).
 
 ---
 
@@ -170,7 +234,7 @@ max_daily_trades        = 24000   # effectively unlimited (PR #49)
 ### Phase 3 – Micro live
 
 1. Set `MODE_DEFAULT = "live"` in `config.py`.
-2. Start with minimum capital (~$250–$500) and `MAX_OPEN_POSITIONS = 2`.
+2. Start with minimum capital (~$120–$250) and `MAX_OPEN_POSITIONS = 2`.
 3. Watch for Kraken-specific issues:
    - `KRAKEN_PRICE_PRECISION` / `KRAKEN_LOT_SIZE` may need tuning for illiquid pairs.
    - Monitor rate-limit messages in the log; adjust `rate_limit_cooldown_minutes` if needed.

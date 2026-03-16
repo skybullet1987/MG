@@ -254,7 +254,12 @@ class DataLayerMixin:
         return score
 
     def _calculate_position_size(self, score, threshold, asset_vol_ann):
-        """Aggressive 70% base size, Kelly-adjusted, bear-halved."""
+        """Delegates to MicroScalpEngine.calculate_position_size.
+
+        Returns a fraction of available reserved cash (0.07–0.15), capped by
+        MAX_SYMBOL_EXPOSURE_USD in config.py.  A Kelly multiplier (0.5–1.5) is
+        applied on top based on recent win/loss history.
+        """
         return self._scoring_engine.calculate_position_size(score, threshold, asset_vol_ann)
 
     def _kelly_fraction(self):
