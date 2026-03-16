@@ -24,37 +24,47 @@ improvements on top:
 | $2 k defaults | Max 3 positions × $250 cap; 3 % daily loss guard; 15 % drawdown limit |
 | Direction toggles | Longs enabled, **shorts disabled by default** until short pipeline is validated |
 | Small account | Auto-scaling for accounts < $500 (e.g. $120); see Small-account guide below |
-| QC architecture | Single `QCAlgorithm` subclass with method injection – fully PythonNet-compatible |
+| QC architecture | Single `QCAlgorithm` subclass — no mixin inheritance, no dynamic injection |
 
 ---
 
 ## Architecture Notes
 
-### Why single-inheritance + method injection?
+### Single-class design (v8.1.0+)
 
-QuantConnect uses **PythonNet** to bridge Python and C# (the Lean engine). PythonNet
-has a hard restriction: a Python class that inherits from a C# managed class
-(`QCAlgorithm`) **cannot simultaneously use Python multiple inheritance**.
+QuantConnect uses **PythonNet** to bridge Python and C#. PythonNet has two
+hard restrictions that previous MG3 drafts hit:
 
-MG3's earlier draft used:
+| Error | Root cause |
+|---|---|
+| `cannot use multiple inheritance with managed classes` | Class inherited from both Python mixins and `QCAlgorithm` |
+| `attribute is read-only` | `setattr()` was used to graft mixin methods onto the class at load time |
+
+The fix is simple: one concrete class, one base class.
+
 ```python
-class SimplifiedCryptoStrategy(AppMixin, DataLayerMixin, ..., QCAlgorithm):
-```
-This triggers the PythonNet error:
-```
-cannot use multiple inheritance with managed classes
+class SimplifiedCryptoStrategy(QCAlgorithm):
+    # All logic lives here directly — no mixin inheritance, no setattr injection
 ```
 
-The fix is to keep `SimplifiedCryptoStrategy` as a single-inheritance class
-(`class SimplifiedCryptoStrategy(QCAlgorithm):`) and inject each helper module's
-methods onto the class at load time.  This is semantically identical to mixin
-inheritance from Python's perspective, but does not trigger the PythonNet restriction.
-The injection block lives at the bottom of `main.py`.
+All logic previously split across `app.py`, `data_layer.py`, `orchestration.py`,
+`exit_handler.py`, and `reporting.py` is now inlined as methods of
+`SimplifiedCryptoStrategy`.  The stateless helper modules (`execution.py`,
+`scoring.py`, `config.py`, `config_loader.py`) remain as separate files.
 
-### `No module named 'data_layer'` error
+### Required files (5 files total)
 
-This error means QC cannot find one of the module files.  **All ten `.py` files must
-be present in the same QC project / Lean directory.**  See the deployment section below.
+| File | Role |
+|---|---|
+| `main.py` | **Single-class entrypoint** — `Initialize`, all trading logic, all event handlers |
+| `config.py` | All tunable parameters |
+| `config_loader.py` | Config validation helpers |
+| `execution.py` | Shared order-execution utilities (stateless functions) |
+| `scoring.py` | `MicroScalpEngine` signal calculations (stateless) |
+
+**Only these 5 files are needed.**  The old mixin files (`app.py`, `data_layer.py`,
+`orchestration.py`, `exit_handler.py`, `reporting.py`) have been deleted — do not
+upload them to your QC project.
 
 ---
 
@@ -63,22 +73,15 @@ be present in the same QC project / Lean directory.**  See the deployment sectio
 ### 1 – QuantConnect Cloud (recommended)
 
 1. Create a new **Algorithm** project in the QC Cloud IDE.
-2. Upload **all ten module files** into that project — QC requires every imported
-   file to be part of the same project.  Missing even one file causes an import error
-   (e.g. `No module named 'data_layer'`).
+2. Upload **all five module files** into that project.
 
    | File | Role |
    |---|---|
-   | `main.py` | Thin entrypoint – `Initialize`, `CustomSecurityInitializer`, method injection |
-   | `app.py` | Bootstrap/wiring helpers (parameter loading, reconciliation, universe) |
-   | `data_layer.py` | Per-bar data ingestion and scoring pipeline |
-   | `orchestration.py` | `Rebalance` and `_execute_trades` entry logic |
-   | `exit_handler.py` | `CheckExits` and `_check_exit` exit logic |
-   | `reporting.py` | `OnOrderEvent`, `OnEndOfAlgorithm`, metrics, daily report |
+   | `main.py` | Single-class entrypoint – all logic |
+   | `config.py` | All tunable parameters |
    | `config_loader.py` | Config validation helpers |
    | `execution.py` | Shared order-execution utilities |
    | `scoring.py` | `MicroScalpEngine` signal calculations |
-   | `config.py` | All tunable parameters |
 
 3. Set the back-test date range and starting capital in `main.py`
    (`SetStartDate` / `SetCash`).  Default: `2025-01-01`, `$2,000`.
