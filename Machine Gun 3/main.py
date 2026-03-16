@@ -19,16 +19,17 @@ from QuantConnect.Orders.Fees import FeeModel, OrderFee
 from QuantConnect.Securities import CashAmount
 import config as MG3Config
 from datetime import timedelta
+# Helper modules — plain functions called with self to keep main.py under QC's
+# 64 000-character file-size limit and avoid multiple-inheritance issues.
+import mg3_data
+import mg3_rebalance
+import mg3_exits
+import mg3_reporting
+from mg3_constants import (
+    POSITION_STATE_FLAT, POSITION_STATE_ENTERING, POSITION_STATE_OPEN,
+    POSITION_STATE_EXITING, POSITION_STATE_RECOVERING,
+)
 # endregion
-
-# ---------------------------------------------------------------------------
-# Position lifecycle state constants (used throughout this module)
-# ---------------------------------------------------------------------------
-POSITION_STATE_FLAT       = "flat"
-POSITION_STATE_ENTERING   = "entering"
-POSITION_STATE_OPEN       = "open"
-POSITION_STATE_EXITING    = "exiting"
-POSITION_STATE_RECOVERING = "recovering"  # failed exits escalated to force-market
 
 
 class MakerTakerFeeModel(FeeModel):
@@ -49,11 +50,16 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     No mixin inheritance, no dynamic method injection.
 
     Required files (all must be present in the same QC project directory):
-      main.py          - this file; single-class entrypoint
+      main.py          - this file; single-class entrypoint (< 64 000 chars)
       config.py        - all tunable parameters
       config_loader.py - config validation helpers
       execution.py     - shared order-execution utilities
       scoring.py       - MicroScalpEngine signal calculations
+      mg3_constants.py - position lifecycle state constants (shared)
+      mg3_data.py      - per-bar data update helpers
+      mg3_rebalance.py - entry-selection and trade-execution helpers
+      mg3_exits.py     - exit condition and liquidation helpers
+      mg3_reporting.py - order-event, reporting, and metrics helpers
     """
 
 
@@ -321,8 +327,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         security.SetFeeModel(MakerTakerFeeModel())
 
     # -----------------------------------------------------------------------
-    # Methods from AppMixin (parameter helpers, state-machine, reconciliation,
-    # scheduled callbacks, universe filter, symbol init)
+    # Parameter helpers, state-machine, reconciliation, scheduled callbacks,
+    # universe filter, and symbol initialization
     # -----------------------------------------------------------------------
 
     def _get_param(self, name, default):
@@ -576,8 +582,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 del self.crypto_data[symbol]
 
     # -----------------------------------------------------------------------
-    # Methods from DataLayerMixin (OnData, per-bar updates, market context,
-    # scoring helpers)
+    # OnData — per-bar data updates, market context, and trading dispatch
     # -----------------------------------------------------------------------
 
     def OnData(self, data):
@@ -620,147 +625,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.CheckExits()
 
     def _update_symbol_data(self, symbol, bar, quote_bar=None):
-        crypto = self.crypto_data[symbol]
-        price = float(bar.Close)
-        high = float(bar.High)
-        low = float(bar.Low)
-        volume = float(bar.Volume)
-        crypto['prices'].append(price)
-        crypto['highs'].append(high)
-        crypto['lows'].append(low)
-        if crypto['last_price'] > 0:
-            ret = (price - crypto['last_price']) / crypto['last_price']
-            crypto['returns'].append(ret)
-        crypto['last_price'] = price
-        crypto['volume'].append(volume)
-        crypto['dollar_volume'].append(price * volume)
-        if len(crypto['volume']) >= self.short_period:
-            crypto['volume_ma'].append(np.mean(list(crypto['volume'])[-self.short_period:]))
-        crypto['ema_ultra_short'].Update(bar.EndTime, price)
-        crypto['ema_short'].Update(bar.EndTime, price)
-        crypto['ema_medium'].Update(bar.EndTime, price)
-        crypto['ema_5'].Update(bar.EndTime, price)
-        crypto['atr'].Update(bar)
-        crypto['adx'].Update(bar)
-        # Rolling 20-bar VWAP
-        crypto['vwap_pv'].append(price * volume)
-        crypto['vwap_v'].append(volume)
-        total_v = sum(crypto['vwap_v'])
-        if total_v > 0:
-            crypto['vwap'] = sum(crypto['vwap_pv']) / total_v
-        # Long-term volume baseline for adaptive scoring thresholds (~24h window)
-        crypto['volume_long'].append(volume)
-        # VWAP SD bands: compute std of bar prices within the rolling VWAP window
-        if len(crypto['vwap_v']) >= 5 and crypto['vwap'] > 0:
-            vwap_val = crypto['vwap']
-            pv_list = list(crypto['vwap_pv'])
-            v_list = list(crypto['vwap_v'])
-            bar_prices = [pv / v for pv, v in zip(pv_list, v_list) if v > 0]
-            if len(bar_prices) >= 5:
-                sd = float(np.std(bar_prices))
-                crypto['vwap_sd'] = sd
-                crypto['vwap_sd2_lower'] = vwap_val - 2.0 * sd
-                crypto['vwap_sd3_lower'] = vwap_val - 3.0 * sd
-        if len(crypto['returns']) >= 10:
-            crypto['volatility'].append(np.std(list(crypto['returns'])[-10:]))
-        crypto['rsi'].Update(bar.EndTime, price)
-        if len(crypto['returns']) >= self.short_period and len(self.btc_returns) >= self.short_period:
-            coin_ret = np.sum(list(crypto['returns'])[-self.short_period:])
-            btc_ret = np.sum(list(self.btc_returns)[-self.short_period:])
-            crypto['rs_vs_btc'].append(coin_ret - btc_ret)
-        if len(crypto['prices']) >= self.medium_period:
-            prices_arr = np.array(list(crypto['prices'])[-self.medium_period:])
-            std = np.std(prices_arr)
-            mean = np.mean(prices_arr)
-            if std > 0:
-                crypto['zscore'].append((price - mean) / std)
-                crypto['bb_upper'].append(mean + 2 * std)
-                crypto['bb_lower'].append(mean - 2 * std)
-                crypto['bb_width'].append(4 * std / mean if mean > 0 else 0)
-        # CVD: Tick Delta approximation
-        high_low = high - low
-        if high_low > 0:
-            bar_delta = volume * ((price - low) - (high - price)) / high_low
-        else:
-            bar_delta = 0.0
-        prev_cvd = crypto['cvd'][-1] if len(crypto['cvd']) > 0 else 0.0
-        crypto['cvd'].append(prev_cvd + bar_delta)
-        # KER: Kaufman Efficiency Ratio (15-period)
-        if len(crypto['prices']) >= 15:
-            price_change = abs(crypto['prices'][-1] - crypto['prices'][-15])
-            volatility_sum = sum(abs(crypto['prices'][i] - crypto['prices'][i-1]) for i in range(-14, 0))
-            if volatility_sum > 0:
-                crypto['ker'].append(price_change / volatility_sum)
-            else:
-                crypto['ker'].append(0.0)
-        # 1D Kalman Filter for price
-        Q = 1e-5  # Process noise variance
-        R = 0.01  # Measurement noise variance
-        if crypto['kalman_estimate'] == 0.0:
-            crypto['kalman_estimate'] = price
-        estimate_pred = crypto['kalman_estimate']
-        error_cov_pred = crypto['kalman_error_cov'] + Q
-        kalman_gain = error_cov_pred / (error_cov_pred + R)
-        crypto['kalman_estimate'] = estimate_pred + kalman_gain * (price - estimate_pred)
-        crypto['kalman_error_cov'] = (1 - kalman_gain) * error_cov_pred
-        sp = get_spread_pct(self, symbol)
-        if sp is not None:
-            crypto['spreads'].append(sp)
-        # Update bid/ask sizes from QuoteBar for Order Book Imbalance calculation
-        if quote_bar is not None:
-            try:
-                bid_sz = float(quote_bar.LastBidSize) if quote_bar.LastBidSize else 0.0
-                ask_sz = float(quote_bar.LastAskSize) if quote_bar.LastAskSize else 0.0
-                if bid_sz > 0 or ask_sz > 0:
-                    crypto['bid_size'] = bid_sz
-                    crypto['ask_size'] = ask_sz
-            except Exception:
-                pass
+        """Delegate per-bar symbol-data updates to mg3_data helper."""
+        mg3_data.update_symbol_data(self, symbol, bar, quote_bar)
 
     def _update_market_context(self):
-        if len(self.btc_prices) >= 48:
-            btc_arr = np.array(list(self.btc_prices))
-            current_btc = btc_arr[-1]
-            btc_mom_12 = np.mean(list(self.btc_returns)[-12:]) if len(self.btc_returns) >= 12 else 0.0
-            btc_sma = np.mean(btc_arr[-48:])
-            if current_btc > btc_sma * 1.02:
-                new_regime = "bull"
-            elif current_btc < btc_sma * 0.98:
-                new_regime = "bear"
-            else:
-                new_regime = "sideways"
-            # Keep momentum confirmation but make it more sensitive
-            if new_regime == "sideways" and len(self.btc_returns) >= 12:
-                if btc_mom_12 > 0.0001:
-                    new_regime = "bull"
-                elif btc_mom_12 < -0.0001:
-                    new_regime = "bear"
-            # Hysteresis: only change if held for 3+ bars
-            if new_regime != self.market_regime:
-                self._regime_hold_count += 1
-                if self._regime_hold_count >= 3:
-                    self.market_regime = new_regime
-                    self._regime_hold_count = 0
-            else:
-                self._regime_hold_count = 0
-        if len(self.btc_volatility) >= 5:
-            current_vol = self.btc_volatility[-1]
-            avg_vol = np.mean(list(self.btc_volatility))
-            if current_vol > avg_vol * 1.5:
-                self.volatility_regime = "high"
-            elif current_vol < avg_vol * 0.5:
-                self.volatility_regime = "low"
-            else:
-                self.volatility_regime = "normal"
-        uptrend_count = 0
-        total_ready = 0
-        for crypto in self.crypto_data.values():
-            if crypto['ema_short'].IsReady and crypto['ema_medium'].IsReady:
-                total_ready += 1
-                if crypto['ema_short'].Current.Value > crypto['ema_medium'].Current.Value:
-                    uptrend_count += 1
-        if total_ready > 5:
-            self.market_breadth = uptrend_count / total_ready
+        """Delegate market-context update to mg3_data helper."""
+        mg3_data.update_market_context(self)
 
     def _annualized_vol(self, crypto):
         if crypto is None:
@@ -884,881 +754,63 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         return daily_loss >= MG3Config.MAX_DAILY_LOSS_PCT
 
     # -----------------------------------------------------------------------
-    # Methods from OrchestrationMixin (Rebalance, _execute_trades)
+    # Rebalance and _execute_trades
+    # Delegated to mg3_rebalance helper module.
     # -----------------------------------------------------------------------
 
     def Rebalance(self):
-        if self.IsWarmingUp:
-            return
-        # Cash mode — pause trading when recent performance is poor
-        if self._cash_mode_until is not None and self.Time < self._cash_mode_until:
-            self._log_skip("cash mode - poor recent performance")
-            return
-
-        # Reset log budget at each rebalance call for consistent logging
-        self.log_budget = 20
-
-        # Check rate limit hard block
-        if self._rate_limit_until is not None and self.Time < self._rate_limit_until:
-            self._log_skip("rate limited")
-            return
-
-        # MG3: max daily loss guard
-        if not self.IsWarmingUp and self._daily_loss_exceeded():
-            self._log_skip("max daily loss exceeded")
-            return
-
-        # Live safety checks
-        if self.LiveMode and not live_safety_checks(self):
-            return
-        # Only block on explicit bad states; unknown is allowed (and will have fallback after warmup)
-        if self.LiveMode and self.kraken_status in ("maintenance", "cancel_only"):
-            self._log_skip("kraken not online")
-            return
-        cancel_stale_new_orders(self)
-        if self.daily_trade_count >= self._get_max_daily_trades():
-            self._log_skip("max daily trades")
-            return
-        val = self.Portfolio.TotalPortfolioValue
-        if self.peak_value is None or self.peak_value < 1:
-            self.peak_value = val
-        if self.drawdown_cooldown > 0:
-            self.drawdown_cooldown -= 1
-            if self.drawdown_cooldown <= 0:
-                self.peak_value = val
-                self.consecutive_losses = 0
-            else:
-                self._log_skip(f"drawdown cooldown {self.drawdown_cooldown}h")
-                return
-        self.peak_value = max(self.peak_value, val)
-        dd = (self.peak_value - val) / self.peak_value if self.peak_value > 0 else 0
-        if dd > self.max_drawdown_limit:
-            self.drawdown_cooldown = self.cooldown_hours
-            self._log_skip(f"drawdown {dd:.1%} > limit")
-            return
-        if self.consecutive_losses >= self.max_consecutive_losses:
-            # Pause 3h and halve size for next 5 trades
-            self.drawdown_cooldown = 3
-            self._consecutive_loss_halve_remaining = 3
-            self.consecutive_losses = 0
-            self._log_skip("consecutive loss cooldown (5 losses)")
-            return
-        # Circuit breaker: halt new entries for 12h after 3 consecutive losses
-        if self.consecutive_losses >= 3:
-            self.circuit_breaker_expiry = self.Time + timedelta(hours=12)
-            self.consecutive_losses = 0
-            self._log_skip("circuit breaker triggered (3 consecutive losses)")
-            return
-        if self.circuit_breaker_expiry is not None and self.Time < self.circuit_breaker_expiry:
-            self._log_skip("circuit breaker active")
-            return
-        pos_count = get_actual_position_count(self)
-        if pos_count >= self.max_positions:
-            self._log_skip("at max positions")
-            return
-        if len(self.Transactions.GetOpenOrders()) >= self.max_concurrent_open_orders:
-            self._log_skip("too many open orders")
-            return
-
-        # Diagnostic counters for filter funnel
-        count_not_blacklisted = 0
-        count_no_open_orders = 0
-        count_spread_ok = 0
-        count_ready = 0
-        count_scored = 0
-        count_above_thresh = 0
-
-        scores = []
-        threshold_now = self._get_threshold()
-        for symbol in list(self.crypto_data.keys()):
-            if symbol.Value in SYMBOL_BLACKLIST or symbol.Value in self._session_blacklist:
-                continue
-            count_not_blacklisted += 1
-
-            if has_open_orders(self, symbol):
-                continue
-            count_no_open_orders += 1
-
-            if not spread_ok(self, symbol):
-                continue
-            count_spread_ok += 1
-
-            crypto = self.crypto_data[symbol]
-            if not self._is_ready(crypto):
-                continue
-            count_ready += 1
-
-            factor_scores = self._calculate_factor_scores(symbol, crypto)
-            if not factor_scores:
-                continue
-            count_scored += 1
-
-            composite_score = self._calculate_composite_score(factor_scores, crypto)
-            net_score = self._apply_fee_adjustment(composite_score)
-
-            # Store for diagnostic purposes
-            crypto['recent_net_scores'].append(net_score)
-
-            if net_score >= threshold_now:
-                count_above_thresh += 1
-                scores.append({
-                    'symbol': symbol,
-                    'composite_score': composite_score,
-                    'net_score': net_score,
-                    'factors': factor_scores,
-                    'volatility': crypto['volatility'][-1] if len(crypto['volatility']) > 0 else 0.05,
-                    'dollar_volume': list(crypto['dollar_volume'])[-6:] if len(crypto['dollar_volume']) >= 6 else [],
-                })
-
-        # Log diagnostic summary
-        try:
-            cash = self.Portfolio.CashBook["USD"].Amount
-        except (KeyError, AttributeError):
-            cash = self.Portfolio.Cash
-
-        debug_limited(self, f"REBALANCE: {count_above_thresh}/{count_scored} above thresh={threshold_now:.2f} | cash=${cash:.2f}")
-
-        if len(scores) == 0:
-            self._log_skip("no candidates passed filters")
-            return
-        scores.sort(key=lambda x: x['net_score'], reverse=True)
-        self._last_skip_reason = None
-        self._execute_trades(scores, threshold_now)
+        """Delegate to mg3_rebalance.rebalance for entry-selection logic."""
+        mg3_rebalance.rebalance(self)
 
     def _get_open_buy_orders_value(self):
         """Calculate total value reserved by open buy orders."""
         return get_open_buy_orders_value(self)
 
     def _execute_trades(self, candidates, threshold_now):
-        if not self._positions_synced:
-            return
-        if self.LiveMode and self.kraken_status in ("maintenance", "cancel_only"):
-            return
-        cancel_stale_new_orders(self)
-        if len(self.Transactions.GetOpenOrders()) >= self.max_concurrent_open_orders:
-            return
-        if self._compute_portfolio_risk_estimate() > self.portfolio_vol_cap:
-            return
-
-        try:
-            available_cash = self.Portfolio.CashBook["USD"].Amount
-        except (KeyError, AttributeError):
-            available_cash = self.Portfolio.Cash
-
-        open_buy_orders_value = self._get_open_buy_orders_value()
-
-        if available_cash <= 0:
-            debug_limited(self, f"SKIP TRADES: No cash available (${available_cash:.2f})")
-            return
-        if open_buy_orders_value > available_cash * self.open_orders_cash_threshold:
-            debug_limited(self, f"SKIP TRADES: ${open_buy_orders_value:.2f} reserved (>{self.open_orders_cash_threshold:.0%} of ${available_cash:.2f})")
-            return
-
-        reject_pending_orders = 0
-        reject_open_orders = 0
-        reject_already_invested = 0
-        reject_spread = 0
-        reject_exit_cooldown = 0
-        reject_loss_cooldown = 0
-        reject_price_invalid = 0
-        reject_price_too_low = 0
-        reject_cash_reserve = 0
-        reject_min_qty_too_large = 0
-        reject_dollar_volume = 0
-        reject_notional = 0
-        success_count = 0
-
-        for cand in candidates:
-            if self.daily_trade_count >= self._get_max_daily_trades():
-                break
-            if get_actual_position_count(self) >= self.max_positions:
-                break
-            sym = cand['symbol']
-            net_score = cand.get('net_score', 0.5)
-            if sym in self._pending_orders and self._pending_orders[sym] > 0:
-                reject_pending_orders += 1
-                continue
-            if has_open_orders(self, sym):
-                reject_open_orders += 1
-                continue
-            if is_invested_not_dust(self, sym):
-                reject_already_invested += 1
-                continue
-            if not spread_ok(self, sym):
-                reject_spread += 1
-                continue
-            if sym in self._exit_cooldowns and self.Time < self._exit_cooldowns[sym]:
-                reject_exit_cooldown += 1
-                continue
-            if sym in self._symbol_loss_cooldowns and self.Time < self._symbol_loss_cooldowns[sym]:
-                reject_loss_cooldown += 1
-                continue
-            sec = self.Securities[sym]
-            price = sec.Price
-            if price is None or price <= 0:
-                reject_price_invalid += 1
-                continue
-            if price < self.min_price_usd:
-                reject_price_too_low += 1
-                continue
-
-            try:
-                available_cash = self.Portfolio.CashBook["USD"].Amount
-            except (KeyError, AttributeError):
-                available_cash = self.Portfolio.Cash
-
-            available_cash = max(0, available_cash - open_buy_orders_value)
-            total_value = self.Portfolio.TotalPortfolioValue
-            # Minimal fee reserve only
-            fee_reserve = max(total_value * 0.01, 0.10)
-            reserved_cash = available_cash - fee_reserve
-            if reserved_cash <= 0:
-                reject_cash_reserve += 1
-                continue
-
-            min_qty = get_min_quantity(self, sym)
-            min_notional_usd = get_min_notional_usd(self, sym)
-            if min_qty * price > reserved_cash * 0.90:
-                reject_min_qty_too_large += 1
-                continue
-
-            crypto = self.crypto_data.get(sym)
-            if not crypto:
-                continue
-
-            # Per-symbol daily trade limit
-            if crypto.get('trade_count_today', 0) >= self.max_symbol_trades_per_day:
-                continue
-
-            # Fee-adjusted profit gate: ATR-projected move must cover fees + slippage.
-            atr_val = crypto['atr'].Current.Value if crypto['atr'].IsReady else None
-            if atr_val and price > 0:
-                expected_move_pct = (atr_val * self.atr_tp_mult) / price
-                min_profit_gate = self.min_expected_profit_pct
-                min_required = self.expected_round_trip_fees + self.fee_slippage_buffer + min_profit_gate
-                if expected_move_pct < min_required:
-                    continue
-
-            # Dollar-volume liquidity gate: use 12-bar average for more stable assessment
-            if len(crypto['dollar_volume']) >= 3:
-                dv_window = min(len(crypto['dollar_volume']), 12)
-                recent_dv = np.mean(list(crypto['dollar_volume'])[-dv_window:])
-                dv_threshold = self.min_dollar_volume_usd
-                if recent_dv < dv_threshold:
-                    reject_dollar_volume += 1
-                    continue
-
-            # Position sizing: 70% base, Kelly-adjusted
-            vol = self._annualized_vol(crypto)
-            size = self._calculate_position_size(net_score, threshold_now, vol)
-
-            # Halve size if in consecutive-loss recovery mode
-            if self._consecutive_loss_halve_remaining > 0:
-                size *= 0.50
-
-            # High-volatility regime: widen sizing slightly (vol = opportunity)
-            if self.volatility_regime == "high":
-                size = min(size * 1.1, self.position_size_pct)
-
-            slippage_penalty = get_slippage_penalty(self, sym)
-            size *= slippage_penalty
-
-            val = reserved_cash * size
-
-            # Floor at min_notional to support small accounts
-            val = max(val, self.min_notional)
-
-            # Absolute Hard Cap on position size
-            val = min(val, self.max_position_usd)
-
-            qty = round_quantity(self, sym, val / price)
-            if qty < min_qty:
-                qty = round_quantity(self, sym, min_qty)
-                val = qty * price
-            total_cost_with_fee = val * 1.006
-            if total_cost_with_fee > available_cash:
-                reject_cash_reserve += 1
-                continue
-            if val < min_notional_usd * self.min_notional_fee_buffer or val < self.min_notional or val > reserved_cash:
-                reject_notional += 1
-                continue
-
-            # Exit feasibility check: qty must be >= MinimumOrderSize so the position can be sold.
-            try:
-                sec = self.Securities[sym]
-                min_order_size = float(sec.SymbolProperties.MinimumOrderSize or 0)
-                lot_size = float(sec.SymbolProperties.LotSize or 0)
-                actual_min = max(min_order_size, lot_size)
-                if actual_min > 0 and qty < actual_min:
-                    self.Debug(f"REJECT ENTRY {sym.Value}: qty={qty} < min_order_size={actual_min} (unsellable)")
-                    reject_notional += 1
-                    continue
-                # Ensure post-fee qty >= MinimumOrderSize so position is sellable.
-                if min_order_size > 0:
-                    post_fee_qty = qty * (1.0 - KRAKEN_SELL_FEE_BUFFER)
-                    if post_fee_qty < min_order_size:
-                        required_qty = round_quantity(self, sym, min_order_size / (1.0 - KRAKEN_SELL_FEE_BUFFER))
-                        if required_qty * price <= available_cash * 0.99:  # 1% cash safety margin
-                            qty = required_qty
-                            val = qty * price
-                        else:
-                            self.Debug(f"REJECT ENTRY {sym.Value}: post-fee qty={post_fee_qty:.6f} < min_order_size={min_order_size} and can't upsize")
-                            reject_notional += 1
-                            continue
-            except Exception as e:
-                self.Debug(f"Warning: could not check min_order_size for {sym.Value}: {e}")
-
-            try:
-                ticket = place_limit_or_market(self, sym, qty, timeout_seconds=30, tag="Entry")
-                if ticket is not None:
-                    self._recent_tickets.append(ticket)
-                    components = cand.get('factors', {})
-                    sig_str = (f"obi={components.get('obi', 0):.2f} "
-                               f"vol={components.get('vol_ignition', 0):.2f} "
-                               f"trend={components.get('micro_trend', 0):.2f} "
-                               f"adx={components.get('adx_filter', 0):.2f} "
-                               f"vwap={components.get('vwap_signal', 0):.2f}")
-                    self.Debug(f"SCALP ENTRY: {sym.Value} | score={net_score:.2f} | ${val:.2f} | {sig_str}")
-                    success_count += 1
-                    self.trade_count += 1
-                    crypto['trade_count_today'] = crypto.get('trade_count_today', 0) + 1
-                    # MG3: transition to ENTERING state
-                    self._set_position_state(sym, POSITION_STATE_ENTERING)
-                    # Record ADX regime at entry for tighter TP in choppy markets
-                    adx_ind = crypto.get('adx')
-                    is_choppy = (adx_ind is not None and adx_ind.IsReady
-                                 and adx_ind.Current.Value < 25)
-                    self._choppy_regime_entries[sym] = is_choppy
-                    if self._consecutive_loss_halve_remaining > 0:
-                        self._consecutive_loss_halve_remaining -= 1
-                    if self.LiveMode:
-                        self._last_live_trade_time = self.Time
-            except Exception as e:
-                self.Debug(f"ORDER FAILED: {sym.Value} - {e}")
-                self._session_blacklist.add(sym.Value)
-                continue
-            if self.LiveMode and success_count >= 1:
-                break
-
-        if success_count > 0 or (reject_exit_cooldown + reject_loss_cooldown) > 3:
-            debug_limited(self, f"EXECUTE: {success_count}/{len(candidates)} | rejects: cd={reject_exit_cooldown} loss={reject_loss_cooldown} dv={reject_dollar_volume}")
+        """Delegate to mg3_rebalance.execute_trades for per-candidate order placement."""
+        mg3_rebalance.execute_trades(self, candidates, threshold_now)
 
     # -----------------------------------------------------------------------
-    # Methods from ExitHandlerMixin (CheckExits, _check_exit,
-    # _force_market_liquidate)
+    # CheckExits, _check_exit, _force_market_liquidate
+    # Delegated to mg3_exits helper module.
     # -----------------------------------------------------------------------
 
     def _is_ready(self, c):
         return len(c['prices']) >= 10 and c['rsi'].IsReady
 
     def CheckExits(self):
-        if self.IsWarmingUp:
-            return
-
-        if self._rate_limit_until is not None and self.Time < self._rate_limit_until:
-            return
-        for kvp in self.Portfolio:
-            symbol = kvp.Key
-            if not is_invested_not_dust(self, symbol):
-                self._failed_exit_attempts.pop(symbol, None)
-                self._failed_exit_counts.pop(symbol, None)
-                continue
-
-            state = self._get_position_state(symbol)
-
-            # RECOVERING: exit retries exhausted — use a direct market order.
-            if state == POSITION_STATE_RECOVERING:
-                self._force_market_liquidate(symbol)
-                continue
-
-            # Belt-and-suspenders: if failure count reached threshold but state
-            # was not updated (e.g. failures counted via OnOrderEvent Invalid),
-            # escalate now.
-            if self._failed_exit_counts.get(symbol, 0) >= MG3Config.MAX_EXIT_RETRIES:
-                self._set_position_state(symbol, POSITION_STATE_RECOVERING)
-                self._force_market_liquidate(symbol)
-                continue
-
-            self._check_exit(symbol, self.Securities[symbol].Price, kvp.Value)
-
-        for kvp in self.Portfolio:
-            symbol = kvp.Key
-            if not is_invested_not_dust(self, symbol):
-                continue
-            if symbol not in self.entry_prices:
-                self.entry_prices[symbol] = kvp.Value.AveragePrice
-                self.highest_prices[symbol] = kvp.Value.AveragePrice
-                self.entry_times[symbol] = self.Time
-                self.Debug(f"ORPHAN RECOVERY: {symbol.Value} re-tracked")
+        """Delegate to mg3_exits.check_exits for all open-position exit logic."""
+        mg3_exits.check_exits(self)
 
     def _force_market_liquidate(self, symbol):
-        """Force market liquidation for a position stuck in RECOVERING state.
-
-        Called when the normal limit-exit path has failed MAX_EXIT_RETRIES times.
-        Uses a market order so the position is closed regardless of spread.
-        Does NOT call cleanup_position – OnOrderEvent handles cleanup on fill.
-        """
-        if len(self.Transactions.GetOpenOrders(symbol)) > 0:
-            return  # exit already in flight
-        if symbol not in self.Portfolio or self.Portfolio[symbol].Quantity == 0:
-            self._set_position_state(symbol, POSITION_STATE_FLAT)
-            self._failed_exit_counts.pop(symbol, None)
-            return
-        holding = self.Portfolio[symbol]
-        qty = abs(holding.Quantity)
-        if qty == 0:
-            self._set_position_state(symbol, POSITION_STATE_FLAT)
-            return
-        direction_mult = -1 if holding.Quantity > 0 else 1
-        entry = self.entry_prices.get(symbol, holding.AveragePrice)
-        price = self.Securities[symbol].Price if symbol in self.Securities else 0
-        pnl = (price - entry) / entry if entry > 0 and price > 0 else 0
-        self.Debug(f"⚠️ FORCE MARKET LIQUIDATE (recovering): {symbol.Value} qty={qty:.6f} PnL:{pnl:+.2%}")
-        try:
-            self.MarketOrder(symbol, qty * direction_mult, tag="Force Recovery Exit")
-            self._set_position_state(symbol, POSITION_STATE_EXITING)
-            self._failed_exit_counts.pop(symbol, None)
-            self.mg3_recovery_events += 1
-        except Exception as e:
-            self.Debug(f"FORCE MARKET LIQUIDATE failed for {symbol.Value}: {e}")
+        """Delegate to mg3_exits.force_market_liquidate for RECOVERING positions."""
+        mg3_exits.force_market_liquidate(self, symbol)
 
     def _check_exit(self, symbol, price, holding):
-        if len(self.Transactions.GetOpenOrders(symbol)) > 0:
-            return
-        if symbol in self._cancel_cooldowns and self.Time < self._cancel_cooldowns[symbol]:
-            return
-
-        min_notional_usd = get_min_notional_usd(self, symbol)
-        if price > 0 and abs(holding.Quantity) * price < min_notional_usd * 0.3:
-            try:
-                self.Liquidate(symbol)
-            except Exception as e:
-                self.Debug(f"DUST liquidation failed for {symbol.Value}: {e}")
-            cleanup_position(self, symbol)
-            self._failed_exit_counts.pop(symbol, None)
-            return
-
-        actual_qty = abs(holding.Quantity)
-        rounded_sell = round_quantity(self, symbol, actual_qty)
-        if rounded_sell > actual_qty:
-            self.Debug(f"DUST (rounded sell > actual): {symbol.Value} | actual={actual_qty} rounded={rounded_sell} — cleaning up")
-            cleanup_position(self, symbol)
-            self._failed_exit_counts.pop(symbol, None)
-            return
-        if symbol not in self.entry_prices:
-            self.entry_prices[symbol] = holding.AveragePrice
-            self.highest_prices[symbol] = holding.AveragePrice
-            self.entry_times[symbol] = self.Time
-        entry = self.entry_prices[symbol]
-        highest = self.highest_prices.get(symbol, entry)
-        if price > highest:
-            self.highest_prices[symbol] = price
-        pnl = (price - entry) / entry if entry > 0 else 0
-
-        crypto = self.crypto_data.get(symbol)
-        dd = (highest - price) / highest if highest > 0 else 0
-        hours = (self.Time - self.entry_times.get(symbol, self.Time)).total_seconds() / 3600
-        minutes = hours * 60
-
-        atr = crypto['atr'].Current.Value if crypto and crypto['atr'].IsReady else None
-        if atr and entry > 0:
-            sl = max((atr * self.atr_sl_mult) / entry, self.tight_stop_loss)
-            tp = max((atr * self.atr_tp_mult) / entry, self.quick_take_profit)
-        else:
-            sl = self.tight_stop_loss   # 1.0-2.0% stop floor
-            tp = self.quick_take_profit  # 1.5-3.0% take-profit floor
-
-        if tp < sl * 1.5:
-            tp = sl * 1.5
-
-        # Tighten take-profit when this position was entered in a choppy (ADX < 25) regime
-        if self._choppy_regime_entries.get(symbol, False):
-            tp = tp * 0.65   # 35% tighter TP – trend continuation unlikely in choppy market
-
-        # Tighten take-profit in low-volatility regime to secure profits faster
-        if self.volatility_regime == "low":
-            tp = tp * 0.75   # 25% tighter TP – low-vol moves mean-revert quickly
-
-        trailing_activation = self.trail_activation
-        trailing_stop_pct   = self.trail_stop_pct
-
-        if crypto and crypto['rsi'].IsReady:
-            rsi_now = crypto['rsi'].Current.Value
-            if rsi_now > 85:
-                self.rsi_peaked_overbought[symbol] = True
-
-        if (not self._partial_tp_taken.get(symbol, False)
-                and pnl >= self.partial_tp_threshold):
-            if partial_smart_sell(self, symbol, 0.50, "Partial TP"):
-                self._partial_tp_taken[symbol] = True
-                self._breakeven_stops[symbol] = entry * 1.002
-                self.Debug(f"PARTIAL TP: {symbol.Value} | PnL:{pnl:+.2%} | SL→entry+0.2%")
-                return  # Don't trigger full exit this bar
-
-        tag = ""
-
-        if self._partial_tp_taken.get(symbol, False):
-            be_price = self._breakeven_stops.get(symbol, entry)
-            if price <= be_price:
-                tag = "Breakeven Stop"
-        elif pnl <= -sl:
-            tag = "Stop Loss"
-
-        if not tag and minutes > self.stagnation_minutes and pnl < self.stagnation_pnl_threshold:
-            tag = "Stagnation Exit"
-
-        elif not tag:
-
-            if not self._partial_tp_taken.get(symbol, False) and pnl >= tp:
-                tag = "Take Profit"
-
-            elif pnl > trailing_activation and dd >= trailing_stop_pct:
-                tag = "Trailing Stop"
-
-            elif atr and entry > 0 and holding.Quantity != 0:
-                trail_offset = atr * self.atr_trail_mult
-                trail_level = highest - trail_offset  # anchor to highest price since entry
-                if crypto:
-                    crypto['trail_stop'] = trail_level
-                if crypto and crypto['trail_stop'] is not None:
-                    if holding.Quantity > 0 and price <= crypto['trail_stop']:
-                        tag = "ATR Trail"
-                    elif holding.Quantity < 0 and price >= crypto['trail_stop']:
-                        tag = "ATR Trail"
-
-            if not tag and crypto and crypto['rsi'].IsReady:
-                rsi_now = crypto['rsi'].Current.Value
-                if self.rsi_peaked_overbought.get(symbol, False) and rsi_now < 75:
-                    tag = "RSI Momentum Exit"
-
-            if not tag and hours >= 2.0 and crypto and len(crypto['volume']) >= 2:
-                entry_vol = self.entry_volumes.get(symbol, 0)
-                if entry_vol > 0:
-                    v1 = crypto['volume'][-1]
-                    v2 = crypto['volume'][-2]
-                    if v1 < entry_vol * 0.50 and v2 < entry_vol * 0.50:
-                        tag = "Volume Dry-up"
-
-            if not tag and hours >= self.time_stop_hours and pnl < self.time_stop_pnl_min:
-                tag = "Time Stop"
-
-            if not tag and hours >= self.extended_time_stop_hours and pnl < self.extended_time_stop_pnl_max:
-                tag = "Extended Time Stop"
-
-            if not tag and hours >= self.stale_position_hours:
-                tag = "Stale Position Exit"
-
-        if tag:
-            if price * abs(holding.Quantity) < min_notional_usd * 0.9:
-                return
-            if pnl < 0:
-                self._symbol_loss_cooldowns[symbol] = self.Time + timedelta(hours=1)
-            # MG3: transition to EXITING state before placing sell order
-            self._set_position_state(symbol, POSITION_STATE_EXITING)
-            sold = smart_liquidate(self, symbol, tag)
-            if sold:
-                self._exit_cooldowns[symbol] = self.Time + timedelta(hours=self.exit_cooldown_hours)
-                self.rsi_peaked_overbought.pop(symbol, None)
-                self.entry_volumes.pop(symbol, None)
-                self._choppy_regime_entries.pop(symbol, None)
-                # MG3: record PnL by exit tag for post-backtest analysis
-                if tag not in self.mg3_pnl_by_tag:
-                    self.mg3_pnl_by_tag[tag] = []
-                self.mg3_pnl_by_tag[tag].append(pnl)
-                self.Debug(f"{tag}: {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.1f}h")
-            else:
-                # smart_liquidate returned False: the position is STILL held.
-                # Do NOT call cleanup_position here — that would wipe entry_prices,
-                # highest_prices, and entry_times while the position is open, which
-                # causes the next exit check to lose PnL context and re-track the
-                # position as an orphan with a wrong entry price.
-                # Instead: increment the failure counter and keep all tracking intact.
-                # After MAX_EXIT_RETRIES failures the position is escalated to
-                # RECOVERING and a force market order is used.
-                fail_count = self._failed_exit_counts.get(symbol, 0) + 1
-                self._failed_exit_counts[symbol] = fail_count
-                if fail_count >= MG3Config.MAX_EXIT_RETRIES:
-                    self._set_position_state(symbol, POSITION_STATE_RECOVERING)
-                    self.Debug(
-                        f"⚠️ EXIT FAILED ({fail_count}×, RECOVERING): {symbol.Value} "
-                        f"| PnL:{pnl:+.2%} | Held:{hours:.1f}h — escalating to force-market"
-                    )
-                else:
-                    self._set_position_state(symbol, POSITION_STATE_OPEN)
-                    self.Debug(
-                        f"⚠️ EXIT FAILED ({fail_count}/{MG3Config.MAX_EXIT_RETRIES}): "
-                        f"{symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.1f}h — will retry"
-                    )
+        """Delegate to mg3_exits.check_exit for per-position exit condition checks."""
+        mg3_exits.check_exit(self, symbol, price, holding)
 
     # -----------------------------------------------------------------------
-    # Methods from ReportingMixin (OnOrderEvent, OnBrokerageMessage,
-    # OnEndOfAlgorithm, metrics, DailyReport)
+    # OnOrderEvent, OnBrokerageMessage, OnEndOfAlgorithm, metrics, DailyReport
+    # Delegated to mg3_reporting helper module.
     # -----------------------------------------------------------------------
 
     def OnOrderEvent(self, event):
-        try:
-            symbol = event.Symbol
-            self.Debug(f"ORDER: {symbol.Value} {event.Status} {event.Direction} qty={event.FillQuantity or event.Quantity} price={event.FillPrice} id={event.OrderId}")
-            if event.Status == OrderStatus.Submitted:
-                if symbol not in self._pending_orders:
-                    self._pending_orders[symbol] = 0
-                intended_qty = abs(event.Quantity) if event.Quantity != 0 else abs(event.FillQuantity)
-                self._pending_orders[symbol] += intended_qty
-                if symbol not in self._submitted_orders:
-                    has_position = symbol in self.Portfolio and self.Portfolio[symbol].Invested
-                    if event.Direction == OrderDirection.Sell and has_position:
-                        inferred_intent = 'exit'
-                    elif event.Direction == OrderDirection.Buy and not has_position:
-                        inferred_intent = 'entry'
-                    else:
-                        inferred_intent = 'entry' if event.Direction == OrderDirection.Buy else 'exit'
-
-                    self._submitted_orders[symbol] = {
-                        'order_id': event.OrderId,
-                        'time': self.Time,
-                        'quantity': event.Quantity,
-                        'intent': inferred_intent
-                    }
-                else:
-                    self._submitted_orders[symbol]['order_id'] = event.OrderId
-            elif event.Status == OrderStatus.PartiallyFilled:
-                if symbol in self._pending_orders:
-                    self._pending_orders[symbol] -= abs(event.FillQuantity)
-                    if self._pending_orders[symbol] <= 0:
-                        self._pending_orders.pop(symbol, None)
-                if event.Direction == OrderDirection.Buy:
-                    if symbol not in self.entry_prices:
-                        self.entry_prices[symbol] = event.FillPrice
-                        self.highest_prices[symbol] = event.FillPrice
-                        self.entry_times[symbol] = self.Time
-                    # MG3: partial fill → position is now at least partially OPEN
-                    self._set_position_state(symbol, POSITION_STATE_OPEN)
-                slip_log(self, symbol, event.Direction, event.FillPrice)
-            elif event.Status == OrderStatus.Filled:
-                self._pending_orders.pop(symbol, None)
-                self._submitted_orders.pop(symbol, None)  # Remove from verification tracking
-                self._order_retries.pop(event.OrderId, None)  # Clean up retry tracking
-                # MG3: increment fill counter
-                self.mg3_fill_count += 1
-                if event.Direction == OrderDirection.Buy:
-                    self.entry_prices[symbol] = event.FillPrice
-                    self.highest_prices[symbol] = event.FillPrice
-                    self.entry_times[symbol] = self.Time
-                    self.daily_trade_count += 1
-                    # MG3: position fully entered → OPEN
-                    self._set_position_state(symbol, POSITION_STATE_OPEN)
-                    # MG3: track peak simultaneous open positions
-                    current_pos = get_actual_position_count(self)
-                    if current_pos > self.mg3_peak_positions:
-                        self.mg3_peak_positions = current_pos
-
-                    crypto = self.crypto_data.get(symbol)
-                    if crypto and len(crypto['volume']) >= 1:
-                        self.entry_volumes[symbol] = crypto['volume'][-1]
-                    self.rsi_peaked_overbought.pop(symbol, None)
-                else:
-                    if symbol in self._partial_sell_symbols:
-                        self._partial_sell_symbols.discard(symbol)
-                    else:
-                        entry = self.entry_prices.get(symbol, None)
-                        if entry is None:
-                            entry = event.FillPrice
-                            self.Debug(f"⚠️ WARNING: Missing entry price for {symbol.Value} sell, using fill price")
-                        pnl = (event.FillPrice - entry) / entry if entry > 0 else 0
-                        # MG3: record hold duration for avg-hold-time metric
-                        hold_hours = (
-                            (self.Time - self.entry_times[symbol]).total_seconds() / 3600
-                            if symbol in self.entry_times else 0.0
-                        )
-                        self._rolling_wins.append(1 if pnl > 0 else 0)
-                        self._recent_trade_outcomes.append(1 if pnl > 0 else 0)
-                        if pnl > 0:
-                            self._rolling_win_sizes.append(pnl)
-                            self.winning_trades += 1
-                            self.consecutive_losses = 0
-                        else:
-                            self._rolling_loss_sizes.append(abs(pnl))
-                            self.losing_trades += 1
-                            self.consecutive_losses += 1
-                        self.total_pnl += pnl
-                        self.trade_log.append({
-                            'time': self.Time,
-                            'symbol': symbol.Value,
-                            'pnl_pct': pnl,
-                            'hold_hours': hold_hours,
-                            'exit_reason': 'filled_sell',
-                        })
-
-                        if len(self._recent_trade_outcomes) >= 8:
-                            recent_wr = sum(self._recent_trade_outcomes) / len(self._recent_trade_outcomes)
-                            if recent_wr < 0.25:
-                                self._cash_mode_until = self.Time + timedelta(hours=24)
-                                self.Debug(f"⚠️ CASH MODE: WR={recent_wr:.0%} over {len(self._recent_trade_outcomes)} trades. Pausing 24h.")
-                        cleanup_position(self, symbol)
-                        # MG3: position exited → FLAT
-                        self._set_position_state(symbol, POSITION_STATE_FLAT)
-                        self._failed_exit_attempts.pop(symbol, None)
-                        self._failed_exit_counts.pop(symbol, None)
-                slip_log(self, symbol, event.Direction, event.FillPrice)
-            elif event.Status == OrderStatus.Canceled:
-                self._pending_orders.pop(symbol, None)
-                self._submitted_orders.pop(symbol, None)
-                self._order_retries.pop(event.OrderId, None)
-                # MG3: increment cancel counter
-                self.mg3_cancel_count += 1
-                if event.Direction == OrderDirection.Sell and symbol not in self.entry_prices:
-                    if is_invested_not_dust(self, symbol):
-                        holding = self.Portfolio[symbol]
-                        self.entry_prices[symbol] = holding.AveragePrice
-                        self.highest_prices[symbol] = holding.AveragePrice
-                        self.entry_times[symbol] = self.Time
-                        self.Debug(f"RE-TRACKED after cancel: {symbol.Value}")
-                    # MG3: if cancel of an entry order, revert to FLAT
-                    if event.Direction == OrderDirection.Buy:
-                        self._set_position_state(symbol, POSITION_STATE_FLAT)
-            elif event.Status == OrderStatus.Invalid:
-                self._pending_orders.pop(symbol, None)
-                self._submitted_orders.pop(symbol, None)
-                self._order_retries.pop(event.OrderId, None)
-                # MG3: increment invalid order counter
-                self.mg3_invalid_count += 1
-                if event.Direction == OrderDirection.Sell:
-                    price = self.Securities[symbol].Price if symbol in self.Securities else 0
-                    min_notional = get_min_notional_usd(self, symbol)
-
-                    if price > 0 and symbol in self.Portfolio and abs(self.Portfolio[symbol].Quantity) * price < min_notional:
-                        self.Debug(f"DUST CLEANUP on invalid sell: {symbol.Value} — releasing tracking")
-                        cleanup_position(self, symbol)
-                        self._set_position_state(symbol, POSITION_STATE_FLAT)
-                        self._failed_exit_counts.pop(symbol, None)
-                    else:
-                        fail_count = self._failed_exit_counts.get(symbol, 0) + 1
-                        self._failed_exit_counts[symbol] = fail_count
-                        self.Debug(f"Invalid sell #{fail_count}: {symbol.Value}")
-                        if fail_count >= 3:
-                            self.Debug(f"FORCE CLEANUP: {symbol.Value} after {fail_count} failed exits — releasing tracking")
-                            cleanup_position(self, symbol)
-                            self._set_position_state(symbol, POSITION_STATE_FLAT)
-                            self._failed_exit_counts.pop(symbol, None)
-                        elif symbol not in self.entry_prices:
-                            if is_invested_not_dust(self, symbol):
-                                holding = self.Portfolio[symbol]
-                                self.entry_prices[symbol] = holding.AveragePrice
-                                self.highest_prices[symbol] = holding.AveragePrice
-                                self.entry_times[symbol] = self.Time
-                                self.Debug(f"RE-TRACKED after invalid: {symbol.Value}")
-                self._session_blacklist.add(symbol.Value)
-        except Exception as e:
-            self.Debug(f"OnOrderEvent error: {e}")
-        if self.LiveMode:
-            persist_state(self)
+        """Delegate to mg3_reporting.on_order_event."""
+        mg3_reporting.on_order_event(self, event)
 
     def OnBrokerageMessage(self, message):
-        try:
-            txt = message.Message.lower()
-            if "system status:" in txt:
-                if "online" in txt:
-                    self.kraken_status = "online"
-                elif "maintenance" in txt:
-                    self.kraken_status = "maintenance"
-                elif "cancel_only" in txt:
-                    self.kraken_status = "cancel_only"
-                elif "post_only" in txt:
-                    self.kraken_status = "post_only"
-                else:
-                    self.kraken_status = "unknown"
-                self.Debug(f"Kraken status update: {self.kraken_status}")
-
-            if "rate limit" in txt or "too many" in txt:
-                self.Debug(f"⚠️ RATE LIMIT - pausing {self.rate_limit_cooldown_minutes}min")
-                self._rate_limit_until = self.Time + timedelta(minutes=self.rate_limit_cooldown_minutes)
-                self._last_live_trade_time = self.Time
-        except Exception as e:
-            self.Debug(f"BrokerageMessage parse error: {e}")
+        """Delegate to mg3_reporting.on_brokerage_message."""
+        mg3_reporting.on_brokerage_message(self, message)
 
     def OnEndOfAlgorithm(self):
-        total = self.winning_trades + self.losing_trades
-        wr = self.winning_trades / total if total > 0 else 0
-        self.Debug("=== FINAL ===")
-        self.Debug(f"Trades: {self.trade_count} | WR: {wr:.1%}")
-        self.Debug(f"Final: ${self.Portfolio.TotalPortfolioValue:.2f}")
-        self.Debug(f"PnL: {self.total_pnl:+.2%}")
-
-        # MG3: emit backtest validation metrics
-        self._log_mg3_metrics()
-
-        persist_state(self)
+        """Delegate to mg3_reporting.on_end_of_algorithm."""
+        mg3_reporting.on_end_of_algorithm(self)
 
     def _log_mg3_metrics(self):
-        """Log MG3-specific backtest validation and forensic metrics.
-
-        These numbers are the primary signal-quality gate before moving from
-        backtest to paper or live (see README Phased Rollout – Phase 1).
-
-        Acceptance thresholds:
-          - Cancel-to-fill ratio  < 2
-          - Invalid orders        < 5 % of fills
-          - Stop Loss avg PnL     more positive than -tight_stop_loss (slippage check)
-          - Recovery events       ideally 0; > 5 indicates systemic exit failure
-        """
-        self.Debug("=== MG3 BACKTEST METRICS ===")
-
-        # --- Order quality ---
-        if self.mg3_fill_count > 0:
-            ctf = self.mg3_cancel_count / self.mg3_fill_count
-            invalid_pct = self.mg3_invalid_count / self.mg3_fill_count
-            self.Debug(
-                f"Cancel-to-fill ratio : {ctf:.2f}  "
-                f"({self.mg3_cancel_count} cancels / {self.mg3_fill_count} fills)"
-            )
-            self.Debug(
-                f"Invalid orders       : {self.mg3_invalid_count}  "
-                f"({invalid_pct:.1%} of fills)"
-            )
-        else:
-            self.Debug(f"Cancel-to-fill ratio : N/A  (fills=0, cancels={self.mg3_cancel_count})")
-            self.Debug(f"Invalid orders       : {self.mg3_invalid_count}")
-
-        # --- Recovery events (failed exits escalated to force-market) ---
-        self.Debug(f"Recovery events      : {self.mg3_recovery_events}")
-
-        # --- Peak concurrent positions ---
-        self.Debug(f"Peak open positions  : {self.mg3_peak_positions}")
-
-        # --- Hold-time statistics (from trade_log) ---
-        hold_times = [t.get('hold_hours', 0) for t in self.trade_log if t.get('hold_hours', 0) > 0]
-        if hold_times:
-            avg_hold = sum(hold_times) / len(hold_times)
-            max_hold = max(hold_times)
-            self.Debug(f"Avg hold time        : {avg_hold:.2f}h  (max {max_hold:.1f}h)")
-        else:
-            self.Debug("Avg hold time        : N/A")
-
-        # --- Estimated round-trip fees paid ---
-        # Approximation: fills / 2 round trips × FEE_ASSUMPTION_RT × avg position size.
-        # Exact fee data is in the QC trade blotter; this is a sanity-check estimate.
-        rt_count = self.mg3_fill_count // 2
-        est_fee_pct = MG3Config.FEE_ASSUMPTION_RT + MG3Config.SLIPPAGE_BUFFER
-        self.Debug(
-            f"Est. cost per RT     : {est_fee_pct:.2%}  "
-            f"(fee {MG3Config.FEE_ASSUMPTION_RT:.2%} + slip {MG3Config.SLIPPAGE_BUFFER:.2%})  "
-            f"× ~{rt_count} round trips"
-        )
-
-        # --- PnL by exit tag ---
-        if self.mg3_pnl_by_tag:
-            self.Debug("PnL by exit tag:")
-            for tag, pnls in sorted(self.mg3_pnl_by_tag.items()):
-                n = len(pnls)
-                avg = sum(pnls) / n if n > 0 else 0.0
-                wins = sum(1 for p in pnls if p > 0)
-                wr = wins / n if n > 0 else 0.0
-                self.Debug(f"  {tag:<30} n={n:>4}  avg={avg:+.3%}  wr={wr:.0%}")
-        else:
-            self.Debug("PnL by exit tag      : (no tagged exits recorded)")
-
-        self.Debug("=== END MG3 METRICS ===")
+        """Delegate to mg3_reporting.log_mg3_metrics."""
+        mg3_reporting.log_mg3_metrics(self)
 
     def DailyReport(self):
-        if self.IsWarmingUp: return
-        daily_report(self)
+        """Delegate to mg3_reporting.daily_report_wrapper."""
+        mg3_reporting.daily_report_wrapper(self)
