@@ -21,8 +21,8 @@ class MicroScalpEngine:
     1. Order Book Imbalance (OBI): bid/ask pressure (tightened threshold)
     2. Volume Ignition: 4× volume surge (tightened from 3×)
     3. MTF Trend Alignment: EMA5 > EMA20 (short-term trend aligned with medium)
-    4. ADX / Mean Reversion: ADX > 20 in trending markets (avoids chop);
-       RSI oversold + price near lower Bollinger Band in ranging markets (Apr–Oct)
+    4a. ADX Trend: ADX > 18 with bullish DI bias (max 0.15)
+    4b. Mean Reversion: RSI oversold + price near lower BB when ADX is low (max 0.15)
     5. VWAP Reclaim: price above rolling 20-bar VWAP (institutional reference level)
     """
 
@@ -38,8 +38,6 @@ class MicroScalpEngine:
     RSI_OVERSOLD_THRESHOLD        = 45   # RSI < 45 → oversold, mean reversion buy signal
     RSI_MILDLY_OVERSOLD_THRESHOLD = 50   # RSI < 50 → mildly oversold, partial credit
     BB_NEAR_LOWER_PCT             = 0.03  # within 3% of lower Bollinger Band = near support
-    # Microstructure gate: without OBI or vol_ignition, cap score below entry threshold
-    MICROSTRUCTURE_CONSTRAINT_MAX_SCORE = 0.59
 
     def __init__(self, algorithm):
         self.algo = algorithm
@@ -60,7 +58,8 @@ class MicroScalpEngine:
             'obi':            0.0,
             'vol_ignition':   0.0,
             'micro_trend':    0.0,
-            'adx_filter':     0.0,
+            'adx_trend':      0.0,
+            'mean_reversion': 0.0,
             'vwap_signal':    0.0,
         }
 
@@ -152,49 +151,42 @@ class MicroScalpEngine:
                             components['micro_trend'] = 0
 
             # ----------------------------------------------------------
-            # Signal 4: ADX Regime Filter OR Mean Reversion
-            # Trending market (ADX > 20): ADX directional bias confirms trend.
-            # Ranging market (ADX ≤ 20): Mean reversion setup (RSI oversold +
-            # price near lower Bollinger Band) serves as the entry signal.
-            # This adaptation allows the engine to trade profitably in both
-            # trending (Jan–Mar) and sideways/consolidating (Apr–Oct) regimes.
+            # Signal 4a: ADX Trend — scores only when ADX is HIGH
+            # Signal 4b: Mean Reversion — scores only when ADX is LOW
+            # Decoupled so they never overwrite each other and can
+            # add up independently into the final score.
             # ----------------------------------------------------------
             adx_indicator = crypto.get('adx')
             if adx_indicator is not None and adx_indicator.IsReady:
                 adx_val = adx_indicator.Current.Value
                 di_plus = adx_indicator.PositiveDirectionalIndex.Current.Value
                 di_minus = adx_indicator.NegativeDirectionalIndex.Current.Value
+                # adx_trend: only fires when trend is strong and bullish
                 if adx_val > self.ADX_STRONG_THRESHOLD and di_plus > di_minus:
-                    # Strong trend with bullish bias
-                    components['adx_filter'] = 0.20
+                    components['adx_trend'] = 0.15
                 elif adx_val > self.ADX_MODERATE_THRESHOLD and di_plus > di_minus:
-                    # Moderate trend with bullish bias
-                    components['adx_filter'] = 0.10
-                elif adx_val < self.ADX_STRONG_THRESHOLD and self.algo.market_regime == 'sideways':
-                    # Deep mean-reversion signal for sideways regime
-                    rsi_indicator = crypto.get('rsi')
+                    components['adx_trend'] = 0.10
+                # mean_reversion: only fires when ADX is low (ranging/choppy)
+                if adx_val <= self.ADX_STRONG_THRESHOLD:
+                    rsi_ind = crypto.get('rsi')
                     bb_lower_data = crypto.get('bb_lower', [])
-                    if (rsi_indicator is not None and rsi_indicator.IsReady
+                    if (rsi_ind is not None and rsi_ind.IsReady
                             and len(bb_lower_data) >= 1 and len(crypto['prices']) >= 1):
-                        rsi_val = rsi_indicator.Current.Value
+                        rsi_val = rsi_ind.Current.Value
                         price = crypto['prices'][-1]
-                        lower_bb = bb_lower_data[-1]
-                        if lower_bb > 0 and price <= lower_bb * 1.005 and rsi_val < 35:
-                            components['adx_filter'] = 0.25
-                elif adx_val <= self.ADX_MODERATE_THRESHOLD:
-                    # Ranging market: use mean reversion signal instead of ADX
-                    if (crypto['rsi'].IsReady and len(crypto['bb_lower']) >= 1
-                            and len(crypto['prices']) >= 1):
-                        rsi_val = crypto['rsi'].Current.Value
-                        price = crypto['prices'][-1]
-                        bb_lower = crypto['bb_lower'][-1]
-                        if (rsi_val < self.RSI_OVERSOLD_THRESHOLD and bb_lower > 0
+                        bb_lower = bb_lower_data[-1]
+                        is_mild_oversold_ranging = (adx_val <= self.ADX_MODERATE_THRESHOLD
+                                                    and rsi_val < self.RSI_MILDLY_OVERSOLD_THRESHOLD)
+                        if (self.algo.market_regime == 'sideways'
+                                and bb_lower > 0 and price <= bb_lower * 1.005 and rsi_val < 35):
+                            components['mean_reversion'] = 0.15
+                        elif (adx_val <= self.ADX_MODERATE_THRESHOLD
+                                and rsi_val < self.RSI_OVERSOLD_THRESHOLD
+                                and bb_lower > 0
                                 and price <= bb_lower * (1 + self.BB_NEAR_LOWER_PCT)):
-                            # Oversold near lower band → strong mean reversion signal
-                            components['adx_filter'] = 0.20
-                        elif rsi_val < self.RSI_MILDLY_OVERSOLD_THRESHOLD:
-                            # Mildly oversold in ranging market → partial credit
-                            components['adx_filter'] = 0.10
+                            components['mean_reversion'] = 0.15
+                        elif is_mild_oversold_ranging:
+                            components['mean_reversion'] = 0.10
 
             # ----------------------------------------------------------
             # Signal 5: VWAP Reclaim / SD Band Bounce
@@ -255,12 +247,12 @@ class MicroScalpEngine:
 
         score = sum(components.values())
 
-        # Microstructure constraint: require at least OBI or vol_ignition to fire.
-        # Without real microstructure confirmation, cap the score below entry threshold
-        # to prevent low-quality entries that get eaten by fees.
-        has_microstructure = components.get('obi', 0) > 0 or components.get('vol_ignition', 0) > 0
-        if not has_microstructure:
-            score = min(score, self.MICROSTRUCTURE_CONSTRAINT_MAX_SCORE)
+        # Graduated microstructure gate: smoothly raises the score ceiling
+        # based on real order-flow presence (OBI + vol_ignition strength).
+        # No microstructure → cap at 0.50; full microstructure → uncapped.
+        microstructure_strength = components.get('obi', 0) + components.get('vol_ignition', 0)
+        gate_cap = 0.50 + min(microstructure_strength / 0.20, 1.0) * 0.50
+        score = min(score, gate_cap)
 
         return min(score, 1.0), components
 
