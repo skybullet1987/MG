@@ -66,7 +66,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.base_max_positions = 6
         self.max_positions      = 6
         self.min_notional       = 5.5
-        self.max_position_usd   = self._get_param("max_position_usd", 100000000000.0)
+        self.max_position_usd   = self._get_param("max_position_usd", 500.0)  # $500 cap prevents over-concentration at scale
         self.min_price_usd      = 0.001
         self.cash_reserve_pct   = 0.00
         self.min_notional_fee_buffer = 1.5
@@ -134,6 +134,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._last_mismatch_warning = None
         self._failed_exit_attempts = {}
         self._failed_exit_counts   = {}
+        self._daily_open_value     = None
+        self.pnl_by_tag            = {}
 
         self.peak_value       = None
         self.drawdown_cooldown = 0
@@ -147,7 +149,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._partial_sell_symbols  = set()
         self._choppy_regime_entries = {}
         self.partial_tp_threshold   = 0.025
-        self.stagnation_minutes     = 60
+        self.stagnation_minutes     = 120
         self.stagnation_pnl_threshold = 0.005
         self.rsi_peaked_overbought = {}
         self.trade_count      = 0
@@ -260,6 +262,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def ResetDailyCounters(self):
         self.daily_trade_count = 0
         self.last_trade_date = self.Time.date()
+        self._daily_open_value = self.Portfolio.TotalPortfolioValue
         for crypto in self.crypto_data.values():
             crypto['trade_count_today'] = 0
         if len(self._session_blacklist) > 0:
@@ -650,6 +653,16 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
         return True
 
+    def _daily_loss_exceeded(self):
+        """Returns True if the portfolio has dropped >= 3% from today's open value."""
+        if self._daily_open_value is None or self._daily_open_value <= 0:
+            return False
+        current = self.Portfolio.TotalPortfolioValue
+        if current <= 0:
+            return True
+        drop = (self._daily_open_value - current) / self._daily_open_value
+        return drop >= 0.03
+
     def _log_skip(self, reason):
         if self.LiveMode:
             debug_limited(self, f"Rebalance skip: {reason}")
@@ -660,6 +673,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def Rebalance(self):
         if self.IsWarmingUp:
+            return
+
+        if self._daily_loss_exceeded():
+            self._log_skip("max daily loss exceeded")
             return
         
         # Cash mode — pause trading when recent performance is poor
@@ -679,7 +696,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if self.LiveMode and not live_safety_checks(self):
             return
         # Only block on explicit bad states; unknown is allowed (and will have fallback after warmup)
-        if self.LiveMode and self.kraken_status in ("maintenance", "cancel_only"):
+        if self.LiveMode and getattr(self, 'kraken_status', 'unknown') in ("maintenance", "cancel_only"):
             self._log_skip("kraken not online")
             return
         cancel_stale_new_orders(self)
@@ -1208,12 +1225,22 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 self._choppy_regime_entries.pop(symbol, None)
                 self.Debug(f"{tag}: {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.1f}h")
             else:
-
-                self.Debug(f"⚠️ EXIT FAILED ({tag}): {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.1f}h -- position unsellable, cleaning up")
-                cleanup_position(self, symbol)
-                self.rsi_peaked_overbought.pop(symbol, None)
-                self.entry_volumes.pop(symbol, None)
-                self._choppy_regime_entries.pop(symbol, None)
+                fail_count = self._failed_exit_counts.get(symbol, 0) + 1
+                self._failed_exit_counts[symbol] = fail_count
+                self.Debug(f"⚠️ EXIT FAILED ({tag}) #{fail_count}: {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.1f}h")
+                if fail_count >= 3:
+                    self.Debug(f"🚨 FATAL EXIT FAILURE: {symbol.Value} — {fail_count} attempts failed, escalating to market order")
+                    try:
+                        holding = self.Portfolio[symbol]
+                        qty = abs(holding.Quantity)
+                        if qty > 0:
+                            self.MarketOrder(symbol, -qty, tag=f"Force Exit (fail#{fail_count})")
+                    except Exception as e:
+                        self.Debug(f"Force market exit error for {symbol.Value}: {e}")
+                    self._failed_exit_counts.pop(symbol, None)
+                    self.rsi_peaked_overbought.pop(symbol, None)
+                    self.entry_volumes.pop(symbol, None)
+                    self._choppy_regime_entries.pop(symbol, None)
 
     def OnOrderEvent(self, event):
         try:
