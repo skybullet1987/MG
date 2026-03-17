@@ -803,7 +803,7 @@ def normalize_order_time(order_time):
     return order_time.replace(tzinfo=None) if order_time.tzinfo is not None else order_time
 
 
-def record_exit_pnl(algo, symbol, entry_price, exit_price, tag=None):
+def record_exit_pnl(algo, symbol, entry_price, exit_price, exit_tag="Unknown"):
     """Helper to record PnL from an exit trade. Returns None if prices are invalid."""
     if entry_price <= 0 or exit_price <= 0:
         algo.Debug(f"⚠️ Cannot record PnL for {symbol.Value}: invalid prices (entry=${entry_price:.4f}, exit=${exit_price:.4f})")
@@ -820,10 +820,11 @@ def record_exit_pnl(algo, symbol, entry_price, exit_price, tag=None):
         algo.losing_trades += 1
         algo.consecutive_losses += 1
     algo.total_pnl += pnl
-    if tag is not None and hasattr(algo, 'pnl_by_tag'):
-        if tag not in algo.pnl_by_tag:
-            algo.pnl_by_tag[tag] = []
-        algo.pnl_by_tag[tag].append(pnl)
+    if not hasattr(algo, 'pnl_by_tag'):
+        algo.pnl_by_tag = {}
+    if exit_tag not in algo.pnl_by_tag:
+        algo.pnl_by_tag[exit_tag] = []
+    algo.pnl_by_tag[exit_tag].append(pnl)
     return pnl
 
 
