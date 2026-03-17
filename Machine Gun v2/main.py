@@ -6,17 +6,13 @@ from collections import deque
 import numpy as np
 from QuantConnect.Orders.Fees import FeeModel, OrderFee
 from QuantConnect.Securities import CashAmount
-# from QuantConnect.Orders.Slippage import SlippageModel
 # endregion
 
 
 class MakerTakerFeeModel(FeeModel):
-    """Blended fee model: assumes 40% of limit orders cross the spread
-    and pay taker rate. This matches empirical Kraken fill data for
-    aggressive limit orders (bid * 1.0005 placement strategy).
-    Taker rate always applies to Market orders."""
+    """Blended crypto fee model: 40% taker fills for limit orders."""
 
-    LIMIT_TAKER_RATIO = 0.40  # 40% of limits cross the spread in practice
+    LIMIT_TAKER_RATIO = 0.40
 
     def GetOrderFee(self, parameters):
         order = parameters.Order
@@ -30,10 +26,6 @@ class MakerTakerFeeModel(FeeModel):
 
 
 class SimplifiedCryptoStrategy(QCAlgorithm):
-    """
-    Micro-Scalping System - v7.3.0
-    5-signal micro-scalp engine, regime-adaptive, bull/sideways/bear-aware.
-    """
 
     def Initialize(self):
         self.SetStartDate(2024, 1, 1)
@@ -55,9 +47,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.extended_time_stop_pnl_max = self._get_param("extended_time_stop_pnl_max", 0.015)
         self.stale_position_hours       = self._get_param("stale_position_hours",       6.0)
 
-        # Keep legacy names used elsewhere
-        self.trailing_activation = self.trail_activation
-        self.trailing_stop_pct   = self.trail_stop_pct
+        self.trailing_activation = self.trail_activation        self.trailing_stop_pct   = self.trail_stop_pct
         self.base_stop_loss      = self.tight_stop_loss
         self.base_take_profit    = self.quick_take_profit
         self.atr_trail_mult      = 2.0
@@ -236,8 +226,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self.Debug(f"Capital: ${self.Portfolio.Cash:.2f} | Max pos: {self.max_positions} | Size: {self.position_size_pct:.0%}")
 
     def CustomSecurityInitializer(self, security):
-        """Applies volume-aware slippage (RealisticCryptoSlippage) and the custom
-        Maker/Taker fee model (0.25% for Limit orders, 0.40% for Market orders)."""
         security.SetSlippageModel(RealisticCryptoSlippage())
         security.SetFeeModel(MakerTakerFeeModel())
 
@@ -252,11 +240,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             return default
 
     def _normalize_order_time(self, order_time):
-        """Helper to normalize order time by removing timezone info if present."""
         return normalize_order_time(order_time)
-    
+
     def _record_exit_pnl(self, symbol, entry_price, exit_price, exit_tag="Unknown"):
-        """Helper to record PnL from an exit trade. Returns None if prices are invalid."""
         return record_exit_pnl(self, symbol, entry_price, exit_price, exit_tag=exit_tag)
 
     def ResetDailyCounters(self):
@@ -446,15 +432,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         crypto['ema_5'].Update(bar.EndTime, price)
         crypto['atr'].Update(bar)
         crypto['adx'].Update(bar)
-        # Rolling 20-bar VWAP
         crypto['vwap_pv'].append(price * volume)
         crypto['vwap_v'].append(volume)
         total_v = sum(crypto['vwap_v'])
         if total_v > 0:
             crypto['vwap'] = sum(crypto['vwap_pv']) / total_v
-        # Long-term volume baseline for adaptive scoring thresholds (~24h window)
         crypto['volume_long'].append(volume)
-        # VWAP SD bands: compute std of bar prices within the rolling VWAP window
         if len(crypto['vwap_v']) >= 5 and crypto['vwap'] > 0:
             vwap_val = crypto['vwap']
             pv_list = list(crypto['vwap_pv'])
@@ -481,7 +464,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 crypto['bb_upper'].append(mean + 2 * std)
                 crypto['bb_lower'].append(mean - 2 * std)
                 crypto['bb_width'].append(4 * std / mean if mean > 0 else 0)
-        # CVD: Tick Delta approximation
         high_low = high - low
         if high_low > 0:
             bar_delta = volume * ((price - low) - (high - price)) / high_low
@@ -489,7 +471,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             bar_delta = 0.0
         prev_cvd = crypto['cvd'][-1] if len(crypto['cvd']) > 0 else 0.0
         crypto['cvd'].append(prev_cvd + bar_delta)
-        # KER: Kaufman Efficiency Ratio (15-period)
         if len(crypto['prices']) >= 15:
             price_change = abs(crypto['prices'][-1] - crypto['prices'][-15])
             volatility_sum = sum(abs(crypto['prices'][i] - crypto['prices'][i-1]) for i in range(-14, 0))
@@ -497,9 +478,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 crypto['ker'].append(price_change / volatility_sum)
             else:
                 crypto['ker'].append(0.0)
-        # 1D Kalman Filter for price
-        Q = 1e-5  # Process noise variance
-        R = 0.01  # Measurement noise variance
+        Q = 1e-5
+        R = 0.01
         if crypto['kalman_estimate'] == 0.0:
             crypto['kalman_estimate'] = price
         estimate_pred = crypto['kalman_estimate']
@@ -510,7 +490,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         sp = get_spread_pct(self, symbol)
         if sp is not None:
             crypto['spreads'].append(sp)
-        # Update bid/ask sizes from QuoteBar for Order Book Imbalance calculation
         if quote_bar is not None:
             try:
                 bid_sz = float(quote_bar.LastBidSize) if quote_bar.LastBidSize else 0.0
@@ -599,6 +578,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         """Evaluate long signals only. Short scoring disabled (Cash account)."""
         long_score, long_components = self._scoring_engine.calculate_scalp_score(crypto)
 
+        sp = get_spread_pct(self, symbol)
+        if sp is not None and sp > 0:
+            spread_penalty = min((sp / 0.005) * 0.15, 0.15)
+            long_score *= (1.0 - spread_penalty)
+
         components = long_components.copy()
         components['_scalp_score'] = long_score
         components['_direction'] = 1
@@ -678,24 +662,23 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if self._daily_loss_exceeded():
             self._log_skip("max daily loss exceeded")
             return
+
+        if len(self.btc_returns) >= 5 and sum(list(self.btc_returns)[-5:]) < -0.01:
+            self._log_skip("BTC dumping")
+            return
         
-        # Cash mode — pause trading when recent performance is poor
         if self._cash_mode_until is not None and self.Time < self._cash_mode_until:
             self._log_skip("cash mode - poor recent performance")
             return
-        
-        # Reset log budget at each rebalance call for consistent logging
+
         self.log_budget = 20
-        
-        # Check rate limit hard block
+
         if self._rate_limit_until is not None and self.Time < self._rate_limit_until:
             self._log_skip("rate limited")
             return
-        
-        # Live safety checks
+
         if self.LiveMode and not live_safety_checks(self):
             return
-        # Only block on explicit bad states; unknown is allowed (and will have fallback after warmup)
         if self.LiveMode and getattr(self, 'kraken_status', 'unknown') in ("maintenance", "cancel_only"):
             self._log_skip("kraken not online")
             return
@@ -721,7 +704,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self._log_skip(f"drawdown {dd:.1%} > limit")
             return
         if self.consecutive_losses >= self.max_consecutive_losses:
-            # Pause 3h and halve size for next 5 trades
             self.drawdown_cooldown = 3
             self._consecutive_loss_halve_remaining = 3
             self.consecutive_losses = 0
@@ -740,10 +722,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if pos_count >= self.max_positions:
             self._log_skip("at max positions")
             return
-        # Fear & Greed regime gate — reduce exposure in extreme greed
         fg_value = getattr(self, 'fear_greed_value', 50)
         if fg_value >= 85:
-            # Extreme Greed — halve max positions (market is frothy)
             effective_max_pos = max(1, self.max_positions // 2)
             if pos_count >= effective_max_pos:
                 self._log_skip(f"Fear&Greed extreme greed ({fg_value}) — reduced max positions")
@@ -752,14 +732,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self._log_skip("too many open orders")
             return
 
-        # Diagnostic counters for filter funnel
-        count_not_blacklisted = 0
-        count_no_open_orders = 0
-        count_spread_ok = 0
-        count_ready = 0
         count_scored = 0
         count_above_thresh = 0
-
         scores = []
         threshold_now = self._get_threshold()
         for symbol in list(self.crypto_data.keys()):
@@ -767,20 +741,15 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
             if symbol.Value in self._symbol_entry_cooldowns and self.Time < self._symbol_entry_cooldowns[symbol.Value]:
                 continue
-            count_not_blacklisted += 1
-
             if has_open_orders(self, symbol):
                 continue
-            count_no_open_orders += 1
 
             if not spread_ok(self, symbol):
                 continue
-            count_spread_ok += 1
 
             crypto = self.crypto_data[symbol]
             if not self._is_ready(crypto):
                 continue
-            count_ready += 1
 
             factor_scores = self._calculate_factor_scores(symbol, crypto)
             if not factor_scores:
@@ -790,7 +759,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             composite_score = self._calculate_composite_score(factor_scores, crypto)
             net_score = self._apply_fee_adjustment(composite_score)
 
-            # Store for diagnostic purposes
             crypto['recent_net_scores'].append(net_score)
 
             if net_score >= threshold_now:
@@ -804,7 +772,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     'dollar_volume': list(crypto['dollar_volume'])[-6:] if len(crypto['dollar_volume']) >= 6 else [],
                 })
 
-        # Log diagnostic summary
         try:
             cash = self.Portfolio.CashBook["USD"].Amount
         except (KeyError, AttributeError):
@@ -820,7 +787,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._execute_trades(scores, threshold_now)
 
     def _get_open_buy_orders_value(self):
-        """Calculate total value reserved by open buy orders."""
         return get_open_buy_orders_value(self)
 
     def _execute_trades(self, candidates, threshold_now):
@@ -927,11 +893,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if not crypto:
                 continue
 
-            # Per-symbol daily trade limit
             if crypto.get('trade_count_today', 0) >= self.max_symbol_trades_per_day:
                 continue
 
-            # Fee-adjusted profit gate: ATR-projected move must cover fees + slippage.
             atr_val = crypto['atr'].Current.Value if crypto['atr'].IsReady else None
             if atr_val and price > 0:
                 expected_move_pct = (atr_val * self.atr_tp_mult) / price
@@ -940,7 +904,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 if expected_move_pct < min_required:
                     continue
 
-            # Dollar-volume liquidity gate: use 12-bar average for more stable assessment
             if len(crypto['dollar_volume']) >= 3:
                 dv_window = min(len(crypto['dollar_volume']), 12)
                 recent_dv = np.mean(list(crypto['dollar_volume'])[-dv_window:])
@@ -949,15 +912,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     reject_dollar_volume += 1
                     continue
 
-            # Position sizing: 70% base, Kelly-adjusted
             vol = self._annualized_vol(crypto)
             size = self._calculate_position_size(net_score, threshold_now, vol)
 
-            # Halve size if in consecutive-loss recovery mode
             if self._consecutive_loss_halve_remaining > 0:
                 size *= 0.50
 
-            # High-volatility regime: widen sizing slightly (vol = opportunity)
             if self.volatility_regime == "high":
                 size = min(size * 1.1, self.position_size_pct)
 
@@ -966,10 +926,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
             val = reserved_cash * size
 
-            # Floor at min_notional to support small accounts
             val = max(val, self.min_notional)
-
-            # Absolute Hard Cap on position size
             val = min(val, self.max_position_usd)
 
             qty = round_quantity(self, sym, val / price)
@@ -984,7 +941,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 reject_notional += 1
                 continue
 
-            # Exit feasibility check: qty must be >= MinimumOrderSize so the position can be sold.
             try:
                 sec = self.Securities[sym]
                 min_order_size = float(sec.SymbolProperties.MinimumOrderSize or 0)
@@ -994,7 +950,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     self.Debug(f"REJECT ENTRY {sym.Value}: qty={qty} < min_order_size={actual_min} (unsellable)")
                     reject_notional += 1
                     continue
-                # Ensure post-fee qty >= MinimumOrderSize so position is sellable.
                 if min_order_size > 0:
                     post_fee_qty = qty * (1.0 - KRAKEN_SELL_FEE_BUFFER)
                     if post_fee_qty < min_order_size:
@@ -1017,13 +972,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     sig_str = (f"obi={components.get('obi', 0):.2f} "
                                f"vol={components.get('vol_ignition', 0):.2f} "
                                f"trend={components.get('micro_trend', 0):.2f} "
-                               f"adx={components.get('adx_filter', 0):.2f} "
+                               f"adx={components.get('adx_trend', 0):.2f} "
+                               f"mean_rev={components.get('mean_reversion', 0):.2f} "
                                f"vwap={components.get('vwap_signal', 0):.2f}")
                     self.Debug(f"SCALP ENTRY: {sym.Value} | score={net_score:.2f} | ${val:.2f} | {sig_str}")
                     success_count += 1
                     self.trade_count += 1
                     crypto['trade_count_today'] = crypto.get('trade_count_today', 0) + 1
-                    # Record ADX regime at entry for tighter TP in choppy markets
                     adx_ind = crypto.get('adx')
                     is_choppy = (adx_ind is not None and adx_ind.IsReady
                                  and adx_ind.Current.Value < 25)
@@ -1115,19 +1070,17 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             sl = max((atr * self.atr_sl_mult) / entry, self.tight_stop_loss)
             tp = max((atr * self.atr_tp_mult) / entry, self.quick_take_profit)
         else:
-            sl = self.tight_stop_loss   # 1.0-2.0% stop floor
-            tp = self.quick_take_profit  # 1.5-3.0% take-profit floor
+            sl = self.tight_stop_loss
+            tp = self.quick_take_profit
 
         if tp < sl * 1.5:
             tp = sl * 1.5
 
-        # Tighten take-profit when this position was entered in a choppy (ADX < 25) regime
         if self._choppy_regime_entries.get(symbol, False):
-            tp = tp * 0.65   # 35% tighter TP – trend continuation unlikely in choppy market
+            tp = tp * 0.65
 
-        # Tighten take-profit in low-volatility regime to secure profits faster
         if self.volatility_regime == "low":
-            tp = tp * 0.75   # 25% tighter TP – low-vol moves mean-revert quickly
+            tp = tp * 0.75
 
         trailing_activation = self.trail_activation
         trailing_stop_pct   = self.trail_stop_pct
@@ -1181,24 +1134,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                         tag = "ATR Trail"
                     elif holding.Quantity < 0 and price >= crypto['trail_stop']:
                         tag = "ATR Trail"
-
-
-            # RSI Momentum Exit removed - causes premature exits in swing-trading regime
-            # if not tag and crypto and crypto['rsi'].IsReady:
-            #     rsi_now = crypto['rsi'].Current.Value
-            #     if self.rsi_peaked_overbought.get(symbol, False) and rsi_now < 75:
-            #         tag = "RSI Momentum Exit"
-
-
-            # Volume Dry-up Exit removed - causes premature exits in swing-trading regime
-            # if not tag and hours >= 2.0 and crypto and len(crypto['volume']) >= 2:
-            #     entry_vol = self.entry_volumes.get(symbol, 0)
-            #     if entry_vol > 0:
-            #         v1 = crypto['volume'][-1]
-            #         v2 = crypto['volume'][-2]
-            #         if v1 < entry_vol * 0.50 and v2 < entry_vol * 0.50:
-            #             tag = "Volume Dry-up"
-
 
             if not tag and hours >= self.time_stop_hours and pnl < self.time_stop_pnl_min:
                 tag = "Time Stop"
@@ -1281,8 +1216,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 slip_log(self, symbol, event.Direction, event.FillPrice)
             elif event.Status == OrderStatus.Filled:
                 self._pending_orders.pop(symbol, None)
-                self._submitted_orders.pop(symbol, None)  # Remove from verification tracking
-                self._order_retries.pop(event.OrderId, None)  # Clean up retry tracking
+                self._submitted_orders.pop(symbol, None)
+                self._order_retries.pop(event.OrderId, None)
                 if event.Direction == OrderDirection.Buy:
                     self.entry_prices[symbol] = event.FillPrice
                     self.highest_prices[symbol] = event.FillPrice
