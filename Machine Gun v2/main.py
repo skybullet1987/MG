@@ -255,9 +255,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         """Helper to normalize order time by removing timezone info if present."""
         return normalize_order_time(order_time)
     
-    def _record_exit_pnl(self, symbol, entry_price, exit_price):
+    def _record_exit_pnl(self, symbol, entry_price, exit_price, exit_tag="Unknown"):
         """Helper to record PnL from an exit trade. Returns None if prices are invalid."""
-        return record_exit_pnl(self, symbol, entry_price, exit_price)
+        return record_exit_pnl(self, symbol, entry_price, exit_price, exit_tag=exit_tag)
 
     def ResetDailyCounters(self):
         self.daily_trade_count = 0
@@ -1298,6 +1298,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     if symbol in self._partial_sell_symbols:
                         self._partial_sell_symbols.discard(symbol)
                     else:
+                        order = self.Transactions.GetOrderById(event.OrderId)
+                        exit_tag = order.Tag if order and order.Tag else "Unknown"
                         entry = self.entry_prices.get(symbol, None)
                         if entry is None:
                             entry = event.FillPrice
@@ -1314,11 +1316,16 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                             self.losing_trades += 1
                             self.consecutive_losses += 1
                         self.total_pnl += pnl
+                        if not hasattr(self, 'pnl_by_tag'):
+                            self.pnl_by_tag = {}
+                        if exit_tag not in self.pnl_by_tag:
+                            self.pnl_by_tag[exit_tag] = []
+                        self.pnl_by_tag[exit_tag].append(pnl)
                         self.trade_log.append({
                             'time': self.Time,
                             'symbol': symbol.Value,
                             'pnl_pct': pnl,
-                            'exit_reason': 'filled_sell',
+                            'exit_reason': exit_tag,
                         })
 
                         if len(self._recent_trade_outcomes) >= 12:
