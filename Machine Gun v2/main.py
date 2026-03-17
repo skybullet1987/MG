@@ -47,9 +47,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.035)
         self.atr_tp_mult  = self._get_param("atr_tp_mult",  4.0)
         self.atr_sl_mult  = self._get_param("atr_sl_mult",  2.0)
-        self.trail_activation  = self._get_param("trail_activation",  0.020)
-        self.trail_stop_pct    = self._get_param("trail_stop_pct",    0.015)
-        self.time_stop_hours   = self._get_param("time_stop_hours",   2.0)
+        self.trail_activation  = self._get_param("trail_activation",  0.040)
+        self.trail_stop_pct    = self._get_param("trail_stop_pct",    0.025)
+        self.time_stop_hours   = self._get_param("time_stop_hours",   3.0)
         self.time_stop_pnl_min = self._get_param("time_stop_pnl_min", 0.003)
         self.extended_time_stop_hours   = self._get_param("extended_time_stop_hours",   4.0)
         self.extended_time_stop_pnl_max = self._get_param("extended_time_stop_pnl_max", 0.015)
@@ -84,7 +84,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.max_spread_pct         = 0.008
         self.spread_median_window   = 12
         self.spread_widen_mult      = 2.5
-        self.min_dollar_volume_usd  = 5000
+        self.min_dollar_volume_usd  = 20000
         self.min_volume_usd         = 10000
 
         self.skip_hours_utc         = []
@@ -97,7 +97,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
         self.expected_round_trip_fees = 0.0025
         self.fee_slippage_buffer      = 0.001
-        self.min_expected_profit_pct  = 0.005
+        self.min_expected_profit_pct  = 0.015
         self.adx_min_period           = 10
 
         self.stale_order_timeout_seconds      = 30
@@ -147,7 +147,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._partial_sell_symbols  = set()
         self._choppy_regime_entries = {}
         self.partial_tp_threshold   = 0.025
-        self.stagnation_minutes     = 45
+        self.stagnation_minutes     = 60
         self.stagnation_pnl_threshold = 0.005
         self.rsi_peaked_overbought = {}
         self.trade_count      = 0
@@ -188,7 +188,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.log_budget     = 0
         self.last_log_time  = None
 
-        self.max_universe_size = 60
+        self.max_universe_size = 20
 
         self.kraken_status = "unknown"
         self._last_skip_reason = None
@@ -1166,19 +1166,21 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                         tag = "ATR Trail"
 
 
-            if not tag and crypto and crypto['rsi'].IsReady:
-                rsi_now = crypto['rsi'].Current.Value
-                if self.rsi_peaked_overbought.get(symbol, False) and rsi_now < 75:
-                    tag = "RSI Momentum Exit"
+            # RSI Momentum Exit removed - causes premature exits in swing-trading regime
+            # if not tag and crypto and crypto['rsi'].IsReady:
+            #     rsi_now = crypto['rsi'].Current.Value
+            #     if self.rsi_peaked_overbought.get(symbol, False) and rsi_now < 75:
+            #         tag = "RSI Momentum Exit"
 
 
-            if not tag and hours >= 2.0 and crypto and len(crypto['volume']) >= 2:
-                entry_vol = self.entry_volumes.get(symbol, 0)
-                if entry_vol > 0:
-                    v1 = crypto['volume'][-1]
-                    v2 = crypto['volume'][-2]
-                    if v1 < entry_vol * 0.50 and v2 < entry_vol * 0.50:
-                        tag = "Volume Dry-up"
+            # Volume Dry-up Exit removed - causes premature exits in swing-trading regime
+            # if not tag and hours >= 2.0 and crypto and len(crypto['volume']) >= 2:
+            #     entry_vol = self.entry_volumes.get(symbol, 0)
+            #     if entry_vol > 0:
+            #         v1 = crypto['volume'][-1]
+            #         v2 = crypto['volume'][-2]
+            #         if v1 < entry_vol * 0.50 and v2 < entry_vol * 0.50:
+            #             tag = "Volume Dry-up"
 
 
             if not tag and hours >= self.time_stop_hours and pnl < self.time_stop_pnl_min:
