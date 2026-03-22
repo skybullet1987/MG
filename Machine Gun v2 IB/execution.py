@@ -149,7 +149,11 @@ def cancel_stale_new_orders(algo):
                     algo.Debug(f"STALE ORDER but position exists: {order.Symbol.Value} — re-tracking")
                     holding = algo.Portfolio[order.Symbol]
                     algo.entry_prices[order.Symbol] = holding.AveragePrice
-                    algo.highest_prices[order.Symbol] = holding.AveragePrice
+                    if holding.Quantity < 0:
+                        if hasattr(algo, 'lowest_prices'):
+                            algo.lowest_prices[order.Symbol] = holding.AveragePrice
+                    else:
+                        algo.highest_prices[order.Symbol] = holding.AveragePrice
                     algo.entry_times[order.Symbol] = algo.Time
                     algo.Transactions.CancelOrder(order.Id)
                     continue
@@ -186,6 +190,8 @@ def cleanup_position(algo, symbol, record_pnl=False, exit_price=None):
             record_exit_pnl(algo, symbol, entry_price, exit_price)
     algo.entry_prices.pop(symbol, None)
     algo.highest_prices.pop(symbol, None)
+    algo.lowest_prices.pop(symbol, None) if hasattr(algo, 'lowest_prices') else None
+    algo._entry_directions.pop(symbol, None) if hasattr(algo, '_entry_directions') else None
     algo.entry_times.pop(symbol, None)
     # Clear trail_stop on mnq_data if this is the active contract
     if hasattr(algo, 'mnq_data') and algo.mnq_data is not None:
@@ -216,12 +222,18 @@ def sync_existing_positions(algo):
             continue
         algo.entry_prices[symbol] = holding.AveragePrice
         algo.highest_prices[symbol] = holding.AveragePrice
+        if hasattr(algo, 'lowest_prices'):
+            algo.lowest_prices[symbol] = holding.AveragePrice
         algo.entry_times[symbol] = algo.Time
         synced_count += 1
         current_price = algo.Securities[symbol].Price if symbol in algo.Securities else holding.Price
-        pnl_pct = (current_price - holding.AveragePrice) / holding.AveragePrice if holding.AveragePrice > 0 else 0
+        is_short = holding.Quantity < 0
+        if is_short:
+            pnl_pct = (holding.AveragePrice - current_price) / holding.AveragePrice if holding.AveragePrice > 0 else 0
+        else:
+            pnl_pct = (current_price - holding.AveragePrice) / holding.AveragePrice if holding.AveragePrice > 0 else 0
         algo.Debug(f"SYNCED: {ticker} | Entry: ${holding.AveragePrice:.2f} | Now: ${current_price:.2f} | PnL: {pnl_pct:+.2%}")
-        if current_price > holding.AveragePrice:
+        if not is_short and current_price > holding.AveragePrice:
             algo.highest_prices[symbol] = current_price
         if pnl_pct >= algo.base_take_profit:
             positions_to_close.append((symbol, ticker, pnl_pct, "Sync TP"))

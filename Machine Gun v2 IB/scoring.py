@@ -241,6 +241,139 @@ class MicroScalpEngine:
         return min(score, 1.0), components
 
     # ------------------------------------------------------------------
+    # Short scoring — inverse of long signals
+    # ------------------------------------------------------------------
+    def calculate_short_score(self, mnq):
+        """
+        Calculate the aggregate short scalp score (inverse of long signals).
+
+        Returns
+        -------
+        (score, components) where score ∈ [0, 1] and components maps each
+        signal name to its individual contribution (0.20 max each).
+        """
+        components = {
+            'obi':            0.0,
+            'vol_ignition':   0.0,
+            'micro_trend':    0.0,
+            'adx_trend':      0.0,
+            'mean_reversion': 0.0,
+            'vwap_signal':    0.0,
+        }
+
+        try:
+            # ----------------------------------------------------------
+            # Signal 1: Tick Imbalance (short = down-tick pressure)
+            # ----------------------------------------------------------
+            returns = mnq.get('returns', [])
+            if len(returns) >= 10:
+                recent_returns = list(returns)[-10:]
+                up_ticks = sum(1 for r in recent_returns if r > 0)
+                down_ticks = sum(1 for r in recent_returns if r <= 0)
+                total_ticks = up_ticks + down_ticks
+                if total_ticks > 0:
+                    tick_imbalance = (down_ticks - up_ticks) / total_ticks
+                    if tick_imbalance > self.TICK_IMBALANCE_STRONG:
+                        components['obi'] = 0.20
+                    elif tick_imbalance > self.TICK_IMBALANCE_PARTIAL:
+                        components['obi'] = 0.10
+
+            # ----------------------------------------------------------
+            # Signal 2: Volume Ignition on down move
+            # ----------------------------------------------------------
+            if len(mnq['volume']) >= 20:
+                volumes = list(mnq['volume'])
+                current_vol = volumes[-1]
+                vol_long = list(mnq.get('volume_long', []))
+                if len(vol_long) >= 60:
+                    vol_baseline = float(np.mean(vol_long))
+                else:
+                    vol_baseline = float(np.mean(volumes[-20:]))
+                adx_indicator = mnq.get('adx')
+                is_choppy = (adx_indicator is not None and adx_indicator.IsReady
+                             and adx_indicator.Current.Value < 25)
+                vol_strong  = 1.8 if is_choppy else self.VOL_SURGE_STRONG
+                vol_partial = 1.2 if is_choppy else self.VOL_SURGE_PARTIAL
+                last_return = list(returns)[-1] if len(returns) >= 1 else 0
+                if vol_baseline > 0 and last_return < 0:
+                    ratio = current_vol / vol_baseline
+                    if ratio >= vol_strong:
+                        components['vol_ignition'] = 0.20
+                    elif ratio >= vol_partial:
+                        components['vol_ignition'] = 0.10
+
+            # ----------------------------------------------------------
+            # Signal 3: MTF Trend Alignment (short = price < EMA5 < EMA20)
+            # ----------------------------------------------------------
+            if (mnq['ema_5'].IsReady and mnq.get('ema_medium') is not None
+                    and mnq['ema_medium'].IsReady and len(mnq['prices']) >= 1):
+                price = mnq['prices'][-1]
+                ema5 = mnq['ema_5'].Current.Value
+                ema20 = mnq['ema_medium'].Current.Value
+                if price < ema5 and ema5 < ema20:
+                    components['micro_trend'] = 0.20
+                elif price < ema5:
+                    components['micro_trend'] = 0.10
+
+            # ----------------------------------------------------------
+            # Signal 4a: ADX Trend (short = ADX high + DI- > DI+)
+            # Signal 4b: Mean Reversion (short = RSI overbought + near upper BB)
+            # ----------------------------------------------------------
+            adx_indicator = mnq.get('adx')
+            if adx_indicator is not None and adx_indicator.IsReady:
+                adx_val = adx_indicator.Current.Value
+                di_plus = adx_indicator.PositiveDirectionalIndex.Current.Value
+                di_minus = adx_indicator.NegativeDirectionalIndex.Current.Value
+                if adx_val > self.ADX_STRONG_THRESHOLD and di_minus > di_plus:
+                    components['adx_trend'] = 0.15
+                elif adx_val > self.ADX_MODERATE_THRESHOLD and di_minus > di_plus:
+                    components['adx_trend'] = 0.10
+                if adx_val <= self.ADX_STRONG_THRESHOLD:
+                    rsi_ind = mnq.get('rsi')
+                    bb_upper_data = mnq.get('bb_upper', [])
+                    if (rsi_ind is not None and rsi_ind.IsReady
+                            and len(bb_upper_data) >= 1 and len(mnq['prices']) >= 1):
+                        rsi_val = rsi_ind.Current.Value
+                        price = mnq['prices'][-1]
+                        bb_upper = bb_upper_data[-1]
+                        RSI_OVERBOUGHT = 55
+                        RSI_MILDLY_OVERBOUGHT = 50
+                        is_mild_overbought = (adx_val <= self.ADX_MODERATE_THRESHOLD
+                                              and rsi_val > RSI_MILDLY_OVERBOUGHT)
+                        if (self.algo.market_regime == 'sideways'
+                                and bb_upper > 0 and price >= bb_upper * 0.995 and rsi_val > 65):
+                            components['mean_reversion'] = 0.15
+                        elif (adx_val <= self.ADX_MODERATE_THRESHOLD
+                                and rsi_val > RSI_OVERBOUGHT
+                                and bb_upper > 0
+                                and price >= bb_upper * (1 - self.BB_NEAR_LOWER_PCT)):
+                            components['mean_reversion'] = 0.15
+                        elif is_mild_overbought:
+                            components['mean_reversion'] = 0.10
+
+            # ----------------------------------------------------------
+            # Signal 5: VWAP Signal (short = price below VWAP)
+            # ----------------------------------------------------------
+            vwap = mnq.get('vwap', 0.0)
+            if vwap > 0 and len(mnq['prices']) >= 1:
+                price = mnq['prices'][-1]
+                if price < vwap / self.VWAP_BUFFER:
+                    components['vwap_signal'] = 0.20
+                elif price < vwap:
+                    components['vwap_signal'] = 0.10
+
+        except Exception as e:
+            self.algo.Debug(f"MicroScalpEngine.calculate_short_score error: {e}")
+
+        score = sum(components.values())
+
+        microstructure_strength = components.get('obi', 0) + components.get('vol_ignition', 0)
+        gate_cap = 0.50 + min(microstructure_strength / 0.20, 1.0) * 0.50
+        score = min(score, gate_cap)
+
+        return min(score, 1.0), components
+
+    # ------------------------------------------------------------------
     # Position sizing — contract-count based for MNQ futures
     # ------------------------------------------------------------------
     def calculate_position_size(self, score, threshold, asset_vol_ann):

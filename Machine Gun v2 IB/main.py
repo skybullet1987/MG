@@ -28,9 +28,9 @@ class MNQStrategy(QCAlgorithm):
         self.entry_threshold = 0.50
         self.high_conviction_threshold = 0.60
 
-        # TP/SL Parameters — recalibrated for MNQ (NQ moves ~1-3%/day, not 15%)
-        self.quick_take_profit = self._get_param("quick_take_profit", 0.008)   # 0.8% (~130 NQ points)
-        self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.003)   # 0.3% (~50 NQ points)
+        # TP/SL Parameters — recalibrated for MNQ micro-scalp
+        self.quick_take_profit = self._get_param("quick_take_profit", 0.0025)  # 0.25% (~50 NQ points)
+        self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.0015)  # 0.15% (~30 NQ points)
         self.atr_tp_mult  = self._get_param("atr_tp_mult",  2.5)
         self.atr_sl_mult  = self._get_param("atr_sl_mult",  1.5)
         self.trail_activation  = self._get_param("trail_activation",  0.005)   # 0.5%
@@ -66,7 +66,7 @@ class MNQStrategy(QCAlgorithm):
         # Fee parameters — flat rate, not percentage
         self.expected_round_trip_fees = 1.26   # $1.26 per RT (not percentage!)
         self.fee_slippage_buffer      = 0.50   # $0.50 buffer
-        self.min_expected_profit_pct  = 0.002  # 0.2% — fees are negligible on MNQ
+        self.min_expected_profit_pct  = 0.001  # 0.1% — lower threshold for low-ATR periods
         self.adx_min_period           = 10
 
         self.skip_hours_utc         = []
@@ -117,6 +117,8 @@ class MNQStrategy(QCAlgorithm):
         self.drawdown_cooldown = 0
         self.entry_prices     = {}
         self.highest_prices   = {}
+        self.lowest_prices    = {}
+        self._entry_directions = {}
         self.entry_times      = {}
         self.entry_volumes    = {}
         self._partial_tp_taken      = {}
@@ -466,12 +468,22 @@ class MNQStrategy(QCAlgorithm):
         return max(0, min(1, (v - mn) / (mx - mn)))
 
     def _calculate_factor_scores(self, symbol, mnq):
-        """Evaluate long signals only. Short scoring disabled."""
+        """Evaluate long and short signals; pick the dominant direction."""
         long_score, long_components = self._scoring_engine.calculate_scalp_score(mnq)
-        components = long_components.copy()
-        components['_scalp_score'] = long_score
-        components['_direction'] = 1
-        components['_long_score'] = long_score
+        short_score, short_components = self._scoring_engine.calculate_short_score(mnq)
+
+        if short_score > long_score and short_score >= self._get_threshold():
+            components = short_components.copy()
+            components['_scalp_score'] = short_score
+            components['_direction'] = -1
+            components['_long_score'] = long_score
+            components['_short_score'] = short_score
+        else:
+            components = long_components.copy()
+            components['_scalp_score'] = long_score
+            components['_direction'] = 1
+            components['_long_score'] = long_score
+            components['_short_score'] = short_score
         return components
 
     def _calculate_composite_score(self, factors, mnq=None):
@@ -562,14 +574,14 @@ class MNQStrategy(QCAlgorithm):
             return
 
         if self.consecutive_losses >= self.max_consecutive_losses:
-            self.drawdown_cooldown = 3
+            self.drawdown_cooldown = 0.5
             self._consecutive_loss_halve_remaining = 3
             self.consecutive_losses = 0
             self._log_skip("consecutive loss cooldown")
             return
 
         if self.consecutive_losses >= 3:
-            self.circuit_breaker_expiry = self.Time + timedelta(hours=1)
+            self.circuit_breaker_expiry = self.Time + timedelta(minutes=15)
             self.consecutive_losses = 0
             self._log_skip("circuit breaker triggered (3 consecutive losses)")
             return
@@ -644,18 +656,22 @@ class MNQStrategy(QCAlgorithm):
             return
 
         try:
+            direction = factors.get('_direction', 1)
             price = self.Securities[self.active_contract].Price
-            ticket = self.MarketOrder(self.active_contract, contracts, tag=f"MG Entry score={net_score:.2f}")
+            order_qty = contracts * direction
+            self._entry_directions[self.active_contract] = direction
+            ticket = self.MarketOrder(self.active_contract, order_qty, tag=f"MG Entry score={net_score:.2f}")
             if ticket is not None:
                 self._recent_tickets.append(ticket)
                 components = factors
+                dir_str = "LONG" if direction == 1 else "SHORT"
                 sig_str = (f"tick_imb={components.get('obi', 0):.2f} "
                            f"vol={components.get('vol_ignition', 0):.2f} "
                            f"trend={components.get('micro_trend', 0):.2f} "
                            f"adx={components.get('adx_trend', 0):.2f} "
                            f"mean_rev={components.get('mean_reversion', 0):.2f} "
                            f"vwap={components.get('vwap_signal', 0):.2f}")
-                self.Debug(f"MNQ ENTRY: {contracts} contract(s) | score={net_score:.2f} | ${price:.2f} | {sig_str}")
+                self.Debug(f"MNQ ENTRY ({dir_str}): {contracts} contract(s) | score={net_score:.2f} | ${price:.2f} | {sig_str}")
                 self.trade_count += 1
                 mnq['trade_count_today'] = mnq.get('trade_count_today', 0) + 1
                 adx_ind = mnq.get('adx')
@@ -698,8 +714,11 @@ class MNQStrategy(QCAlgorithm):
                 continue
             if symbol not in self.entry_prices:
                 self.entry_prices[symbol] = kvp.Value.AveragePrice
-                self.highest_prices[symbol] = kvp.Value.AveragePrice
                 self.entry_times[symbol] = self.Time
+                if kvp.Value.Quantity < 0:
+                    self.lowest_prices[symbol] = kvp.Value.AveragePrice
+                else:
+                    self.highest_prices[symbol] = kvp.Value.AveragePrice
                 self.Debug(f"ORPHAN RECOVERY: {symbol.Value} re-tracked")
 
     def _check_exit(self, symbol, price, holding):
@@ -710,17 +729,31 @@ class MNQStrategy(QCAlgorithm):
 
         if symbol not in self.entry_prices:
             self.entry_prices[symbol] = holding.AveragePrice
-            self.highest_prices[symbol] = holding.AveragePrice
             self.entry_times[symbol] = self.Time
+            if holding.Quantity < 0:
+                self.lowest_prices[symbol] = holding.AveragePrice
+            else:
+                self.highest_prices[symbol] = holding.AveragePrice
 
+        is_short = holding.Quantity < 0
         entry = self.entry_prices[symbol]
-        highest = self.highest_prices.get(symbol, entry)
-        if price > highest:
-            self.highest_prices[symbol] = price
-        pnl = (price - entry) / entry if entry > 0 else 0
+
+        if is_short:
+            lowest = self.lowest_prices.get(symbol, entry)
+            if price < lowest:
+                self.lowest_prices[symbol] = price
+                lowest = price
+            pnl = (entry - price) / entry if entry > 0 else 0
+            dd = (price - lowest) / lowest if lowest > 0 else 0
+        else:
+            highest = self.highest_prices.get(symbol, entry)
+            if price > highest:
+                self.highest_prices[symbol] = price
+                highest = price
+            pnl = (price - entry) / entry if entry > 0 else 0
+            dd = (highest - price) / highest if highest > 0 else 0
 
         mnq = self.mnq_data
-        dd = (highest - price) / highest if highest > 0 else 0
         hours = (self.Time - self.entry_times.get(symbol, self.Time)).total_seconds() / 3600
         minutes = hours * 60
 
@@ -753,16 +786,23 @@ class MNQStrategy(QCAlgorithm):
                 and pnl >= self.partial_tp_threshold):
             if partial_smart_sell(self, symbol, 0.50, "Partial TP"):
                 self._partial_tp_taken[symbol] = True
-                self._breakeven_stops[symbol] = entry * 1.001
-                self.Debug(f"PARTIAL TP: {symbol.Value} | PnL:{pnl:+.2%} | SL→entry+0.1%")
+                if is_short:
+                    self._breakeven_stops[symbol] = entry * 0.999
+                else:
+                    self._breakeven_stops[symbol] = entry * 1.001
+                self.Debug(f"PARTIAL TP: {symbol.Value} | PnL:{pnl:+.2%} | SL→entry±0.1%")
                 return
 
         tag = ""
 
         if self._partial_tp_taken.get(symbol, False):
             be_price = self._breakeven_stops.get(symbol, entry)
-            if price <= be_price:
-                tag = "Breakeven Stop"
+            if is_short:
+                if price >= be_price:
+                    tag = "Breakeven Stop"
+            else:
+                if price <= be_price:
+                    tag = "Breakeven Stop"
         elif pnl <= -sl:
             tag = "Stop Loss"
 
@@ -778,7 +818,10 @@ class MNQStrategy(QCAlgorithm):
 
             elif atr and entry > 0 and holding.Quantity != 0:
                 trail_offset = atr * self.atr_trail_mult
-                trail_level = highest - trail_offset
+                if is_short:
+                    trail_level = lowest + trail_offset
+                else:
+                    trail_level = highest - trail_offset
                 if mnq:
                     mnq['trail_stop'] = trail_level
                 if mnq and mnq['trail_stop'] is not None:
@@ -834,12 +877,10 @@ class MNQStrategy(QCAlgorithm):
                 self._pending_orders[symbol] += intended_qty
                 if symbol not in self._submitted_orders:
                     has_position = symbol in self.Portfolio and self.Portfolio[symbol].Invested
-                    if event.Direction == OrderDirection.Sell and has_position:
+                    if has_position:
                         inferred_intent = 'exit'
-                    elif event.Direction == OrderDirection.Buy and not has_position:
-                        inferred_intent = 'entry'
                     else:
-                        inferred_intent = 'entry' if event.Direction == OrderDirection.Buy else 'exit'
+                        inferred_intent = 'entry'
                     self._submitted_orders[symbol] = {
                         'order_id': event.OrderId,
                         'time': self.Time,
@@ -853,19 +894,32 @@ class MNQStrategy(QCAlgorithm):
                     self._pending_orders[symbol] -= abs(event.FillQuantity)
                     if self._pending_orders[symbol] <= 0:
                         self._pending_orders.pop(symbol, None)
-                if event.Direction == OrderDirection.Buy:
-                    if symbol not in self.entry_prices:
-                        self.entry_prices[symbol] = event.FillPrice
+                intended_dir = self._entry_directions.get(symbol, 1)
+                if symbol not in self.entry_prices:
+                    self.entry_prices[symbol] = event.FillPrice
+                    self.entry_times[symbol] = self.Time
+                    if intended_dir == -1:
+                        self.lowest_prices[symbol] = event.FillPrice
+                    else:
                         self.highest_prices[symbol] = event.FillPrice
-                        self.entry_times[symbol] = self.Time
                 slip_log(self, symbol, event.Direction, event.FillPrice)
             elif event.Status == OrderStatus.Filled:
                 self._pending_orders.pop(symbol, None)
                 self._submitted_orders.pop(symbol, None)
                 self._order_retries.pop(event.OrderId, None)
-                if event.Direction == OrderDirection.Buy:
+                intended_dir = self._entry_directions.get(symbol, 1)
+                is_new_entry = symbol not in self.entry_prices
+                is_long_entry = is_new_entry and event.Direction == OrderDirection.Buy and intended_dir == 1
+                is_short_entry = is_new_entry and event.Direction == OrderDirection.Sell and intended_dir == -1
+                if is_long_entry:
                     self.entry_prices[symbol] = event.FillPrice
                     self.highest_prices[symbol] = event.FillPrice
+                    self.entry_times[symbol] = self.Time
+                    self.daily_trade_count += 1
+                    self.rsi_peaked_overbought.pop(symbol, None)
+                elif is_short_entry:
+                    self.entry_prices[symbol] = event.FillPrice
+                    self.lowest_prices[symbol] = event.FillPrice
                     self.entry_times[symbol] = self.Time
                     self.daily_trade_count += 1
                     self.rsi_peaked_overbought.pop(symbol, None)
@@ -878,8 +932,11 @@ class MNQStrategy(QCAlgorithm):
                         entry = self.entry_prices.get(symbol, None)
                         if entry is None:
                             entry = event.FillPrice
-                            self.Debug(f"⚠️ WARNING: Missing entry price for {symbol.Value} sell, using fill price")
-                        pnl = (event.FillPrice - entry) / entry if entry > 0 else 0
+                            self.Debug(f"⚠️ WARNING: Missing entry price for {symbol.Value} exit, using fill price")
+                        if intended_dir == -1:
+                            pnl = (entry - event.FillPrice) / entry if entry > 0 else 0
+                        else:
+                            pnl = (event.FillPrice - entry) / entry if entry > 0 else 0
                         self._rolling_wins.append(1 if pnl > 0 else 0)
                         self._recent_trade_outcomes.append(1 if pnl > 0 else 0)
                         if pnl > 0:
@@ -903,8 +960,8 @@ class MNQStrategy(QCAlgorithm):
                         if len(self._recent_trade_outcomes) >= 12:
                             recent_wr = sum(self._recent_trade_outcomes) / len(self._recent_trade_outcomes)
                             if recent_wr < 0.25:
-                                self._cash_mode_until = self.Time + timedelta(hours=2)
-                                self.Debug(f"⚠️ CASH MODE: WR={recent_wr:.0%} over {len(self._recent_trade_outcomes)} trades. Pausing 2h.")
+                                self._cash_mode_until = self.Time + timedelta(minutes=30)
+                                self.Debug(f"⚠️ CASH MODE: WR={recent_wr:.0%} over {len(self._recent_trade_outcomes)} trades. Pausing 30min.")
                         cleanup_position(self, symbol)
                         self._failed_exit_attempts.pop(symbol, None)
                         self._failed_exit_counts.pop(symbol, None)
@@ -913,13 +970,15 @@ class MNQStrategy(QCAlgorithm):
                 self._pending_orders.pop(symbol, None)
                 self._submitted_orders.pop(symbol, None)
                 self._order_retries.pop(event.OrderId, None)
-                if event.Direction == OrderDirection.Sell and symbol not in self.entry_prices:
-                    if is_invested_not_dust(self, symbol):
-                        holding = self.Portfolio[symbol]
-                        self.entry_prices[symbol] = holding.AveragePrice
+                if symbol not in self.entry_prices and is_invested_not_dust(self, symbol):
+                    holding = self.Portfolio[symbol]
+                    self.entry_prices[symbol] = holding.AveragePrice
+                    self.entry_times[symbol] = self.Time
+                    if holding.Quantity < 0:
+                        self.lowest_prices[symbol] = holding.AveragePrice
+                    else:
                         self.highest_prices[symbol] = holding.AveragePrice
-                        self.entry_times[symbol] = self.Time
-                        self.Debug(f"RE-TRACKED after cancel: {symbol.Value}")
+                    self.Debug(f"RE-TRACKED after cancel: {symbol.Value}")
             elif event.Status == OrderStatus.Invalid:
                 self._pending_orders.pop(symbol, None)
                 self._submitted_orders.pop(symbol, None)
