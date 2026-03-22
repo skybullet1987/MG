@@ -18,9 +18,9 @@ class MakerTakerFeeModel(FeeModel):
         order = parameters.Order
         if order.Type == OrderType.Limit:
             # Blended: 60% maker + 40% taker
-            fee_pct = (1 - self.LIMIT_TAKER_RATIO) * 0.0025 + self.LIMIT_TAKER_RATIO * 0.0040
+            fee_pct = (1 - self.LIMIT_TAKER_RATIO) * 0.0040 + self.LIMIT_TAKER_RATIO * 0.0060
         else:
-            fee_pct = 0.0040  # Market orders always taker
+            fee_pct = 0.0060  # Market orders always taker
         trade_value = order.AbsoluteQuantity * parameters.Security.Price
         return OrderFee(CashAmount(trade_value * fee_pct, "USD"))
 

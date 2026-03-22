@@ -66,8 +66,8 @@ MIN_NOTIONAL_FALLBACK = {
 }
 
 # Fee buffer applied when computing sell quantity to prevent overselling due to
-# Kraken deducting fees from the base asset after a buy (Cash Modeling discrepancy).
-COINBASE_SELL_FEE_BUFFER = 0.006  # 0.6% (0.4% base fee + 0.2% safety margin)
+# Coinbase deducting fees from the base asset after a buy (Cash Modeling discrepancy).
+COINBASE_SELL_FEE_BUFFER = 0.008  # 0.8% (0.6% base fee + 0.2% safety margin)
 
 
 class RealisticCryptoSlippage:
@@ -201,7 +201,7 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
         return False
     # Verify fee reserve before selling (Coinbase cash account requirement)
     if algo.LiveMode and holding_qty > 0:
-        estimated_fee = price * abs(holding_qty) * 0.006  # 0.6% fee estimate (0.4% base + 0.2% safety buffer)
+        estimated_fee = price * abs(holding_qty) * 0.008  # 0.8% fee estimate (0.6% base + 0.2% safety buffer)
         try:
             available_usd = algo.Portfolio.CashBook["USD"].Amount
         except (KeyError, AttributeError):
@@ -231,7 +231,7 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
         exit_min_qty = min_qty
     if abs(holding_qty) < exit_min_qty:
         return False
-    # The portfolio already reflects the post-fee quantity (Kraken deducts fees from
+    # The portfolio already reflects the post-fee quantity (Coinbase deducts fees from
     # the base asset at buy time), so no fee buffer is needed on the sell side.
     safe_qty = round_quantity(algo, symbol, abs(holding_qty))
     # Ensure we never attempt to sell more than the actual portfolio quantity.
@@ -345,7 +345,7 @@ def partial_smart_sell(algo, symbol, fraction, tag="Partial TP"):
     if hasattr(algo, '_partial_sell_symbols'):
         algo._partial_sell_symbols.add(symbol)
     direction_mult = -1 if holding_qty > 0 else 1
-    # Use limit order at current price to capture maker fee (0.25% vs 0.40% taker)
+    # Use limit order at current price to capture maker fee (0.40% vs 0.60% taker)
     try:
         ticket = algo.LimitOrder(symbol, sell_qty * direction_mult, price, tag=tag)
     except Exception:
@@ -751,7 +751,7 @@ def get_slippage_penalty(algo, symbol):
 def place_limit_or_market(algo, symbol, quantity, timeout_seconds=30, tag="Entry"):
     """
     Place a limit order at mid-price with fallback to market order after timeout.
-    Uses LimitOrder in both live and backtest mode to capture Maker fees (0.25%).
+    Uses LimitOrder in both live and backtest mode to capture Maker fees (0.40%).
     Returns the ticket from the order placement.
     """
     try:
