@@ -42,18 +42,18 @@ class MNQFuturesStrategy(QCAlgorithm):
         # ------------------------------------------------------------------
         # Strategy parameters
         # ------------------------------------------------------------------
-        self.entry_threshold          = 0.50
+        self.entry_threshold          = 0.75
         self.high_conviction_threshold = 0.60
         self.max_contracts            = self._get_param("max_contracts", 2)   # safety cap
         self.max_positions            = 1   # one position at a time (long OR short)
 
         # Exit parameters calibrated for futures intraday moves
-        self.quick_take_profit    = self._get_param("quick_take_profit",    0.008)  # 0.8%
-        self.tight_stop_loss      = self._get_param("tight_stop_loss",      0.003)  # 0.3%
+        self.quick_take_profit    = self._get_param("quick_take_profit",    0.020)  # 2.0%
+        self.tight_stop_loss      = self._get_param("tight_stop_loss",      0.008)  # 0.8%
         self.atr_tp_mult          = self._get_param("atr_tp_mult",          3.0)
         self.atr_sl_mult          = self._get_param("atr_sl_mult",          1.5)
-        self.trail_activation     = self._get_param("trail_activation",     0.005)  # 0.5%
-        self.trail_stop_pct       = self._get_param("trail_stop_pct",       0.002)  # 0.2%
+        self.trail_activation     = self._get_param("trail_activation",     0.010)  # 1.0%
+        self.trail_stop_pct       = self._get_param("trail_stop_pct",       0.005)  # 0.5%
         self.time_stop_hours      = self._get_param("time_stop_hours",      1.5)
         self.time_stop_pnl_min    = self._get_param("time_stop_pnl_min",    0.001)
         self.extended_time_stop_hours   = self._get_param("extended_time_stop_hours",   3.0)
@@ -66,7 +66,7 @@ class MNQFuturesStrategy(QCAlgorithm):
         self.base_take_profit     = self.quick_take_profit
         self.atr_trail_mult       = 1.5
 
-        self.partial_tp_threshold    = 0.004   # 0.4% — take half off at this profit
+        self.partial_tp_threshold    = 0.015   # 1.5% — take half off at this profit
         self.stagnation_minutes      = 30
         self.stagnation_pnl_threshold = 0.001
 
@@ -110,10 +110,10 @@ class MNQFuturesStrategy(QCAlgorithm):
         # ------------------------------------------------------------------
         # Trade-count & daily counters
         # ------------------------------------------------------------------
-        self.max_daily_trades            = 500
+        self.max_daily_trades            = 5
         self.daily_trade_count           = 0
         self.last_trade_date             = None
-        self.max_symbol_trades_per_day   = 20
+        self.max_symbol_trades_per_day   = 3
 
         # ------------------------------------------------------------------
         # Performance tracking
@@ -786,6 +786,14 @@ class MNQFuturesStrategy(QCAlgorithm):
             f"REBALANCE: score={net_score:.2f} dir={'LONG' if direction > 0 else 'SHORT'} | "
             f"regime={self.market_regime} vol={self.volatility_regime}"
         ))
+
+        # Strict trend alignment: skip counter-trend entries
+        if direction > 0 and self.market_regime == "bear":
+            self._log_skip("skip: counter-trend long in bear regime")
+            return
+        if direction < 0 and self.market_regime == "bull":
+            self._log_skip("skip: counter-trend short in bull regime")
+            return
 
         self._last_skip_reason = None
         self._execute_trade(factor_scores, threshold)
