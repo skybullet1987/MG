@@ -29,8 +29,8 @@ class MNQFuturesStrategy(QCAlgorithm):
         # Eastern Time for session filtering
         self.SetTimeZone(TimeZones.NewYork)
 
-        # Tradovate + Margin (no custom crypto fee/slippage — use defaults)
-        self.SetBrokerageModel(BrokerageName.Tradovate, AccountType.Margin)
+        # IBKR + Margin (Tradovate is not available in QC cloud backtests)
+        self.SetBrokerageModel(BrokerageName.InteractiveBrokersBrokerage, AccountType.Margin)
 
         # ------------------------------------------------------------------
         # MNQ Continuous Future (front month)
@@ -233,6 +233,12 @@ class MNQFuturesStrategy(QCAlgorithm):
         current_min = self.Time.hour * 60 + self.Time.minute
         return self._session_start_min <= current_min <= self._session_end_min
 
+    def get_tradable_symbol(self):
+        """Return the currently mapped (front-month) contract, or None if unavailable."""
+        if self.mnq.Mapped is not None:
+            return self.mnq.Mapped
+        return None
+
     def _normalize_order_time(self, order_time):
         return normalize_order_time(order_time)
 
@@ -295,7 +301,16 @@ class MNQFuturesStrategy(QCAlgorithm):
             except Exception as e:
                 self.Debug(f"FlatAtClose order error: {e}")
 
-    def DailyReport(self):
+        # Also close any position in the currently mapped contract
+        tradable_symbol = self.get_tradable_symbol()
+        if tradable_symbol is not None and is_invested(self, tradable_symbol):
+            qty = self.Portfolio[tradable_symbol].Quantity
+            try:
+                self.MarketOrder(tradable_symbol, -qty, tag="Flat at Close")
+                cleanup_position(self, tradable_symbol)
+                self.Debug(f"FLAT AT CLOSE: {tradable_symbol.Value} qty={qty} @ {self.Time}")
+            except Exception as e:
+                self.Debug(f"FlatAtClose order error: {e}")
         if self.IsWarmingUp:
             return
         daily_report(self)
@@ -710,11 +725,17 @@ class MNQFuturesStrategy(QCAlgorithm):
             return
 
         # If already in a position, don't open another
+        # Check both the continuous symbol and the currently mapped contract
+        tradable_symbol = self.get_tradable_symbol()
+        if tradable_symbol is not None and is_invested(self, tradable_symbol):
+            self._log_skip("already in position")
+            return
         if is_invested(self, self.symbol):
             self._log_skip("already in position")
             return
 
-        if has_open_orders(self, self.symbol):
+        if (tradable_symbol is not None and has_open_orders(self, tradable_symbol)) \
+                or has_open_orders(self, self.symbol):
             self._log_skip("open orders pending")
             return
 
@@ -779,9 +800,16 @@ class MNQFuturesStrategy(QCAlgorithm):
 
         order_qty = contracts * direction  # positive = long, negative = short
 
+        # Use the currently mapped contract for all order placement;
+        # the continuous symbol itself is non-tradable.
+        tradable_symbol = self.get_tradable_symbol()
+        if tradable_symbol is None:
+            self.Debug("ORDER SKIPPED: MNQ mapped contract not available yet")
+            return
+
         try:
             ticket = place_limit_or_market(
-                self, self.symbol, order_qty, timeout_seconds=30, tag="Entry"
+                self, tradable_symbol, order_qty, timeout_seconds=30, tag="Entry"
             )
             if ticket is not None:
                 self._recent_tickets.append(ticket)
@@ -789,7 +817,7 @@ class MNQFuturesStrategy(QCAlgorithm):
                 components = factor_scores
                 side = "LONG" if direction > 0 else "SHORT"
                 self.Debug(
-                    f"SCALP ENTRY [{side}]: {self.symbol.Value} | "
+                    f"SCALP ENTRY [{side}]: {tradable_symbol.Value} | "
                     f"score={net_score:.2f} | contracts={contracts} | "
                     f"obi={components.get('obi', 0):.2f} "
                     f"vol={components.get('vol_ignition', 0):.2f} "
@@ -804,7 +832,7 @@ class MNQFuturesStrategy(QCAlgorithm):
                     adx_ind  = future.get('adx')
                     is_choppy = (adx_ind is not None and adx_ind.IsReady
                                  and adx_ind.Current.Value < 25)
-                    self._choppy_regime_entries[self.symbol] = is_choppy
+                    self._choppy_regime_entries[tradable_symbol] = is_choppy
 
                 if self._consecutive_loss_halve_remaining > 0:
                     self._consecutive_loss_halve_remaining -= 1
@@ -812,7 +840,7 @@ class MNQFuturesStrategy(QCAlgorithm):
                     self._last_live_trade_time = self.Time
 
         except Exception as e:
-            self.Debug(f"ORDER FAILED: {self.symbol.Value} - {e}")
+            self.Debug(f"ORDER FAILED: {tradable_symbol.Value} - {e}")
 
     # ------------------------------------------------------------------
     # Exit logic
