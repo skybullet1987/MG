@@ -3,22 +3,23 @@ from AlgorithmImports import *
 from execution import *
 from scoring import MicroScalpEngine
 from collections import deque
+import math
 import numpy as np
 # endregion
 
 
-class MNQFuturesStrategy(QCAlgorithm):
+class CoinbaseCryptoStrategy(QCAlgorithm):
     """
-    Machine Gun v2 MNA — CME Micro Nasdaq 100 E-mini Futures (MNQ)
+    Machine Gun v2 Coinbase — Spot Crypto Trading on Coinbase
 
-    Core strategy adapted from Machine Gun v2 (crypto scalper) for
-    Tradovate / CME futures:
-      - Single instrument: MNQ continuous front-month future
-      - Both Long and Short allowed (no borrow restrictions on futures)
-      - Integer contract sizing (1 or 2 contracts)
-      - Regular Trading Hours filter: entries only 09:30–15:45 ET
-      - Flat-at-Close: all positions liquidated at 15:55 ET
-      - Tradovate brokerage + Margin account (default fee/slippage models)
+    Core strategy adapted from Machine Gun v2 MNA (CME Futures) for
+    Coinbase spot crypto trading:
+      - Instruments: BTCUSD and ETHUSD (spot crypto)
+      - Both Long and Short considered (long-only on Cash accounts)
+      - Fractional position sizing based on portfolio cash allocation
+      - 24/7 trading — no Regular Trading Hours (RTH) filter
+      - No Flat-at-Close — crypto never closes
+      - Coinbase brokerage + Cash account
       - Alpha Upgrades retained: Graduated Gate, Signal 4 Split, Spread Haircut
     """
 
@@ -26,39 +27,47 @@ class MNQFuturesStrategy(QCAlgorithm):
         self.SetStartDate(2024, 1, 1)
         self.SetCash(10000)
 
-        # Eastern Time for session filtering
-        self.SetTimeZone(TimeZones.NewYork)
+        # UTC timezone — crypto is global, no session filtering needed
+        self.SetTimeZone(TimeZones.Utc)
 
-        # IBKR + Margin (Tradovate is not available in QC cloud backtests)
-        self.SetBrokerageModel(BrokerageName.InteractiveBrokersBrokerage, AccountType.Margin)
+        # Coinbase + Cash account (spot crypto)
+        self.SetBrokerageModel(BrokerageName.Coinbase, AccountType.Cash)
 
         # ------------------------------------------------------------------
-        # MNQ Continuous Future (front month)
+        # Crypto assets
         # ------------------------------------------------------------------
-        self.mnq = self.AddFuture(Futures.Indices.MicroNASDAQ100EMini, Resolution.Minute)
-        self.mnq.SetFilter(0, 120)   # front month only
-        self.symbol = self.mnq.Symbol
+        btc = self.AddCrypto("BTCUSD", Resolution.Minute, Market.Coinbase)
+        eth = self.AddCrypto("ETHUSD", Resolution.Minute, Market.Coinbase)
+
+        self.crypto_symbols = [btc.Symbol, eth.Symbol]
+
+        # BTC is used as the primary market-regime reference
+        self.btc_symbol = btc.Symbol
 
         # ------------------------------------------------------------------
         # Strategy parameters
         # ------------------------------------------------------------------
-        self.entry_threshold          = 0.75
+        self.entry_threshold           = 0.75
         self.high_conviction_threshold = 0.60
-        self.max_contracts            = self._get_param("max_contracts", 2)   # safety cap
-        self.max_positions            = 1   # one position at a time (long OR short)
+        self.max_positions             = 2    # at most one per symbol simultaneously
 
-        # Exit parameters calibrated for futures intraday moves
-        self.quick_take_profit    = self._get_param("quick_take_profit",    0.020)  # 2.0%
-        self.tight_stop_loss      = self._get_param("tight_stop_loss",      0.008)  # 0.8%
+        # Position sizing — fractional, based on portfolio value
+        # Each position is sized as a fraction of available cash
+        self.position_size_pct = self._get_param("position_size_pct", 0.45)  # 45% per trade
+        self.max_position_usd  = self._get_param("max_position_usd", 4500.0)  # hard cap per symbol
+
+        # Exit parameters calibrated for crypto volatility (wider than MNQ)
+        self.quick_take_profit    = self._get_param("quick_take_profit",    0.030)  # 3.0%
+        self.tight_stop_loss      = self._get_param("tight_stop_loss",      0.012)  # 1.2%
         self.atr_tp_mult          = self._get_param("atr_tp_mult",          3.0)
         self.atr_sl_mult          = self._get_param("atr_sl_mult",          1.5)
-        self.trail_activation     = self._get_param("trail_activation",     0.010)  # 1.0%
-        self.trail_stop_pct       = self._get_param("trail_stop_pct",       0.005)  # 0.5%
-        self.time_stop_hours      = self._get_param("time_stop_hours",      1.5)
-        self.time_stop_pnl_min    = self._get_param("time_stop_pnl_min",    0.001)
-        self.extended_time_stop_hours   = self._get_param("extended_time_stop_hours",   3.0)
-        self.extended_time_stop_pnl_max = self._get_param("extended_time_stop_pnl_max", 0.005)
-        self.stale_position_hours = self._get_param("stale_position_hours", 3.0)
+        self.trail_activation     = self._get_param("trail_activation",     0.015)  # 1.5%
+        self.trail_stop_pct       = self._get_param("trail_stop_pct",       0.008)  # 0.8%
+        self.time_stop_hours      = self._get_param("time_stop_hours",      2.0)
+        self.time_stop_pnl_min    = self._get_param("time_stop_pnl_min",    0.002)
+        self.extended_time_stop_hours   = self._get_param("extended_time_stop_hours",   4.0)
+        self.extended_time_stop_pnl_max = self._get_param("extended_time_stop_pnl_max", 0.008)
+        self.stale_position_hours = self._get_param("stale_position_hours", 6.0)
 
         self.trailing_activation   = self.trail_activation
         self.trailing_stop_pct    = self.trail_stop_pct
@@ -66,9 +75,9 @@ class MNQFuturesStrategy(QCAlgorithm):
         self.base_take_profit     = self.quick_take_profit
         self.atr_trail_mult       = 1.5
 
-        self.partial_tp_threshold    = 0.015   # 1.5% — take half off at this profit
-        self.stagnation_minutes      = 30
-        self.stagnation_pnl_threshold = 0.001
+        self.partial_tp_threshold    = 0.020   # 2.0% — take half off at this profit
+        self.stagnation_minutes      = 60
+        self.stagnation_pnl_threshold = 0.002
 
         # ------------------------------------------------------------------
         # Indicator periods
@@ -77,7 +86,8 @@ class MNQFuturesStrategy(QCAlgorithm):
         self.short_period       = 6
         self.medium_period      = 12
         self.lookback           = 48
-        self.sqrt_annualization = np.sqrt(60 * 24 * 252)   # annualization for 1-min bars
+        # Annualization for 1-min bars, 24/7 crypto (365 days)
+        self.sqrt_annualization = np.sqrt(60 * 24 * 365)
 
         # ------------------------------------------------------------------
         # Risk management
@@ -103,17 +113,17 @@ class MNQFuturesStrategy(QCAlgorithm):
         # ------------------------------------------------------------------
         self.stale_order_timeout_seconds      = 60
         self.live_stale_order_timeout_seconds = 90
-        self.max_concurrent_open_orders       = 2
+        self.max_concurrent_open_orders       = 4
         self.order_fill_check_threshold_seconds = 60
         self.order_timeout_seconds              = 30
 
         # ------------------------------------------------------------------
         # Trade-count & daily counters
         # ------------------------------------------------------------------
-        self.max_daily_trades            = 5
+        self.max_daily_trades            = 20
         self.daily_trade_count           = 0
         self.last_trade_date             = None
-        self.max_symbol_trades_per_day   = 3
+        self.max_symbol_trades_per_day   = 5
 
         # ------------------------------------------------------------------
         # Performance tracking
@@ -135,7 +145,7 @@ class MNQFuturesStrategy(QCAlgorithm):
         # ------------------------------------------------------------------
         # Position tracking
         # ------------------------------------------------------------------
-        self.future_data       = {}   # indicator / signal data (keyed by symbol)
+        self.crypto_data       = {}   # indicator / signal data (keyed by symbol)
         self.entry_prices      = {}
         self.highest_prices    = {}   # for long trailing stops
         self.lowest_prices     = {}   # for short trailing stops
@@ -162,7 +172,7 @@ class MNQFuturesStrategy(QCAlgorithm):
         self._cash_mode_until     = None
         self._last_skip_reason    = None
         self._slip_abs            = deque(maxlen=50)
-        self.slip_outlier_threshold = 0.0015
+        self.slip_outlier_threshold = 0.004
         self._symbol_loss_cooldowns = {}
         self._recent_tickets        = deque(maxlen=25)
         self._daily_open_value      = None
@@ -171,20 +181,14 @@ class MNQFuturesStrategy(QCAlgorithm):
         self.peak_value        = None
         self.drawdown_cooldown = 0
 
-        # Market regime (derived from MNQ itself)
+        # Market regime (derived from BTC price action)
         self.market_regime    = "unknown"
         self.volatility_regime = "normal"
         self.market_breadth   = 0.5
         self._regime_hold_count = 0
 
         # ------------------------------------------------------------------
-        # Session filter boundaries (Eastern Time — algorithm is in ET)
-        # ------------------------------------------------------------------
-        self._session_start_min = 9 * 60 + 30    # 09:30 ET in minutes
-        self._session_end_min   = 15 * 60 + 45   # 15:45 ET in minutes
-
-        # ------------------------------------------------------------------
-        # Scheduled tasks
+        # Scheduled tasks (24/7 — no market open/close events)
         # ------------------------------------------------------------------
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(0, 0), self.ResetDailyCounters)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(0, 1), self.DailyReport)
@@ -199,8 +203,7 @@ class MNQFuturesStrategy(QCAlgorithm):
             self.TimeRules.Every(timedelta(minutes=2)),
             self.VerifyOrderFills,
         )
-        # Flat-at-Close: liquidate all positions at 15:55 ET
-        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(15, 55), self.FlatAtClose)
+        # No FlatAtClose — crypto trades 24/7
 
         # ------------------------------------------------------------------
         # Warm-up & initialisation
@@ -212,8 +215,8 @@ class MNQFuturesStrategy(QCAlgorithm):
 
         if self.LiveMode:
             load_persisted_state(self)
-            self.Debug("=== LIVE TRADING: MNQ Futures (MNA) v1.0 ===")
-            self.Debug(f"Capital: ${self.Portfolio.Cash:.2f} | Max contracts: {self.max_contracts}")
+            self.Debug("=== LIVE TRADING: Coinbase Crypto v1.0 ===")
+            self.Debug(f"Capital: ${self.Portfolio.Cash:.2f} | Max positions: {self.max_positions} | Size: {self.position_size_pct:.0%}")
 
     # ------------------------------------------------------------------
     # Helpers
@@ -227,17 +230,6 @@ class MNQFuturesStrategy(QCAlgorithm):
             return default
         except Exception:
             return default
-
-    def _in_session(self):
-        """Returns True if within Regular Trading Hours: 09:30–15:45 ET."""
-        current_min = self.Time.hour * 60 + self.Time.minute
-        return self._session_start_min <= current_min <= self._session_end_min
-
-    def get_tradable_symbol(self):
-        """Return the currently mapped (front-month) contract, or None if unavailable."""
-        if self.mnq.Mapped is not None:
-            return self.mnq.Mapped
-        return None
 
     def _normalize_order_time(self, order_time):
         return normalize_order_time(order_time)
@@ -253,13 +245,14 @@ class MNQFuturesStrategy(QCAlgorithm):
         self.daily_trade_count = 0
         self.last_trade_date   = self.Time.date()
         self._daily_open_value = self.Portfolio.TotalPortfolioValue
-        future = self.future_data.get(self.symbol)
-        if future is not None:
-            future['trade_count_today'] = 0
+        for sym in self.crypto_symbols:
+            crypto = self.crypto_data.get(sym)
+            if crypto is not None:
+                crypto['trade_count_today'] = 0
         persist_state(self)
 
     def DailyReport(self):
-        """Reset daily counters and log portfolio status."""
+        """Log portfolio status at start of UTC day."""
         self.daily_trade_count = 0
         self._daily_open_value = self.Portfolio.TotalPortfolioValue
 
@@ -288,52 +281,18 @@ class MNQFuturesStrategy(QCAlgorithm):
         recent_wr  = sum(1 for t in recent if t['pnl_pct'] > 0) / len(recent)
         recent_pnl = np.mean([t['pnl_pct'] for t in recent])
         if recent_wr < 0.20 and recent_pnl < -0.02:
-            self.max_contracts = 1
-            self.Debug(f"PERFORMANCE DECAY: max_contracts=1 (WR:{recent_wr:.0%}, PnL:{recent_pnl:+.2%})")
+            self.position_size_pct = max(0.10, self.position_size_pct * 0.5)
+            self.Debug(f"PERFORMANCE DECAY: position_size_pct={self.position_size_pct:.0%} (WR:{recent_wr:.0%}, PnL:{recent_pnl:+.2%})")
         elif recent_wr > 0.35 and recent_pnl > 0:
-            self.max_contracts = int(self._get_param("max_contracts", 2))
-
-    def FlatAtClose(self):
-        """
-        Flat-at-Close: market-liquidate all positions and cancel all pending
-        orders at 15:55 ET to avoid the 16:00–17:00 ET settlement window.
-        """
-        if self.IsWarmingUp:
-            return
-        try:
-            self.Transactions.CancelOpenOrders()
-        except Exception as e:
-            self.Debug(f"FlatAtClose cancel error: {e}")
-
-        if is_invested(self, self.symbol):
-            qty = self.Portfolio[self.symbol].Quantity
-            try:
-                self.MarketOrder(self.symbol, -qty, tag="Flat at Close")
-                cleanup_position(self, self.symbol)
-                self.Debug(f"FLAT AT CLOSE: {self.symbol.Value} qty={qty} @ {self.Time}")
-            except Exception as e:
-                self.Debug(f"FlatAtClose order error: {e}")
-
-        # Also close any position in the currently mapped contract
-        tradable_symbol = self.get_tradable_symbol()
-        if tradable_symbol is not None and is_invested(self, tradable_symbol):
-            qty = self.Portfolio[tradable_symbol].Quantity
-            try:
-                self.MarketOrder(tradable_symbol, -qty, tag="Flat at Close")
-                cleanup_position(self, tradable_symbol)
-                self.Debug(f"FLAT AT CLOSE: {tradable_symbol.Value} qty={qty} @ {self.Time}")
-            except Exception as e:
-                self.Debug(f"FlatAtClose order error: {e}")
-        if self.IsWarmingUp:
-            return
-        daily_report(self)
+            self.position_size_pct = min(float(self._get_param("position_size_pct", 0.45)),
+                                         self.position_size_pct * 1.5)
 
     # ------------------------------------------------------------------
     # Initialise indicator data for a symbol
     # ------------------------------------------------------------------
 
     def _initialize_symbol(self, symbol):
-        self.future_data[symbol] = {
+        self.crypto_data[symbol] = {
             'prices':      deque(maxlen=self.lookback),
             'returns':     deque(maxlen=self.lookback),
             'volume':      deque(maxlen=self.lookback),
@@ -382,31 +341,31 @@ class MNQFuturesStrategy(QCAlgorithm):
     def OnSecuritiesChanged(self, changes):
         for security in changes.AddedSecurities:
             sym = security.Symbol
-            # Track data for the continuous contract and any mapped contracts
-            if sym not in self.future_data:
+            if sym not in self.crypto_data:
                 self._initialize_symbol(sym)
         for security in changes.RemovedSecurities:
             sym = security.Symbol
-            # If we're holding a position in the removed contract, liquidate
+            # Liquidate any position in a removed security
             if not self.IsWarmingUp and is_invested(self, sym):
-                smart_liquidate(self, sym, "Contract Roll — Removed")
-                self.Debug(f"CONTRACT ROLL: {sym.Value} removed, liquidating")
+                smart_liquidate(self, sym, "Security Removed")
+                self.Debug(f"SECURITY REMOVED: {sym.Value} — liquidating")
 
     # ------------------------------------------------------------------
     # OnData
     # ------------------------------------------------------------------
 
     def OnData(self, data):
-        # Update indicator data for the continuous symbol
-        if data.Bars.ContainsKey(self.symbol):
-            if self.symbol not in self.future_data:
-                self._initialize_symbol(self.symbol)
-            try:
-                quote_bar = (data.QuoteBars[self.symbol]
-                             if data.QuoteBars.ContainsKey(self.symbol) else None)
-                self._update_symbol_data(self.symbol, data.Bars[self.symbol], quote_bar)
-            except Exception as e:
-                self.Debug(f"Error updating symbol data: {e}")
+        # Update indicator data for all tracked crypto symbols
+        for symbol in self.crypto_symbols:
+            if data.Bars.ContainsKey(symbol):
+                if symbol not in self.crypto_data:
+                    self._initialize_symbol(symbol)
+                try:
+                    quote_bar = (data.QuoteBars[symbol]
+                                 if data.QuoteBars.ContainsKey(symbol) else None)
+                    self._update_symbol_data(symbol, data.Bars[symbol], quote_bar)
+                except Exception as e:
+                    self.Debug(f"Error updating symbol data for {symbol.Value}: {e}")
 
         if self.IsWarmingUp:
             return
@@ -427,70 +386,70 @@ class MNQFuturesStrategy(QCAlgorithm):
     # ------------------------------------------------------------------
 
     def _update_symbol_data(self, symbol, bar, quote_bar=None):
-        future = self.future_data[symbol]
+        crypto = self.crypto_data[symbol]
         price  = float(bar.Close)
         high   = float(bar.High)
         low    = float(bar.Low)
         volume = float(bar.Volume)
 
-        future['prices'].append(price)
-        future['highs'].append(high)
-        future['lows'].append(low)
+        crypto['prices'].append(price)
+        crypto['highs'].append(high)
+        crypto['lows'].append(low)
 
-        if future['last_price'] > 0:
-            ret = (price - future['last_price']) / future['last_price']
-            future['returns'].append(ret)
-        future['last_price'] = price
+        if crypto['last_price'] > 0:
+            ret = (price - crypto['last_price']) / crypto['last_price']
+            crypto['returns'].append(ret)
+        crypto['last_price'] = price
 
-        future['volume'].append(volume)
-        future['dollar_volume'].append(price * volume)
-        future['volume_long'].append(volume)
+        crypto['volume'].append(volume)
+        crypto['dollar_volume'].append(price * volume)
+        crypto['volume_long'].append(volume)
 
-        if len(future['volume']) >= self.short_period:
-            future['volume_ma'].append(np.mean(list(future['volume'])[-self.short_period:]))
+        if len(crypto['volume']) >= self.short_period:
+            crypto['volume_ma'].append(np.mean(list(crypto['volume'])[-self.short_period:]))
 
-        future['ema_ultra_short'].Update(bar.EndTime, price)
-        future['ema_short'].Update(bar.EndTime, price)
-        future['ema_medium'].Update(bar.EndTime, price)
-        future['ema_5'].Update(bar.EndTime, price)
-        future['atr'].Update(bar)
-        future['adx'].Update(bar)
-        future['rsi'].Update(bar.EndTime, price)
+        crypto['ema_ultra_short'].Update(bar.EndTime, price)
+        crypto['ema_short'].Update(bar.EndTime, price)
+        crypto['ema_medium'].Update(bar.EndTime, price)
+        crypto['ema_5'].Update(bar.EndTime, price)
+        crypto['atr'].Update(bar)
+        crypto['adx'].Update(bar)
+        crypto['rsi'].Update(bar.EndTime, price)
 
         # VWAP + standard deviation bands
-        future['vwap_pv'].append(price * volume)
-        future['vwap_v'].append(volume)
-        total_v = sum(future['vwap_v'])
+        crypto['vwap_pv'].append(price * volume)
+        crypto['vwap_v'].append(volume)
+        total_v = sum(crypto['vwap_v'])
         if total_v > 0:
-            future['vwap'] = sum(future['vwap_pv']) / total_v
+            crypto['vwap'] = sum(crypto['vwap_pv']) / total_v
 
-        if len(future['vwap_v']) >= 5 and future['vwap'] > 0:
-            vwap_val = future['vwap']
-            pv_list  = list(future['vwap_pv'])
-            v_list   = list(future['vwap_v'])
+        if len(crypto['vwap_v']) >= 5 and crypto['vwap'] > 0:
+            vwap_val = crypto['vwap']
+            pv_list  = list(crypto['vwap_pv'])
+            v_list   = list(crypto['vwap_v'])
             bar_prices = [pv / v for pv, v in zip(pv_list, v_list) if v > 0]
             if len(bar_prices) >= 5:
                 sd = float(np.std(bar_prices))
-                future['vwap_sd']       = sd
-                future['vwap_sd2_lower'] = vwap_val - 2.0 * sd
-                future['vwap_sd3_lower'] = vwap_val - 3.0 * sd
-                future['vwap_sd2_upper'] = vwap_val + 2.0 * sd
-                future['vwap_sd3_upper'] = vwap_val + 3.0 * sd
+                crypto['vwap_sd']       = sd
+                crypto['vwap_sd2_lower'] = vwap_val - 2.0 * sd
+                crypto['vwap_sd3_lower'] = vwap_val - 3.0 * sd
+                crypto['vwap_sd2_upper'] = vwap_val + 2.0 * sd
+                crypto['vwap_sd3_upper'] = vwap_val + 3.0 * sd
 
         # Bollinger Bands
-        if len(future['prices']) >= self.medium_period:
-            prices_arr = np.array(list(future['prices'])[-self.medium_period:])
+        if len(crypto['prices']) >= self.medium_period:
+            prices_arr = np.array(list(crypto['prices'])[-self.medium_period:])
             std  = np.std(prices_arr)
             mean = np.mean(prices_arr)
             if std > 0:
-                future['zscore'].append((price - mean) / std)
-                future['bb_upper'].append(mean + 2 * std)
-                future['bb_lower'].append(mean - 2 * std)
-                future['bb_width'].append(4 * std / mean if mean > 0 else 0)
+                crypto['zscore'].append((price - mean) / std)
+                crypto['bb_upper'].append(mean + 2 * std)
+                crypto['bb_lower'].append(mean - 2 * std)
+                crypto['bb_width'].append(4 * std / mean if mean > 0 else 0)
 
         # Volatility
-        if len(future['returns']) >= 10:
-            future['volatility'].append(np.std(list(future['returns'])[-10:]))
+        if len(crypto['returns']) >= 10:
+            crypto['volatility'].append(np.std(list(crypto['returns'])[-10:]))
 
         # CVD (Cumulative Volume Delta)
         high_low = high - low
@@ -498,29 +457,29 @@ class MNQFuturesStrategy(QCAlgorithm):
             bar_delta = volume * ((price - low) - (high - price)) / high_low
         else:
             bar_delta = 0.0
-        prev_cvd = future['cvd'][-1] if len(future['cvd']) > 0 else 0.0
-        future['cvd'].append(prev_cvd + bar_delta)
+        prev_cvd = crypto['cvd'][-1] if len(crypto['cvd']) > 0 else 0.0
+        crypto['cvd'].append(prev_cvd + bar_delta)
 
         # Kaufman Efficiency Ratio (KER)
-        if len(future['prices']) >= 15:
-            price_change   = abs(future['prices'][-1] - future['prices'][-15])
-            volatility_sum = sum(abs(future['prices'][i] - future['prices'][i - 1])
+        if len(crypto['prices']) >= 15:
+            price_change   = abs(crypto['prices'][-1] - crypto['prices'][-15])
+            volatility_sum = sum(abs(crypto['prices'][i] - crypto['prices'][i - 1])
                                  for i in range(-14, 0))
             if volatility_sum > 0:
-                future['ker'].append(price_change / volatility_sum)
+                crypto['ker'].append(price_change / volatility_sum)
             else:
-                future['ker'].append(0.0)
+                crypto['ker'].append(0.0)
 
         # Kalman Filter
         Q = 1e-5
         R = 0.01
-        if future['kalman_estimate'] == 0.0:
-            future['kalman_estimate'] = price
-        est_pred   = future['kalman_estimate']
-        err_pred   = future['kalman_error_cov'] + Q
+        if crypto['kalman_estimate'] == 0.0:
+            crypto['kalman_estimate'] = price
+        est_pred   = crypto['kalman_estimate']
+        err_pred   = crypto['kalman_error_cov'] + Q
         kg         = err_pred / (err_pred + R)
-        future['kalman_estimate']   = est_pred + kg * (price - est_pred)
-        future['kalman_error_cov']  = (1 - kg) * err_pred
+        crypto['kalman_estimate']   = est_pred + kg * (price - est_pred)
+        crypto['kalman_error_cov']  = (1 - kg) * err_pred
 
         # Order Book Imbalance from quote bar
         if quote_bar is not None:
@@ -528,29 +487,29 @@ class MNQFuturesStrategy(QCAlgorithm):
                 bid_sz = float(quote_bar.LastBidSize) if quote_bar.LastBidSize else 0.0
                 ask_sz = float(quote_bar.LastAskSize) if quote_bar.LastAskSize else 0.0
                 if bid_sz > 0 or ask_sz > 0:
-                    future['bid_size'] = bid_sz
-                    future['ask_size'] = ask_sz
+                    crypto['bid_size'] = bid_sz
+                    crypto['ask_size'] = ask_sz
             except Exception:
                 pass
 
         # Spread tracking
         sp = get_spread_pct(self, symbol)
         if sp is not None:
-            future['spreads'].append(sp)
+            crypto['spreads'].append(sp)
 
     # ------------------------------------------------------------------
-    # Market context (regime derived from MNQ itself)
+    # Market context (regime derived from BTC price action)
     # ------------------------------------------------------------------
 
     def _update_market_context(self):
-        future = self.future_data.get(self.symbol)
-        if future is None or len(future['prices']) < 48:
+        btc = self.crypto_data.get(self.btc_symbol)
+        if btc is None or len(btc['prices']) < 48:
             return
 
-        arr      = np.array(list(future['prices']))
+        arr      = np.array(list(btc['prices']))
         current  = arr[-1]
         sma      = np.mean(arr[-48:])
-        returns  = list(future['returns'])
+        returns  = list(btc['returns'])
         mom_12   = np.mean(returns[-12:]) if len(returns) >= 12 else 0.0
 
         if current > sma * 1.005:
@@ -574,7 +533,7 @@ class MNQFuturesStrategy(QCAlgorithm):
         else:
             self._regime_hold_count = 0
 
-        vols = list(future.get('volatility', []))
+        vols = list(btc.get('volatility', []))
         if len(vols) >= 5:
             current_vol = vols[-1]
             avg_vol     = np.mean(vols)
@@ -589,12 +548,12 @@ class MNQFuturesStrategy(QCAlgorithm):
     # Scoring
     # ------------------------------------------------------------------
 
-    def _annualized_vol(self, future):
-        if future is None:
+    def _annualized_vol(self, crypto):
+        if crypto is None:
             return None
-        if len(future.get('volatility', [])) == 0:
+        if len(crypto.get('volatility', [])) == 0:
             return None
-        return float(future['volatility'][-1]) * self.sqrt_annualization
+        return float(crypto['volatility'][-1]) * self.sqrt_annualization
 
     def _compute_portfolio_risk_estimate(self):
         total_value = self.Portfolio.TotalPortfolioValue
@@ -604,15 +563,15 @@ class MNQFuturesStrategy(QCAlgorithm):
         for kvp in self.Portfolio:
             if not is_invested(self, kvp.Key):
                 continue
-            future = self.future_data.get(kvp.Key)
-            asset_vol_ann = self._annualized_vol(future)
+            crypto = self.crypto_data.get(kvp.Key)
+            asset_vol_ann = self._annualized_vol(crypto)
             if asset_vol_ann is None:
                 asset_vol_ann = self.min_asset_vol_floor
             weight = abs(kvp.Value.HoldingsValue) / total_value
             risk  += weight * asset_vol_ann
         return risk
 
-    def _calculate_factor_scores(self, symbol, future):
+    def _calculate_factor_scores(self, symbol, crypto):
         """
         Evaluate both long and short signals. Returns the components dict
         for the higher-scoring direction (if it meets the entry threshold),
@@ -620,10 +579,10 @@ class MNQFuturesStrategy(QCAlgorithm):
         The '_direction' key indicates: 1 = long, -1 = short.
         The '_scalp_score' key holds the winning score.
         """
-        long_score,  long_components  = self._scoring_engine.calculate_long_score(future)
-        short_score, short_components = self._scoring_engine.calculate_short_score(future)
+        long_score,  long_components  = self._scoring_engine.calculate_long_score(crypto)
+        short_score, short_components = self._scoring_engine.calculate_short_score(crypto)
 
-        # Spread haircut (MNQ spreads are tight but still apply the penalty)
+        # Spread haircut — crypto spreads vary; wider spread = larger penalty
         sp = get_spread_pct(self, symbol)
         if sp is not None and sp > 0:
             spread_penalty = min((sp / 0.005) * 0.15, 0.15)
@@ -646,11 +605,11 @@ class MNQFuturesStrategy(QCAlgorithm):
 
         return components
 
-    def _calculate_composite_score(self, factors, future=None):
+    def _calculate_composite_score(self, factors, crypto=None):
         return factors.get('_scalp_score', 0.0)
 
-    def _is_ready(self, f):
-        return len(f['prices']) >= 10 and f['rsi'].IsReady
+    def _is_ready(self, c):
+        return len(c['prices']) >= 10 and c['rsi'].IsReady
 
     def _daily_loss_exceeded(self):
         """Returns True if today's portfolio has dropped >= 3% from open."""
@@ -671,17 +630,14 @@ class MNQFuturesStrategy(QCAlgorithm):
             self._last_skip_reason = reason
 
     # ------------------------------------------------------------------
-    # Rebalance
+    # Rebalance — iterates over all crypto symbols, 24/7 (no RTH filter)
     # ------------------------------------------------------------------
 
     def Rebalance(self):
         if self.IsWarmingUp:
             return
 
-        # --- Session filter: only new entries during RTH ---
-        if not self._in_session():
-            self._log_skip("outside RTH (09:30–15:45 ET)")
-            return
+        # Crypto is 24/7 — no session filter needed
 
         if self._daily_loss_exceeded():
             self._log_skip("max daily loss exceeded (3%)")
@@ -737,100 +693,129 @@ class MNQFuturesStrategy(QCAlgorithm):
             self._log_skip("circuit breaker triggered (4 losses)")
             return
 
-        # If already in a position, don't open another
-        # Check both the continuous symbol and the currently mapped contract
-        tradable_symbol = self.get_tradable_symbol()
-        if tradable_symbol is not None and is_invested(self, tradable_symbol):
-            self._log_skip("already in position")
-            return
-        if is_invested(self, self.symbol):
-            self._log_skip("already in position")
-            return
-
-        if (tradable_symbol is not None and has_open_orders(self, tradable_symbol)) \
-                or has_open_orders(self, self.symbol):
-            self._log_skip("open orders pending")
+        if self._compute_portfolio_risk_estimate() > self.portfolio_vol_cap:
+            self._log_skip("portfolio risk cap exceeded")
             return
 
         if len(self.Transactions.GetOpenOrders()) >= self.max_concurrent_open_orders:
             self._log_skip("too many open orders")
             return
 
-        if self._compute_portfolio_risk_estimate() > self.portfolio_vol_cap:
-            self._log_skip("portfolio risk cap exceeded")
+        # Count current positions
+        current_positions = sum(1 for sym in self.crypto_symbols if is_invested(self, sym))
+        if current_positions >= self.max_positions:
+            self._log_skip("max positions reached")
             return
 
-        future = self.future_data.get(self.symbol)
-        if future is None or not self._is_ready(future):
-            self._log_skip("indicator warmup incomplete")
-            return
+        # Evaluate each symbol
+        for symbol in self.crypto_symbols:
+            if is_invested(self, symbol):
+                continue
+            if has_open_orders(self, symbol):
+                continue
 
-        if future.get('trade_count_today', 0) >= self.max_symbol_trades_per_day:
-            self._log_skip("max daily trades for symbol")
-            return
+            crypto = self.crypto_data.get(symbol)
+            if crypto is None or not self._is_ready(crypto):
+                continue
 
-        # Score the opportunity
-        factor_scores = self._calculate_factor_scores(self.symbol, future)
-        net_score     = self._calculate_composite_score(factor_scores, future)
+            if crypto.get('trade_count_today', 0) >= self.max_symbol_trades_per_day:
+                continue
 
-        future['recent_net_scores'].append(net_score)
+            if symbol in self._exit_cooldowns and self.Time < self._exit_cooldowns[symbol]:
+                continue
 
-        threshold = self.entry_threshold
-        if net_score < threshold:
-            self._log_skip(f"score {net_score:.2f} below threshold {threshold:.2f}")
-            return
+            if symbol in self._symbol_loss_cooldowns and self.Time < self._symbol_loss_cooldowns[symbol]:
+                continue
 
-        direction = factor_scores.get('_direction', 1)
+            # Score the opportunity
+            factor_scores = self._calculate_factor_scores(symbol, crypto)
+            net_score     = self._calculate_composite_score(factor_scores, crypto)
 
-        debug_limited(self, (
-            f"REBALANCE: score={net_score:.2f} dir={'LONG' if direction > 0 else 'SHORT'} | "
-            f"regime={self.market_regime} vol={self.volatility_regime}"
-        ))
+            crypto['recent_net_scores'].append(net_score)
 
-        # Strict trend alignment: skip counter-trend entries
-        if direction > 0 and self.market_regime == "bear":
-            self._log_skip("skip: counter-trend long in bear regime")
-            return
-        if direction < 0 and self.market_regime == "bull":
-            self._log_skip("skip: counter-trend short in bull regime")
-            return
+            threshold = self.entry_threshold
+            if net_score < threshold:
+                self._log_skip(f"{symbol.Value} score {net_score:.2f} below threshold {threshold:.2f}")
+                continue
 
-        self._last_skip_reason = None
-        self._execute_trade(factor_scores, threshold)
+            direction = factor_scores.get('_direction', 1)
+
+            debug_limited(self, (
+                f"REBALANCE {symbol.Value}: score={net_score:.2f} dir={'LONG' if direction > 0 else 'SHORT'} | "
+                f"regime={self.market_regime} vol={self.volatility_regime}"
+            ))
+
+            # Strict trend alignment: skip counter-trend entries
+            if direction > 0 and self.market_regime == "bear":
+                self._log_skip(f"{symbol.Value}: skip counter-trend long in bear regime")
+                continue
+            if direction < 0 and self.market_regime == "bull":
+                self._log_skip(f"{symbol.Value}: skip counter-trend short in bull regime")
+                continue
+
+            # On Cash account, only allow long entries (no shorting on spot)
+            if direction < 0:
+                self._log_skip(f"{symbol.Value}: skip short — Cash account (spot only)")
+                continue
+
+            self._last_skip_reason = None
+            self._execute_trade(symbol, factor_scores, threshold)
+
+            # After placing one trade, re-check position count
+            current_positions = sum(1 for sym in self.crypto_symbols if is_invested(self, sym))
+            if current_positions >= self.max_positions:
+                break
 
     # ------------------------------------------------------------------
-    # Execute trade
+    # Execute trade — fractional crypto sizing
     # ------------------------------------------------------------------
 
-    def _execute_trade(self, factor_scores, threshold_now):
+    def _execute_trade(self, symbol, factor_scores, threshold_now):
         if not self._positions_synced:
             return
 
         cancel_stale_new_orders(self)
 
         net_score = factor_scores.get('_scalp_score', 0.0)
-        direction = factor_scores.get('_direction', 1)  # 1 = long, -1 = short
+        direction = factor_scores.get('_direction', 1)  # 1 = long, -1 = short (long-only on Cash)
 
-        # Integer contract sizing
-        contracts = self._scoring_engine.calculate_position_size(
-            net_score, threshold_now, self.max_contracts
+        # Fractional sizing: calculate order size in USD, then convert to crypto units
+        size_mult = self._scoring_engine.calculate_position_size(
+            net_score, threshold_now, max_size_fraction=1.0
         )
 
         if self._consecutive_loss_halve_remaining > 0:
-            contracts = 1
+            size_mult *= 0.5
 
-        order_qty = contracts * direction  # positive = long, negative = short
+        available_cash = self.Portfolio.Cash * (1 - self.Settings.FreePortfolioValuePercentage)
+        target_usd     = min(
+            available_cash * self.position_size_pct * size_mult,
+            self.max_position_usd
+        )
 
-        # Use the currently mapped contract for all order placement;
-        # the continuous symbol itself is non-tradable.
-        tradable_symbol = self.get_tradable_symbol()
-        if tradable_symbol is None:
-            self.Debug("ORDER SKIPPED: MNQ mapped contract not available yet")
+        price = self.Securities[symbol].Price if symbol in self.Securities else 0
+        if price <= 0:
+            self.Debug(f"ORDER SKIPPED: {symbol.Value} — price unavailable")
             return
+
+        raw_qty = target_usd / price
+        # Round down to lot size (crypto may have minimum lot requirements)
+        try:
+            lot_size = self.Securities[symbol].SymbolProperties.LotSize
+            if lot_size is not None and lot_size > 0:
+                raw_qty = math.floor(raw_qty / lot_size) * lot_size
+        except Exception:
+            pass
+
+        if raw_qty <= 0:
+            self.Debug(f"ORDER SKIPPED: {symbol.Value} — computed qty={raw_qty:.8f} too small")
+            return
+
+        order_qty = raw_qty * direction  # positive = long, negative = short
 
         try:
             ticket = place_limit_or_market(
-                self, tradable_symbol, order_qty, timeout_seconds=30, tag="Entry"
+                self, symbol, order_qty, timeout_seconds=30, tag="Entry"
             )
             if ticket is not None:
                 self._recent_tickets.append(ticket)
@@ -838,8 +823,8 @@ class MNQFuturesStrategy(QCAlgorithm):
                 components = factor_scores
                 side = "LONG" if direction > 0 else "SHORT"
                 self.Debug(
-                    f"SCALP ENTRY [{side}]: {tradable_symbol.Value} | "
-                    f"score={net_score:.2f} | contracts={contracts} | "
+                    f"SCALP ENTRY [{side}]: {symbol.Value} | "
+                    f"score={net_score:.2f} | qty={raw_qty:.6f} | ~${target_usd:.0f} | "
                     f"obi={components.get('obi', 0):.2f} "
                     f"vol={components.get('vol_ignition', 0):.2f} "
                     f"trend={components.get('micro_trend', 0):.2f} "
@@ -847,13 +832,13 @@ class MNQFuturesStrategy(QCAlgorithm):
                     f"vwap={components.get('vwap_signal', 0):.2f}"
                 )
                 self.trade_count += 1
-                future = self.future_data.get(self.symbol)
-                if future is not None:
-                    future['trade_count_today'] = future.get('trade_count_today', 0) + 1
-                    adx_ind  = future.get('adx')
+                crypto = self.crypto_data.get(symbol)
+                if crypto is not None:
+                    crypto['trade_count_today'] = crypto.get('trade_count_today', 0) + 1
+                    adx_ind  = crypto.get('adx')
                     is_choppy = (adx_ind is not None and adx_ind.IsReady
                                  and adx_ind.Current.Value < 25)
-                    self._choppy_regime_entries[tradable_symbol] = is_choppy
+                    self._choppy_regime_entries[symbol] = is_choppy
 
                 if self._consecutive_loss_halve_remaining > 0:
                     self._consecutive_loss_halve_remaining -= 1
@@ -861,7 +846,7 @@ class MNQFuturesStrategy(QCAlgorithm):
                     self._last_live_trade_time = self.Time
 
         except Exception as e:
-            self.Debug(f"ORDER FAILED: {tradable_symbol.Value} - {e}")
+            self.Debug(f"ORDER FAILED: {symbol.Value} - {e}")
 
     # ------------------------------------------------------------------
     # Exit logic
@@ -918,11 +903,11 @@ class MNQFuturesStrategy(QCAlgorithm):
             pnl = (price - entry) / entry if entry > 0 else 0
             dd  = (highest - price) / highest if highest > 0 else 0  # drawdown from peak
 
-        future = self.future_data.get(symbol)
+        crypto = self.crypto_data.get(symbol)
         hours   = (self.Time - self.entry_times.get(symbol, self.Time)).total_seconds() / 3600
         minutes = hours * 60
 
-        atr = future['atr'].Current.Value if future and future['atr'].IsReady else None
+        atr = crypto['atr'].Current.Value if crypto and crypto['atr'].IsReady else None
         if atr and entry > 0:
             sl = max((atr * self.atr_sl_mult) / entry, self.tight_stop_loss)
             tp = max((atr * self.atr_tp_mult) / entry, self.quick_take_profit)
@@ -977,20 +962,18 @@ class MNQFuturesStrategy(QCAlgorithm):
             elif atr and entry > 0 and holding.Quantity != 0:
                 trail_offset = atr * self.atr_trail_mult
                 if is_short:
-                    # For short: trail is anchor_lowest + offset
                     lowest = self.lowest_prices.get(symbol, entry)
                     trail_level = lowest + trail_offset
-                    if future:
-                        future['trail_stop'] = trail_level
-                    if future and future['trail_stop'] is not None and price >= future['trail_stop']:
+                    if crypto:
+                        crypto['trail_stop'] = trail_level
+                    if crypto and crypto['trail_stop'] is not None and price >= crypto['trail_stop']:
                         tag = "ATR Trail"
                 else:
-                    # For long: trail is anchor_highest - offset
                     highest = self.highest_prices.get(symbol, entry)
                     trail_level = highest - trail_offset
-                    if future:
-                        future['trail_stop'] = trail_level
-                    if future and future['trail_stop'] is not None and price <= future['trail_stop']:
+                    if crypto:
+                        crypto['trail_stop'] = trail_level
+                    if crypto and crypto['trail_stop'] is not None and price <= crypto['trail_stop']:
                         tag = "ATR Trail"
 
             # Time stops
@@ -1037,7 +1020,7 @@ class MNQFuturesStrategy(QCAlgorithm):
             symbol = event.Symbol
             self.Debug(
                 f"ORDER: {symbol.Value} {event.Status} {event.Direction} "
-                f"qty={event.FillQuantity or event.Quantity} price={event.FillPrice} "
+                f"qty={event.FillQuantity or event.Quantity:.6f} price={event.FillPrice} "
                 f"id={event.OrderId}"
             )
 
@@ -1046,7 +1029,7 @@ class MNQFuturesStrategy(QCAlgorithm):
                     self._pending_orders[symbol] = 0
                 intended_qty = abs(event.Quantity) if event.Quantity != 0 else abs(event.FillQuantity)
                 self._pending_orders[symbol] += intended_qty
-                # Infer intent if not already set from place_limit_or_market / smart_liquidate
+                # Infer intent if not already set
                 if symbol not in self._submitted_orders:
                     has_position = symbol in self.entry_prices
                     if event.Direction == OrderDirection.Sell and has_position and self.position_direction.get(symbol, 1) == 1:
@@ -1068,7 +1051,6 @@ class MNQFuturesStrategy(QCAlgorithm):
                 intent     = order_info.get('intent', 'unknown')
                 self._order_retries.pop(event.OrderId, None)
 
-                # Use intent to determine entry vs exit
                 is_entry = (
                     intent == 'entry'
                     or (intent == 'unknown' and symbol not in self.entry_prices)
@@ -1083,7 +1065,7 @@ class MNQFuturesStrategy(QCAlgorithm):
                         self.entry_times[symbol]        = self.Time
                         self.position_direction[symbol] = 1
                         self.daily_trade_count += 1
-                        self.Debug(f"LONG ENTRY FILL: {symbol.Value} @ ${event.FillPrice:.2f}")
+                        self.Debug(f"LONG ENTRY FILL: {symbol.Value} @ ${event.FillPrice:.4f}")
                     else:
                         # Closing a short position
                         if symbol in self._partial_sell_symbols:
@@ -1100,7 +1082,7 @@ class MNQFuturesStrategy(QCAlgorithm):
                         self.entry_times[symbol]        = self.Time
                         self.position_direction[symbol] = -1
                         self.daily_trade_count += 1
-                        self.Debug(f"SHORT ENTRY FILL: {symbol.Value} @ ${event.FillPrice:.2f}")
+                        self.Debug(f"SHORT ENTRY FILL: {symbol.Value} @ ${event.FillPrice:.4f}")
                     else:
                         # Closing a long position
                         if symbol in self._partial_sell_symbols:
@@ -1178,7 +1160,7 @@ class MNQFuturesStrategy(QCAlgorithm):
                 self.Debug(f"CASH MODE: WR={recent_wr:.0%} over {len(self._recent_trade_outcomes)} trades. Pausing 2h.")
 
         side = "LONG" if direction >= 0 else "SHORT"
-        self.Debug(f"EXIT FILL [{side}]: {symbol.Value} | entry=${entry:.2f} | exit=${exit_price:.2f} | PnL:{pnl:+.2%}")
+        self.Debug(f"EXIT FILL [{side}]: {symbol.Value} | entry=${entry:.4f} | exit=${exit_price:.4f} | PnL:{pnl:+.2%}")
         cleanup_position(self, symbol)
         self._failed_exit_counts.pop(symbol, None)
         self._failed_exit_attempts.pop(symbol, None)

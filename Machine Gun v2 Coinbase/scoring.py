@@ -6,17 +6,17 @@ import numpy as np
 
 class MicroScalpEngine:
     """
-    Micro-Scalping Signal Engine - MNQ Futures Edition v1.0
+    Micro-Scalping Signal Engine - Coinbase Crypto Edition v1.0
 
-    Adapted from v7.3.0 for CME Micro Nasdaq 100 E-mini Futures (MNQ).
+    Adapted from the MNA Futures version for Coinbase spot crypto trading.
     Supports both Long and Short directions via separate scoring methods.
 
     Long Score  → buy signal  (price rising, bid dominance, VWAP above)
     Short Score → sell signal (price falling, ask dominance, VWAP below)
 
-    Score: 0.0 – 1.0 (same gate logic as crypto version)
+    Score: 0.0 – 1.0 (same gate logic as futures version)
       >= 0.50 → entry threshold
-      >= 0.60 → high-conviction entry → max contracts
+      >= 0.60 → high-conviction entry → full position size
     """
 
     # Tunable signal thresholds
@@ -38,7 +38,7 @@ class MicroScalpEngine:
         self.algo = algorithm
 
     # ------------------------------------------------------------------
-    # Long scoring (identical logic to the crypto version)
+    # Long scoring
     # ------------------------------------------------------------------
     def calculate_long_score(self, future):
         """
@@ -390,26 +390,29 @@ class MicroScalpEngine:
         return self.calculate_long_score(future)
 
     # ------------------------------------------------------------------
-    # Position sizing — integer contracts for futures
+    # Position sizing — fractional quantities for crypto
     # ------------------------------------------------------------------
-    def calculate_position_size(self, score, threshold, max_contracts=2):
+    def calculate_position_size(self, score, threshold, max_size_fraction=1.0):
         """
-        Returns integer number of contracts (1 or 2).
-        Futures do not use fractional sizing.
+        Returns a sizing multiplier (0.0 – 1.0) for crypto fractional orders.
 
-        High-conviction (score >= 0.80) → max_contracts
-        Standard entry (score >= threshold) → 1 contract
-        Kelly scaling: if Kelly < 0.70, reduce to 1 contract
+        Crypto trading uses fractional quantities, so this returns a fraction
+        of the target allocation rather than an integer contract count.
+
+        High-conviction (score >= 0.80)           → max_size_fraction (full allocation)
+        High-conviction (score >= high_conviction) → 75% of allocation
+        Standard entry  (score >= threshold)       → 50% of allocation
+        Kelly scaling: if Kelly < 0.70, reduce by an additional 50%.
         """
         if score >= 0.80:
-            contracts = max_contracts
+            size_fraction = max_size_fraction
         elif score >= self.algo.high_conviction_threshold:
-            contracts = max(1, max_contracts - 1) if max_contracts > 1 else 1
+            size_fraction = max_size_fraction * 0.75
         else:
-            contracts = 1
+            size_fraction = max_size_fraction * 0.50
 
         kelly = self.algo._kelly_fraction()
         if kelly < 0.70:
-            contracts = 1
+            size_fraction *= 0.50
 
-        return int(contracts)
+        return max(0.0, min(max_size_fraction, size_fraction))

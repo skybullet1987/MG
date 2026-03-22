@@ -45,8 +45,8 @@ def cleanup_position(algo, symbol):
     algo.lowest_prices.pop(symbol, None)
     algo.entry_times.pop(symbol, None)
     algo.position_direction.pop(symbol, None)
-    if symbol in algo.future_data:
-        algo.future_data[symbol]['trail_stop'] = None
+    if symbol in algo.crypto_data:
+        algo.crypto_data[symbol]['trail_stop'] = None
     algo._partial_tp_taken.pop(symbol, None)
     algo._breakeven_stops.pop(symbol, None)
 
@@ -88,6 +88,7 @@ def partial_smart_sell(algo, symbol, fraction, tag="Partial TP"):
     """
     Close a fraction (0.0–1.0) of the current position.
     Works for both long and short positions.
+    For crypto, quantities are fractional — no integer rounding.
     Returns True if an order was placed.
     """
     if not is_invested(algo, symbol):
@@ -99,7 +100,20 @@ def partial_smart_sell(algo, symbol, fraction, tag="Partial TP"):
     if holding_qty == 0:
         return False
 
-    close_qty = int(abs(holding_qty) * fraction) or 1
+    raw_close = abs(holding_qty) * fraction
+    # Round down to lot size (crypto may have lot-size requirements)
+    try:
+        lot_size = algo.Securities[symbol].SymbolProperties.LotSize
+        if lot_size is not None and lot_size > 0:
+            close_qty = math.floor(raw_close / lot_size) * lot_size
+        else:
+            close_qty = raw_close
+    except Exception:
+        close_qty = raw_close
+
+    if close_qty <= 0:
+        return smart_liquidate(algo, symbol, tag)
+
     if close_qty >= abs(holding_qty):
         return smart_liquidate(algo, symbol, tag)
 
@@ -119,7 +133,7 @@ def partial_smart_sell(algo, symbol, fraction, tag="Partial TP"):
 def place_limit_or_market(algo, symbol, quantity, timeout_seconds=30, tag="Entry"):
     """
     Place a limit order near mid-price for the entry.
-    For futures, uses mid-price limit to try for a better fill.
+    For crypto, uses mid-price limit to try for a better fill.
     Returns the ticket, or None if placement is skipped.
     """
     try:
@@ -155,7 +169,7 @@ def place_limit_or_market(algo, symbol, quantity, timeout_seconds=30, tag="Entry
             }
 
         if algo.LiveMode:
-            algo.Debug(f"LIMIT ENTRY: {symbol.Value} | qty={quantity} | limit=${limit_price:.2f} | timeout={timeout_seconds}s")
+            algo.Debug(f"LIMIT ENTRY: {symbol.Value} | qty={quantity:.6f} | limit=${limit_price:.4f} | timeout={timeout_seconds}s")
         return ticket
 
     except Exception as e:
@@ -282,7 +296,7 @@ def sync_existing_positions(algo):
         else:
             algo.lowest_prices[symbol] = holding.AveragePrice
         synced += 1
-        algo.Debug(f"SYNCED: {symbol.Value} | qty={holding.Quantity} | entry=${holding.AveragePrice:.2f}")
+        algo.Debug(f"SYNCED: {symbol.Value} | qty={holding.Quantity:.6f} | entry=${holding.AveragePrice:.4f}")
     algo.Debug(f"Synced {synced} positions. Cash: ${algo.Portfolio.Cash:.2f}")
     algo.Debug("=" * 50)
 
@@ -300,15 +314,15 @@ def persist_state(algo):
             "trade_count":       algo.trade_count,
             "peak_value":        algo.peak_value if algo.peak_value is not None else 0,
         }
-        algo.ObjectStore.Save("live_state_mna", json.dumps(state))
+        algo.ObjectStore.Save("live_state_coinbase", json.dumps(state))
     except Exception as e:
         algo.Debug(f"Persist error: {e}")
 
 
 def load_persisted_state(algo):
     try:
-        if algo.LiveMode and algo.ObjectStore.ContainsKey("live_state_mna"):
-            raw  = algo.ObjectStore.Read("live_state_mna")
+        if algo.LiveMode and algo.ObjectStore.ContainsKey("live_state_coinbase"):
+            raw  = algo.ObjectStore.Read("live_state_coinbase")
             data = json.loads(raw)
             algo.winning_trades    = data.get("winning_trades", 0)
             algo.losing_trades     = data.get("losing_trades", 0)
@@ -419,17 +433,17 @@ def daily_report(algo):
             else:
                 pnl = (entry - price) / entry if entry > 0 else 0
             side = "LONG" if direction >= 0 else "SHORT"
-            algo.Debug(f"  [{side}] {kvp.Key.Value}: qty={h.Quantity} | entry=${entry:.2f} | now=${price:.2f} | PnL:{pnl:+.2%}")
+            algo.Debug(f"  [{side}] {kvp.Key.Value}: qty={h.Quantity:.6f} | entry=${entry:.4f} | now=${price:.4f} | PnL:{pnl:+.2%}")
 
 
 def live_safety_checks(algo):
     if not algo.LiveMode:
         return True
-    if algo.Portfolio.Cash < 100.0:
-        debug_limited(algo, "LIVE SAFETY: Cash below $100, pausing new entries")
+    if algo.Portfolio.Cash < 10.0:
+        debug_limited(algo, "LIVE SAFETY: Cash below $10, pausing new entries")
         return False
     if hasattr(algo, '_last_live_trade_time') and algo._last_live_trade_time is not None:
         seconds_since = (algo.Time - algo._last_live_trade_time).total_seconds()
-        if seconds_since < 90:
+        if seconds_since < 60:
             return False
     return True
