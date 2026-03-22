@@ -32,11 +32,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.SetCash(1000)
         self.SetBrokerageModel(BrokerageName.Coinbase, AccountType.Cash)
 
-        self.entry_threshold = 0.50
+        self.entry_threshold = 0.55
         self.high_conviction_threshold = 0.60
 
-        self.quick_take_profit = self._get_param("quick_take_profit", 0.050)
-        self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.050)
+        self.quick_take_profit = self._get_param("quick_take_profit", 0.120)
+        self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.035)
         self.atr_tp_mult  = self._get_param("atr_tp_mult",  4.0)
         self.atr_sl_mult  = self._get_param("atr_sl_mult",  2.0)
         self.trail_activation  = self._get_param("trail_activation",  0.040)
@@ -76,7 +76,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.spread_median_window   = 12
         self.spread_widen_mult      = 2.5
         self.min_dollar_volume_usd  = 20000
-        self.min_volume_usd         = 10000
+        self.min_volume_usd         = 25000
 
         self.skip_hours_utc         = []
         self.max_daily_trades       = 24000
@@ -88,7 +88,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
         self.expected_round_trip_fees = 0.012
         self.fee_slippage_buffer      = 0.001
-        self.min_expected_profit_pct  = 0.030
+        self.min_expected_profit_pct  = 0.040
         self.adx_min_period           = 10
 
         self.stale_order_timeout_seconds      = 30
@@ -139,7 +139,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._breakeven_stops       = {}
         self._partial_sell_symbols  = set()
         self._choppy_regime_entries = {}
-        self.partial_tp_threshold   = self._get_param("partial_tp_threshold", 0.040)
+        self.partial_tp_threshold   = self._get_param("partial_tp_threshold", 0.050)
         self.stagnation_minutes     = 120
         self.stagnation_pnl_threshold = 0.005
         self.rsi_peaked_overbought = {}
