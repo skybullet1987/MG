@@ -25,7 +25,7 @@ class MakerTakerFeeModel(FeeModel):
         return OrderFee(CashAmount(trade_value * fee_pct, "USD"))
 
 
-class CoinbaseCryptoStrategy(QCAlgorithm):
+class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def Initialize(self):
         self.SetStartDate(2024, 1, 1)
@@ -47,8 +47,7 @@ class CoinbaseCryptoStrategy(QCAlgorithm):
         self.extended_time_stop_pnl_max = self._get_param("extended_time_stop_pnl_max", 0.015)
         self.stale_position_hours       = self._get_param("stale_position_hours",       6.0)
 
-        self.trailing_activation = self.trail_activation
-        self.trailing_stop_pct   = self.trail_stop_pct
+        self.trailing_activation = self.trail_activation        self.trailing_stop_pct   = self.trail_stop_pct
         self.base_stop_loss      = self.tight_stop_loss
         self.base_take_profit    = self.quick_take_profit
         self.atr_trail_mult      = 2.0
@@ -133,8 +132,6 @@ class CoinbaseCryptoStrategy(QCAlgorithm):
         self.crypto_data      = {}
         self.entry_prices     = {}
         self.highest_prices   = {}
-        self.lowest_prices    = {}   # for short trailing stops
-        self.position_direction = {}  # 1 = long, -1 = short
         self.entry_times      = {}
         self.entry_volumes    = {}   # for volume dry-up exit
         self._partial_tp_taken      = {}
@@ -225,7 +222,7 @@ class CoinbaseCryptoStrategy(QCAlgorithm):
         if self.LiveMode:
             cleanup_object_store(self)
             load_persisted_state(self)
-            self.Debug("=== LIVE TRADING: Coinbase Crypto v2.0 ===")
+            self.Debug("=== LIVE TRADING (MICRO-SCALP) v7.3.0 ===")
             self.Debug(f"Capital: ${self.Portfolio.Cash:.2f} | Max pos: {self.max_positions} | Size: {self.position_size_pct:.0%}")
 
     def CustomSecurityInitializer(self, security):

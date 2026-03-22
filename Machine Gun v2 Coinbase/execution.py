@@ -367,7 +367,7 @@ def cancel_stale_new_orders(algo):
         timeout_seconds = effective_stale_timeout(algo)
         for order in open_orders:
             sym_val = order.Symbol.Value
-            if hasattr(algo, "_session_blacklist") and sym_val in algo._session_blacklist:
+            if sym_val in algo._session_blacklist:
                 continue
             order_time = order.Time
             if order_time.tzinfo is not None:
@@ -400,8 +400,7 @@ def cancel_stale_new_orders(algo):
                 if has_position_or_tracked:
                     algo.Debug(f"STALE EXIT: {sym_val} - cooldown only, not blacklisted")
                 else:
-                    if hasattr(algo, "_symbol_entry_cooldowns"):
-                        algo._symbol_entry_cooldowns[sym_val] = algo.Time + timedelta(minutes=15)
+                    algo._symbol_entry_cooldowns[sym_val] = algo.Time + timedelta(minutes=15)
                     algo.Debug(f"⚠️ ZOMBIE ORDER DETECTED: {sym_val} - entry cooldown 15min")
     except Exception as e:
         algo.Debug(f"Error in _cancel_stale_new_orders: {e}")
@@ -507,11 +506,7 @@ def cleanup_position(algo, symbol, record_pnl=False, exit_price=None):
     # Then do existing cleanup
     algo.entry_prices.pop(symbol, None)
     algo.highest_prices.pop(symbol, None)
-    if hasattr(algo, 'lowest_prices'):
-        algo.lowest_prices.pop(symbol, None)
     algo.entry_times.pop(symbol, None)
-    if hasattr(algo, 'position_direction'):
-        algo.position_direction.pop(symbol, None)
     if symbol in algo.crypto_data:
         algo.crypto_data[symbol]['trail_stop'] = None
     if hasattr(algo, '_spike_entries'):
@@ -520,10 +515,6 @@ def cleanup_position(algo, symbol, record_pnl=False, exit_price=None):
         algo._partial_tp_taken.pop(symbol, None)
     if hasattr(algo, '_breakeven_stops'):
         algo._breakeven_stops.pop(symbol, None)
-    if hasattr(algo, 'rsi_peaked_overbought'):
-        algo.rsi_peaked_overbought.pop(symbol, None)
-    if hasattr(algo, 'entry_volumes'):
-        algo.entry_volumes.pop(symbol, None)
 
 
 def sync_existing_positions(algo):
@@ -618,7 +609,7 @@ def persist_state(algo):
     try:
         spike_entries = [s.Value for s in getattr(algo, '_spike_entries', {}).keys() if hasattr(s, 'Value')]
         state = {
-            "session_blacklist": list(getattr(algo, "_session_blacklist", set())),
+            "session_blacklist": list(algo._session_blacklist),
             "winning_trades": algo.winning_trades,
             "losing_trades": algo.losing_trades,
             "total_pnl": algo.total_pnl,
@@ -628,7 +619,7 @@ def persist_state(algo):
             "peak_value": algo.peak_value if algo.peak_value is not None else 0,
             "spike_entries": spike_entries,
         }
-        algo.ObjectStore.Save("live_state_coinbase", json.dumps(state))
+        algo.ObjectStore.Save("live_state", json.dumps(state))
     except Exception as e:
         algo.Debug(f"Persist error: {e}")
 
@@ -636,11 +627,10 @@ def persist_state(algo):
 def load_persisted_state(algo):
     """Enhanced load_persisted_state with trade_count and peak_value from main_opus."""
     try:
-        if algo.LiveMode and algo.ObjectStore.ContainsKey("live_state_coinbase"):
-            raw = algo.ObjectStore.Read("live_state_coinbase")
+        if algo.LiveMode and algo.ObjectStore.ContainsKey("live_state"):
+            raw = algo.ObjectStore.Read("live_state")
             data = json.loads(raw)
-            if hasattr(algo, "_session_blacklist"):
-                algo._session_blacklist = set(data.get("session_blacklist", []))
+            algo._session_blacklist = set(data.get("session_blacklist", []))
             algo.winning_trades = data.get("winning_trades", 0)
             algo.losing_trades = data.get("losing_trades", 0)
             algo.total_pnl = data.get("total_pnl", 0.0)
@@ -656,7 +646,7 @@ def load_persisted_state(algo):
                 for symbol in algo.Securities.Keys:
                     if hasattr(symbol, 'Value') and symbol.Value in spike_entry_values:
                         algo._spike_entries[symbol] = True
-            algo.Debug(f"Loaded persisted state: blacklist {len(getattr(algo, '_session_blacklist', set()))}, "
+            algo.Debug(f"Loaded persisted state: blacklist {len(algo._session_blacklist)}, "
                        f"trades W:{algo.winning_trades}/L:{algo.losing_trades}")
     except Exception as e:
         algo.Debug(f"Load persist error: {e}")
@@ -668,7 +658,7 @@ def cleanup_object_store(algo):
         n = 0
         for i in algo.ObjectStore.GetEnumerator():
             k = i.Key if hasattr(i, 'Key') else str(i)
-            if k != "live_state_coinbase":
+            if k != "live_state":
                 try:
                     algo.ObjectStore.Delete(k)
                     n += 1
@@ -900,9 +890,8 @@ def health_check(algo):
         if is_invested_not_dust(algo, kvp.Key) and kvp.Key not in algo.entry_prices:
             issues.append(f"Untracked position: {kvp.Key.Value}")
     
-    session_blacklist = getattr(algo, "_session_blacklist", set())
-    if len(session_blacklist) > 50:
-        issues.append(f"Large session blacklist: {len(session_blacklist)}")
+    if len(algo._session_blacklist) > 50:
+        issues.append(f"Large session blacklist: {len(algo._session_blacklist)}")
     
     open_orders = algo.Transactions.GetOpenOrders()
     if len(open_orders) > 0:
@@ -1143,8 +1132,7 @@ def verify_order_fills(algo):
                     algo.Debug(f"ORDER TIMEOUT (attempt 1): {symbol.Value} - cancel requested, will retry after cooldown")
                     
                     # Set cooldown flag - do NOT retry immediately
-                    if hasattr(algo, "_retry_pending"):
-                        algo._retry_pending[symbol] = current_time
+                    algo._retry_pending[symbol] = current_time
                     algo._order_retries[order_id] = 1
                     symbols_to_remove.append(symbol)
                 except Exception as e:
@@ -1154,8 +1142,7 @@ def verify_order_fills(algo):
             else:
                 try:
                     algo.Transactions.CancelOrder(order_id)
-                    if hasattr(algo, "_session_blacklist"):
-                        algo._session_blacklist.add(symbol.Value)
+                    algo._session_blacklist.add(symbol.Value)
                     symbols_to_remove.append(symbol)
                     algo._order_retries.pop(order_id, None)
                     algo.Debug(f"ORDER TIMEOUT (attempt 2): {symbol.Value} - blacklisted")
@@ -1306,9 +1293,8 @@ def daily_report(algo):
     algo.Debug(f"Portfolio: ${algo.Portfolio.TotalPortfolioValue:.2f} | Cash: ${algo.Portfolio.Cash:.2f}")
     algo.Debug(f"Pos: {get_actual_position_count(algo)}/{algo.base_max_positions} | {algo.market_regime} {algo.volatility_regime} {algo.market_breadth:.0%}")
     algo.Debug(f"Trades: {total} | WR: {wr:.1%} | Avg: {avg:+.2%}")
-    session_blacklist = getattr(algo, '_session_blacklist', set())
-    if session_blacklist:
-        algo.Debug(f"Blacklist: {len(session_blacklist)}")
+    if algo._session_blacklist:
+        algo.Debug(f"Blacklist: {len(algo._session_blacklist)}")
     for kvp in algo.Portfolio:
         if is_invested_not_dust(algo, kvp.Key):
             s = kvp.Key
