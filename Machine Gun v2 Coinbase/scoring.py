@@ -6,17 +6,17 @@ import numpy as np
 
 class MicroScalpEngine:
     """
-    Micro-Scalping Signal Engine - MNQ Futures Edition v1.0
+    Micro-Scalping Signal Engine - Coinbase Crypto Edition v2.0
 
-    Adapted from v7.3.0 for CME Micro Nasdaq 100 E-mini Futures (MNQ).
+    Full port of the Machine Gun v2 signal engine for Coinbase spot crypto trading.
     Supports both Long and Short directions via separate scoring methods.
 
     Long Score  → buy signal  (price rising, bid dominance, VWAP above)
     Short Score → sell signal (price falling, ask dominance, VWAP below)
 
-    Score: 0.0 – 1.0 (same gate logic as crypto version)
+    Score: 0.0 – 1.0 (same gate logic as futures version)
       >= 0.50 → entry threshold
-      >= 0.60 → high-conviction entry → max contracts
+      >= 0.60 → high-conviction entry → full position size
     """
 
     # Tunable signal thresholds
@@ -38,7 +38,7 @@ class MicroScalpEngine:
         self.algo = algorithm
 
     # ------------------------------------------------------------------
-    # Long scoring (identical logic to the crypto version)
+    # Long scoring
     # ------------------------------------------------------------------
     def calculate_long_score(self, future):
         """
@@ -390,26 +390,40 @@ class MicroScalpEngine:
         return self.calculate_long_score(future)
 
     # ------------------------------------------------------------------
-    # Position sizing — integer contracts for futures
+    # Position sizing — vol-targeting with Kelly scaling for crypto
     # ------------------------------------------------------------------
-    def calculate_position_size(self, score, threshold, max_contracts=2):
+    def calculate_position_size(self, score, threshold, asset_vol_ann=None):
         """
-        Returns integer number of contracts (1 or 2).
-        Futures do not use fractional sizing.
+        Position sizing calibrated for fee survival with vol-targeting.
 
-        High-conviction (score >= 0.80) → max_contracts
-        Standard entry (score >= threshold) → 1 contract
-        Kelly scaling: if Kelly < 0.70, reduce to 1 contract
+        At 0.65% round-trip fees, positions must be large enough for the
+        TP target to cover fees, but small enough that stop losses don't
+        cascade into drawdown → circuit breaker → passivity.
+
+        Target: max 2% account risk per trade.
+        Returns 25–50% of available capital depending on conviction,
+        scaled by asset volatility and half-Kelly criterion.
+
+        Parameters
+        ----------
+        score        : float — composite signal score
+        threshold    : float — minimum entry threshold
+        asset_vol_ann: float or None — annualized asset volatility (e.g. 0.8 for 80%)
         """
         if score >= 0.80:
-            contracts = max_contracts
+            size = 0.50   # 4+ signals — high conviction
         elif score >= self.algo.high_conviction_threshold:
-            contracts = max(1, max_contracts - 1) if max_contracts > 1 else 1
+            size = 0.40   # 3+ signals — good conviction
+        elif score >= threshold:
+            size = 0.35   # entry threshold met
         else:
-            contracts = 1
+            size = 0.25
+
+        # Vol-targeting: scale down for volatile assets, keep size for calmer ones
+        if asset_vol_ann is not None and asset_vol_ann > 0:
+            target_vol = self.algo.target_position_ann_vol  # 0.35
+            vol_scalar = min(target_vol / asset_vol_ann, 1.0)
+            size *= max(vol_scalar, 0.5)  # Never reduce below 50% of base size
 
         kelly = self.algo._kelly_fraction()
-        if kelly < 0.70:
-            contracts = 1
-
-        return int(contracts)
+        return size * kelly
