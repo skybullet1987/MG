@@ -52,6 +52,11 @@ class MNQStrategy(QCAlgorithm):
         self.position_size_pct = 0.50    # Use 50% of available margin
         self.base_max_positions = 3      # One position per instrument (MNQ, M2K, MGC)
         self.max_positions      = 3
+        # Portfolio-wide hard cap: with $3,000 capital, keep total open contracts
+        # across ALL symbols to at most 2 to avoid IB margin rejections.
+        self.max_portfolio_contracts = 2
+        # Minutes to cool down a symbol after an Invalid entry order (margin rejection)
+        self.invalid_entry_cooldown_minutes = 30
 
         self.target_position_ann_vol = self._get_param("target_position_ann_vol", 0.35)
         self.portfolio_vol_cap       = self._get_param("portfolio_vol_cap", 0.80)
@@ -621,7 +626,18 @@ class MNQStrategy(QCAlgorithm):
             return
 
         # === Per-symbol trading loop ===
+        # Count already-open contracts across all instruments before we begin so
+        # we can enforce the portfolio-wide margin cap within a single Rebalance call.
+        total_open_contracts = get_actual_position_count(self)
+        orders_queued_this_rebalance = 0
+
         for base_sym, active_contract in list(self.active_contracts.items()):
+            # Portfolio-wide cap: stop queuing new entries when the combined count
+            # (already open + queued this tick) would exceed our margin limit.
+            if total_open_contracts + orders_queued_this_rebalance >= self.max_portfolio_contracts:
+                self._log_skip(f"Portfolio max contracts ({self.max_portfolio_contracts}) reached")
+                break
+
             mnq = self.instrument_data.get(active_contract)
             if mnq is None or not self._is_ready(mnq):
                 continue
@@ -674,6 +690,7 @@ class MNQStrategy(QCAlgorithm):
                 ticket = self.MarketOrder(active_contract, order_qty, tag=f"MG Entry score={net_score:.2f}")
                 if ticket is not None:
                     self._recent_tickets.append(ticket)
+                    orders_queued_this_rebalance += 1
                     components = factors
                     dir_str = "LONG" if direction == 1 else "SHORT"
                     sig_str = (f"tick_imb={components.get('obi', 0):.2f} "
@@ -994,6 +1011,9 @@ class MNQStrategy(QCAlgorithm):
                 self._pending_orders.pop(symbol, None)
                 self._submitted_orders.pop(symbol, None)
                 self._order_retries.pop(event.OrderId, None)
+                # Log the rejection reason so we can diagnose margin/other issues
+                msg = getattr(event, 'Message', '') or ''
+                self.Debug(f"INVALID ORDER: {symbol.Value} dir={event.Direction} qty={event.Quantity} | Reason: {msg or 'unknown'}")
                 if event.Direction == OrderDirection.Sell:
                     fail_count = self._failed_exit_counts.get(symbol, 0) + 1
                     self._failed_exit_counts[symbol] = fail_count
@@ -1009,6 +1029,12 @@ class MNQStrategy(QCAlgorithm):
                             self.highest_prices[symbol] = holding.AveragePrice
                             self.entry_times[symbol] = self.Time
                             self.Debug(f"RE-TRACKED after invalid: {symbol.Value}")
+                # If this was a failed entry attempt (not invested), apply a cooldown
+                # to prevent the bot from spamming the same order every minute bar.
+                if not is_invested_not_dust(self, symbol) and symbol not in self.entry_prices:
+                    cooldown_until = self.Time + timedelta(minutes=self.invalid_entry_cooldown_minutes)
+                    self._symbol_entry_cooldowns[symbol.Value] = cooldown_until
+                    self.Debug(f"Entry cooldown set for {symbol.Value} until {cooldown_until} after invalid order")
         except Exception as e:
             self.Debug(f"OnOrderEvent error: {e}")
         if self.LiveMode:

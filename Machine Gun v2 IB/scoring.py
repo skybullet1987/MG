@@ -383,12 +383,21 @@ class MicroScalpEngine:
         MNQ initial margin ~$1,300 per contract. With $3,000 capital, max 2 contracts.
         Fees are flat ~$1.26 RT (negligible vs crypto's 0.65%), so sizing focuses
         on margin utilization and vol-targeting rather than fee survival.
+
+        The portfolio-wide cap (max_portfolio_contracts) is enforced in Rebalance()
+        before this function is called; here we additionally guard against violating
+        the per-order margin limit relative to actual remaining margin.
         """
         available_margin = self.algo.Portfolio.MarginRemaining
-        margin_per_contract = 1400  # MNQ initial margin ~$1,300 + buffer
+        # Use a conservative per-contract margin estimate that covers any of our
+        # three instruments (MNQ ~$1,300, MGC ~$1,000, M2K ~$700) with a buffer.
+        margin_per_contract = 1400  # conservative buffer above highest (MNQ ~$1,300)
 
         max_by_margin = int(available_margin / margin_per_contract) if margin_per_contract > 0 else 0
         max_contracts = getattr(self.algo, 'max_contracts', 2)
+        # Also respect the portfolio-wide cap so sizing never exceeds overall limit
+        portfolio_cap = getattr(self.algo, 'max_portfolio_contracts', max_contracts)
+        max_contracts = min(max_contracts, portfolio_cap)
 
         if score >= 0.80:
             contracts = min(2, max_by_margin, max_contracts)
