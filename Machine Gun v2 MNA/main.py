@@ -258,6 +258,19 @@ class MNQFuturesStrategy(QCAlgorithm):
             future['trade_count_today'] = 0
         persist_state(self)
 
+    def DailyReport(self):
+        """Reset daily counters and log portfolio status."""
+        self.daily_trade_count = 0
+        self._daily_open_value = self.Portfolio.TotalPortfolioValue
+
+        total_trades = len(self.trade_log)
+        wins = sum(1 for t in self.trade_log if t.get('pnl_pct', 0) > 0)
+        wr = (wins / total_trades * 100) if total_trades > 0 else 0.0
+
+        self.Debug(f"=== DAILY {self.Time.date()} ===")
+        self.Debug(f"Portfolio: ${self.Portfolio.TotalPortfolioValue:.2f} | Cash: ${self.Portfolio.Cash:.2f}")
+        self.Debug(f"Trades: {total_trades} | WR: {wr:.1f}%")
+
     def HealthCheck(self):
         if self.IsWarmingUp:
             return
