@@ -6,9 +6,9 @@ import numpy as np
 
 class MicroScalpEngine:
     """
-    Micro-Scalping Signal Engine - Coinbase Crypto Edition v1.0
+    Micro-Scalping Signal Engine - Coinbase Crypto Edition v2.0
 
-    Adapted from the MNA Futures version for Coinbase spot crypto trading.
+    Full port of the Machine Gun v2 signal engine for Coinbase spot crypto trading.
     Supports both Long and Short directions via separate scoring methods.
 
     Long Score  → buy signal  (price rising, bid dominance, VWAP above)
@@ -390,29 +390,40 @@ class MicroScalpEngine:
         return self.calculate_long_score(future)
 
     # ------------------------------------------------------------------
-    # Position sizing — fractional quantities for crypto
+    # Position sizing — vol-targeting with Kelly scaling for crypto
     # ------------------------------------------------------------------
-    def calculate_position_size(self, score, threshold, max_size_fraction=1.0):
+    def calculate_position_size(self, score, threshold, asset_vol_ann=None):
         """
-        Returns a sizing multiplier (0.0 – 1.0) for crypto fractional orders.
+        Position sizing calibrated for fee survival with vol-targeting.
 
-        Crypto trading uses fractional quantities, so this returns a fraction
-        of the target allocation rather than an integer contract count.
+        At 0.65% round-trip fees, positions must be large enough for the
+        TP target to cover fees, but small enough that stop losses don't
+        cascade into drawdown → circuit breaker → passivity.
 
-        High-conviction (score >= 0.80)           → max_size_fraction (full allocation)
-        High-conviction (score >= high_conviction) → 75% of allocation
-        Standard entry  (score >= threshold)       → 50% of allocation
-        Kelly scaling: if Kelly < 0.70, reduce by an additional 50%.
+        Target: max 2% account risk per trade.
+        Returns 25–50% of available capital depending on conviction,
+        scaled by asset volatility and half-Kelly criterion.
+
+        Parameters
+        ----------
+        score        : float — composite signal score
+        threshold    : float — minimum entry threshold
+        asset_vol_ann: float or None — annualized asset volatility (e.g. 0.8 for 80%)
         """
         if score >= 0.80:
-            size_fraction = max_size_fraction
+            size = 0.50   # 4+ signals — high conviction
         elif score >= self.algo.high_conviction_threshold:
-            size_fraction = max_size_fraction * 0.75
+            size = 0.40   # 3+ signals — good conviction
+        elif score >= threshold:
+            size = 0.35   # entry threshold met
         else:
-            size_fraction = max_size_fraction * 0.50
+            size = 0.25
+
+        # Vol-targeting: scale down for volatile assets, keep size for calmer ones
+        if asset_vol_ann is not None and asset_vol_ann > 0:
+            target_vol = self.algo.target_position_ann_vol  # 0.35
+            vol_scalar = min(target_vol / asset_vol_ann, 1.0)
+            size *= max(vol_scalar, 0.5)  # Never reduce below 50% of base size
 
         kelly = self.algo._kelly_fraction()
-        if kelly < 0.70:
-            size_fraction *= 0.50
-
-        return max(0.0, min(max_size_fraction, size_fraction))
+        return size * kelly
