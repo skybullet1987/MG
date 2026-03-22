@@ -23,7 +23,7 @@ class MNQStrategy(QCAlgorithm):
     def Initialize(self):
         self.SetStartDate(2024, 1, 1)
         self.SetCash(3000)  # Need ~$1,300 margin per MNQ contract
-        self.SetBrokerageModel(BrokerageName.InteractiveBrokers, AccountType.Margin)
+        self.SetBrokerageModel(BrokerageName.InteractiveBrokersBrokerage, AccountType.Margin)
 
         self.entry_threshold = 0.50
         self.high_conviction_threshold = 0.60
@@ -48,10 +48,10 @@ class MNQStrategy(QCAlgorithm):
         self.atr_trail_mult      = 2.0
 
         # Position sizing — contract-based, not percentage-based
-        self.max_contracts     = 2       # Max 2 MNQ contracts with $3K
+        self.max_contracts     = 2       # Max 2 contracts per instrument
         self.position_size_pct = 0.50    # Use 50% of available margin
-        self.base_max_positions = 1      # Single instrument = 1 position
-        self.max_positions      = 1
+        self.base_max_positions = 3      # One position per instrument (MNQ, M2K, MGC)
+        self.max_positions      = 3
 
         self.target_position_ann_vol = self._get_param("target_position_ann_vol", 0.35)
         self.portfolio_vol_cap       = self._get_param("portfolio_vol_cap", 0.80)
@@ -161,18 +161,29 @@ class MNQStrategy(QCAlgorithm):
         self.last_log_time  = None
         self._last_skip_reason = None
 
-        # MNQ futures setup
-        future = self.AddFuture(Futures.Indices.MicroNASDAQ100EMini, Resolution.Minute)
-        future.SetFilter(timedelta(days=0), timedelta(days=90))
-        self.mnq_symbol = future.Symbol
-        self.active_contract = None  # Track current front-month contract
+        # Multi-symbol futures setup (MNQ, M2K, MGC)
+        mnq_future = self.AddFuture(Futures.Indices.MicroNASDAQ100EMini, Resolution.Minute)
+        mnq_future.SetFilter(timedelta(days=0), timedelta(days=90))
+        self.mnq_base_symbol = mnq_future.Symbol
+
+        m2k_future = self.AddFuture(Futures.Indices.MicroRussell2000EMini, Resolution.Minute)
+        m2k_future.SetFilter(timedelta(days=0), timedelta(days=90))
+        self.m2k_base_symbol = m2k_future.Symbol
+
+        mgc_future = self.AddFuture(Futures.Metals.MicroGold, Resolution.Minute)
+        mgc_future.SetFilter(timedelta(days=0), timedelta(days=90))
+        self.mgc_base_symbol = mgc_future.Symbol
+
+        self.base_symbols = [self.mnq_base_symbol, self.m2k_base_symbol, self.mgc_base_symbol]
+        self.active_contracts = {}   # base_symbol -> active front-month contract symbol
+        self.instrument_data  = {}   # active contract symbol -> indicator/price data dict
 
         # VIX as regime overlay (replaces Fear & Greed and BTC reference)
         self.vix_symbol = self.AddData(CBOE, "VIX", Resolution.Daily).Symbol
         self.vix_value = 20.0  # neutral default
 
-        # Single instrument data — replaces crypto_data dict-of-dicts
-        self.mnq_data = None  # Initialized on first bar
+        # Per-symbol instrument data — replaces single self.mnq_data
+        # (populated in OnData when active contracts are resolved)
 
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(0, 1), self.DailyReport)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(0, 0), self.ResetDailyCounters)
@@ -192,8 +203,8 @@ class MNQStrategy(QCAlgorithm):
         if self.LiveMode:
             cleanup_object_store(self)
             load_persisted_state(self)
-            self.Debug("=== LIVE TRADING (MNQ MICRO-SCALP) v7.3.0 ===")
-            self.Debug(f"Capital: ${self.Portfolio.Cash:.2f} | Max contracts: {self.max_contracts}")
+            self.Debug("=== LIVE TRADING (MNQ/M2K/MGC MICRO-SCALP) v7.3.0 ===")
+            self.Debug(f"Capital: ${self.Portfolio.Cash:.2f} | Max contracts: {self.max_contracts} | Symbols: MNQ, M2K, MGC")
 
     def CustomSecurityInitializer(self, security):
         security.SetSlippageModel(MNQSlippage())
@@ -219,8 +230,8 @@ class MNQStrategy(QCAlgorithm):
         self.daily_trade_count = 0
         self.last_trade_date = self.Time.date()
         self._daily_open_value = self.Portfolio.TotalPortfolioValue
-        if self.mnq_data is not None:
-            self.mnq_data['trade_count_today'] = 0
+        for data in self.instrument_data.values():
+            data['trade_count_today'] = 0
         self._symbol_entry_cooldowns.clear()
         persist_state(self)
 
@@ -255,9 +266,9 @@ class MNQStrategy(QCAlgorithm):
         except Exception as e:
             self.Debug(f"Error canceling stale orders: {e}")
 
-    def _initialize_mnq_data(self):
-        """Initialize the MNQ data structure (replaces _initialize_symbol for crypto)."""
-        self.mnq_data = {
+    def _make_instrument_data(self):
+        """Create and return a new instrument data structure for one futures contract."""
+        return {
             'prices': deque(maxlen=self.lookback),
             'returns': deque(maxlen=self.lookback),
             'volume': deque(maxlen=self.lookback),
@@ -309,30 +320,36 @@ class MNQStrategy(QCAlgorithm):
         return not self._is_rth()
 
     def OnData(self, data):
-        # === Contract selection / rollover ===
+        # === Contract selection / rollover — handled independently per base symbol ===
         for chain in data.FutureChains:
+            base_sym = chain.Key
+            # Only process chains for our subscribed instruments
+            if base_sym not in self.base_symbols:
+                continue
             contracts = sorted(chain.Value, key=lambda c: c.Expiry)
             if contracts:
                 front = contracts[0]
-                if self.active_contract != front.Symbol:
-                    if self.active_contract and self.Portfolio[self.active_contract].Invested:
-                        self.Liquidate(self.active_contract, "Contract rollover")
-                    self.active_contract = front.Symbol
+                current_active = self.active_contracts.get(base_sym)
+                if current_active != front.Symbol:
+                    if current_active and self.Portfolio[current_active].Invested:
+                        self.Liquidate(current_active, "Contract rollover")
+                    # Drop stale data for the old contract
+                    if current_active is not None:
+                        self.instrument_data.pop(current_active, None)
+                    self.active_contracts[base_sym] = front.Symbol
+                    self.instrument_data[front.Symbol] = self._make_instrument_data()
                     self.Debug(f"Active contract: {front.Symbol.Value} expiry {front.Expiry}")
-                    # Re-initialize data on contract change
-                    self._initialize_mnq_data()
 
-        if self.IsWarmingUp or self.active_contract is None:
+        if self.IsWarmingUp or not self.active_contracts:
             return
 
-        # Initialize data structure if needed
-        if self.mnq_data is None:
-            self._initialize_mnq_data()
-
-        # Process bars for the active contract only
-        if data.Bars.ContainsKey(self.active_contract):
-            bar = data.Bars[self.active_contract]
-            self._update_symbol_data(self.active_contract, bar)
+        # Process bars for each active contract
+        for base_sym, contract in self.active_contracts.items():
+            if contract not in self.instrument_data:
+                self.instrument_data[contract] = self._make_instrument_data()
+            if data.Bars.ContainsKey(contract):
+                bar = data.Bars[contract]
+                self._update_symbol_data(contract, bar)
 
         # VIX data
         if data.ContainsKey(self.vix_symbol):
@@ -346,16 +363,20 @@ class MNQStrategy(QCAlgorithm):
             sync_existing_positions(self)
             self._positions_synced = True
             self._first_post_warmup = False
-            ready = self._is_ready(self.mnq_data) if self.mnq_data else False
-            self.Debug(f"Post-warmup: MNQ data {'ready' if ready else 'warming'}")
+            for base_sym, contract in self.active_contracts.items():
+                d = self.instrument_data.get(contract)
+                ready = self._is_ready(d) if d else False
+                self.Debug(f"Post-warmup: {contract.Value} data {'ready' if ready else 'warming'}")
 
         self._update_market_context()
         self.Rebalance()
         self.CheckExits()
 
     def _update_symbol_data(self, symbol, bar):
-        """Update MNQ data indicators from the latest bar."""
-        mnq = self.mnq_data
+        """Update instrument data indicators from the latest bar."""
+        mnq = self.instrument_data.get(symbol)
+        if mnq is None:
+            return
         price = float(bar.Close)
         high = float(bar.High)
         low = float(bar.Low)
@@ -526,7 +547,7 @@ class MNQStrategy(QCAlgorithm):
             self._last_skip_reason = reason
 
     def Rebalance(self):
-        if self.IsWarmingUp or self.active_contract is None:
+        if self.IsWarmingUp or not self.active_contracts:
             return
 
         if not self._is_rth():
@@ -590,11 +611,6 @@ class MNQStrategy(QCAlgorithm):
             self._log_skip("circuit breaker active")
             return
 
-        pos_count = get_actual_position_count(self)
-        if pos_count >= self.max_positions:
-            self._log_skip("at max positions")
-            return
-
         # VIX-based position limit in extreme regimes
         if self.vix_value >= 35:
             self._log_skip(f"VIX extreme ({self.vix_value:.1f}) — halting new entries")
@@ -604,86 +620,81 @@ class MNQStrategy(QCAlgorithm):
             self._log_skip("too many open orders")
             return
 
-        mnq = self.mnq_data
-        if mnq is None or not self._is_ready(mnq):
-            self._log_skip("MNQ data not ready")
-            return
+        # === Per-symbol trading loop ===
+        for base_sym, active_contract in list(self.active_contracts.items()):
+            mnq = self.instrument_data.get(active_contract)
+            if mnq is None or not self._is_ready(mnq):
+                continue
 
-        # Score the active contract
-        factors = self._calculate_factor_scores(self.active_contract, mnq)
-        if not factors:
-            return
+            # Score this contract
+            factors = self._calculate_factor_scores(active_contract, mnq)
+            if not factors:
+                continue
 
-        composite_score = self._calculate_composite_score(factors, mnq)
-        net_score = self._apply_fee_adjustment(composite_score)
-        mnq['recent_net_scores'].append(net_score)
+            composite_score = self._calculate_composite_score(factors, mnq)
+            net_score = self._apply_fee_adjustment(composite_score)
+            mnq['recent_net_scores'].append(net_score)
 
-        threshold_now = self._get_threshold()
-        debug_limited(self, f"REBALANCE: score={net_score:.2f} thresh={threshold_now:.2f} | VIX={self.vix_value:.1f} | {self.market_regime}")
+            threshold_now = self._get_threshold()
+            debug_limited(self, f"REBALANCE {active_contract.Value}: score={net_score:.2f} thresh={threshold_now:.2f} | VIX={self.vix_value:.1f} | {self.market_regime}")
 
-        if net_score < threshold_now:
-            self._log_skip(f"score {net_score:.2f} < threshold {threshold_now:.2f}")
-            return
+            if net_score < threshold_now:
+                continue
 
-        if is_invested_not_dust(self, self.active_contract):
-            self._log_skip("already invested in MNQ")
-            return
+            if is_invested_not_dust(self, active_contract):
+                continue
 
-        if has_open_orders(self, self.active_contract):
-            self._log_skip("open orders for MNQ")
-            return
+            if has_open_orders(self, active_contract):
+                continue
 
-        if self.active_contract.Value in self._symbol_entry_cooldowns and self.Time < self._symbol_entry_cooldowns[self.active_contract.Value]:
-            self._log_skip("entry cooldown")
-            return
+            if active_contract.Value in self._symbol_entry_cooldowns and self.Time < self._symbol_entry_cooldowns[active_contract.Value]:
+                continue
 
-        atr_val = mnq['atr'].Current.Value if mnq['atr'].IsReady else None
-        if atr_val and self.Securities[self.active_contract].Price > 0:
-            price = self.Securities[self.active_contract].Price
-            expected_move_pct = (atr_val * self.atr_tp_mult) / price
-            if expected_move_pct < self.min_expected_profit_pct:
-                self._log_skip(f"expected move {expected_move_pct:.3%} < min profit {self.min_expected_profit_pct:.3%}")
-                return
+            atr_val = mnq['atr'].Current.Value if mnq['atr'].IsReady else None
+            if atr_val and self.Securities[active_contract].Price > 0:
+                price = self.Securities[active_contract].Price
+                expected_move_pct = (atr_val * self.atr_tp_mult) / price
+                if expected_move_pct < self.min_expected_profit_pct:
+                    continue
 
-        vol = self._annualized_vol(mnq)
-        contracts = self._calculate_position_size(net_score, threshold_now, vol)
+            vol = self._annualized_vol(mnq)
+            contracts = self._calculate_position_size(net_score, threshold_now, vol)
 
-        if self._consecutive_loss_halve_remaining > 0:
-            contracts = max(0, contracts - 1)
+            if self._consecutive_loss_halve_remaining > 0:
+                contracts = max(0, contracts - 1)
 
-        if contracts < 1:
-            self._log_skip("position size < 1 contract")
-            return
+            if contracts < 1:
+                continue
 
-        try:
-            direction = factors.get('_direction', 1)
-            price = self.Securities[self.active_contract].Price
-            order_qty = contracts * direction
-            self._entry_directions[self.active_contract] = direction
-            ticket = self.MarketOrder(self.active_contract, order_qty, tag=f"MG Entry score={net_score:.2f}")
-            if ticket is not None:
-                self._recent_tickets.append(ticket)
-                components = factors
-                dir_str = "LONG" if direction == 1 else "SHORT"
-                sig_str = (f"tick_imb={components.get('obi', 0):.2f} "
-                           f"vol={components.get('vol_ignition', 0):.2f} "
-                           f"trend={components.get('micro_trend', 0):.2f} "
-                           f"adx={components.get('adx_trend', 0):.2f} "
-                           f"mean_rev={components.get('mean_reversion', 0):.2f} "
-                           f"vwap={components.get('vwap_signal', 0):.2f}")
-                self.Debug(f"MNQ ENTRY ({dir_str}): {contracts} contract(s) | score={net_score:.2f} | ${price:.2f} | {sig_str}")
-                self.trade_count += 1
-                mnq['trade_count_today'] = mnq.get('trade_count_today', 0) + 1
-                adx_ind = mnq.get('adx')
-                is_choppy = (adx_ind is not None and adx_ind.IsReady
-                             and adx_ind.Current.Value < 25)
-                self._choppy_regime_entries[self.active_contract] = is_choppy
-                if self._consecutive_loss_halve_remaining > 0:
-                    self._consecutive_loss_halve_remaining -= 1
-                if self.LiveMode:
-                    self._last_live_trade_time = self.Time
-        except Exception as e:
-            self.Debug(f"ORDER FAILED: MNQ - {e}")
+            try:
+                direction = factors.get('_direction', 1)
+                price = self.Securities[active_contract].Price
+                order_qty = contracts * direction
+                self._entry_directions[active_contract] = direction
+                ticket = self.MarketOrder(active_contract, order_qty, tag=f"MG Entry score={net_score:.2f}")
+                if ticket is not None:
+                    self._recent_tickets.append(ticket)
+                    components = factors
+                    dir_str = "LONG" if direction == 1 else "SHORT"
+                    sig_str = (f"tick_imb={components.get('obi', 0):.2f} "
+                               f"vol={components.get('vol_ignition', 0):.2f} "
+                               f"trend={components.get('micro_trend', 0):.2f} "
+                               f"adx={components.get('adx_trend', 0):.2f} "
+                               f"mean_rev={components.get('mean_reversion', 0):.2f} "
+                               f"vwap={components.get('vwap_signal', 0):.2f}")
+                    self.Debug(f"{active_contract.Value} ENTRY ({dir_str}): {contracts} contract(s) | score={net_score:.2f} | ${price:.2f} | {sig_str}")
+                    self.trade_count += 1
+                    mnq['trade_count_today'] = mnq.get('trade_count_today', 0) + 1
+                    adx_ind = mnq.get('adx')
+                    is_choppy = (adx_ind is not None and adx_ind.IsReady
+                                 and adx_ind.Current.Value < 25)
+                    self._choppy_regime_entries[active_contract] = is_choppy
+                    if self._consecutive_loss_halve_remaining > 0:
+                        self._consecutive_loss_halve_remaining -= 1
+                    if self.LiveMode:
+                        self._last_live_trade_time = self.Time
+            except Exception as e:
+                self.Debug(f"ORDER FAILED: {active_contract.Value} - {e}")
 
         self._last_skip_reason = None
 
@@ -753,7 +764,7 @@ class MNQStrategy(QCAlgorithm):
             pnl = (price - entry) / entry if entry > 0 else 0
             dd = (highest - price) / highest if highest > 0 else 0
 
-        mnq = self.mnq_data
+        mnq = self.instrument_data.get(symbol)
         hours = (self.Time - self.entry_times.get(symbol, self.Time)).total_seconds() / 3600
         minutes = hours * 60
 
