@@ -35,12 +35,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.entry_threshold = 0.50
         self.high_conviction_threshold = 0.60
 
-        self.quick_take_profit = self._get_param("quick_take_profit", 0.015)
-        self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.012)
+        self.quick_take_profit = self._get_param("quick_take_profit", 0.050)
+        self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.050)
         self.atr_tp_mult  = self._get_param("atr_tp_mult",  4.0)
         self.atr_sl_mult  = self._get_param("atr_sl_mult",  2.0)
-        self.trail_activation  = self._get_param("trail_activation",  0.012)
-        self.trail_stop_pct    = self._get_param("trail_stop_pct",    0.008)
+        self.trail_activation  = self._get_param("trail_activation",  0.040)
+        self.trail_stop_pct    = self._get_param("trail_stop_pct",    0.025)
         self.time_stop_hours   = self._get_param("time_stop_hours",   3.0)
         self.time_stop_pnl_min = self._get_param("time_stop_pnl_min", 0.003)
         self.extended_time_stop_hours   = self._get_param("extended_time_stop_hours",   4.0)
@@ -88,7 +88,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
         self.expected_round_trip_fees = 0.012
         self.fee_slippage_buffer      = 0.001
-        self.min_expected_profit_pct  = 0.015
+        self.min_expected_profit_pct  = 0.030
         self.adx_min_period           = 10
 
         self.stale_order_timeout_seconds      = 30
@@ -139,7 +139,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._breakeven_stops       = {}
         self._partial_sell_symbols  = set()
         self._choppy_regime_entries = {}
-        self.partial_tp_threshold   = 0.025
+        self.partial_tp_threshold   = self._get_param("partial_tp_threshold", 0.040)
         self.stagnation_minutes     = 120
         self.stagnation_pnl_threshold = 0.005
         self.rsi_peaked_overbought = {}
