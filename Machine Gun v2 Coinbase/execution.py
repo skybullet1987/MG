@@ -76,9 +76,9 @@ class RealisticCryptoSlippage:
     Altcoins under $1 routinely have 0.3-0.5% effective slippage."""
 
     def __init__(self):
-        self.base_slippage_pct = 0.002    # 0.2% base (was 0.1% — too optimistic)
+        self.base_slippage_pct = 0.003    # 0.3% base (was 0.2% — too optimistic for Coinbase)
         self.volume_impact_factor = 0.15   # was 0.10
-        self.max_slippage_pct = 0.03       # 3% cap (was 2%)
+        self.max_slippage_pct = 0.04       # 4% cap (was 3%)
 
     def get_slippage_approximation(self, asset, order):
         price = asset.Price

@@ -263,7 +263,7 @@ class MicroScalpEngine:
         """
         Position sizing calibrated for fee survival with vol-targeting.
 
-        At 0.65% round-trip fees, positions must be large enough for the
+        At ~1.0% round-trip fees, positions must be large enough for the
         TP target to cover fees, but small enough that stop losses don't
         cascade into drawdown -> circuit breaker -> passivity.
 
@@ -273,15 +273,15 @@ class MicroScalpEngine:
         """
         if score >= 0.80:
             # 4+ signals firing – high conviction
-            size = 0.50
+            size = 0.40
         elif score >= self.algo.high_conviction_threshold:
             # 3+ signals: good conviction
-            size = 0.40
+            size = 0.35
         elif score >= threshold:
             # Entry threshold met: moderate sizing
-            size = 0.35
+            size = 0.30
         else:
-            size = 0.25
+            size = 0.20
 
         # Vol-targeting: scale down for volatile assets, keep size for calmer ones
         if asset_vol_ann is not None and asset_vol_ann > 0:
