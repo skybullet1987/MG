@@ -28,8 +28,8 @@ class MakerTakerFeeModel(FeeModel):
 class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def Initialize(self):
-        self.SetStartDate(2024, 1, 1)
-        self.SetCash(2000)
+        self.SetStartDate(2022, 1, 1)
+        self.SetCash(1000)
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
         self.entry_threshold = 0.50
@@ -47,7 +47,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.extended_time_stop_pnl_max = self._get_param("extended_time_stop_pnl_max", 0.015)
         self.stale_position_hours       = self._get_param("stale_position_hours",       6.0)
 
-        self.trailing_activation = self.trail_activation
+        self.trailing_activation = self.trail_activation        
         self.trailing_stop_pct   = self.trail_stop_pct
         self.base_stop_loss      = self.tight_stop_loss
         self.base_take_profit    = self.quick_take_profit
@@ -181,7 +181,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.log_budget     = 0
         self.last_log_time  = None
 
-        self.max_universe_size = 20
+        self.max_universe_size = 75
 
         self.kraken_status = "unknown"
         self._last_skip_reason = None
@@ -1165,7 +1165,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 self._failed_exit_counts[symbol] = fail_count
                 self.Debug(f"⚠️ EXIT FAILED ({tag}) #{fail_count}: {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.1f}h")
                 if fail_count >= 3:
-                    self.Debug(f"🚨 FATAL EXIT FAILURE: {symbol.Value} — {fail_count} attempts failed, escalating to market order")
+                    self.Debug(f" FATAL EXIT FAILURE: {symbol.Value} — {fail_count} attempts failed, escalating to market order")
                     try:
                         holding = self.Portfolio[symbol]
                         qty = abs(holding.Quantity)
