@@ -48,27 +48,27 @@ class MNQFuturesStrategy(QCAlgorithm):
         self.max_positions            = 1   # one position at a time (long OR short)
 
         # Exit parameters calibrated for futures intraday moves
-        self.quick_take_profit    = self._get_param("quick_take_profit",    0.015)  # 1.5%
-        self.tight_stop_loss      = self._get_param("tight_stop_loss",      0.005)  # 0.5%
-        self.atr_tp_mult          = self._get_param("atr_tp_mult",          4.0)
-        self.atr_sl_mult          = self._get_param("atr_sl_mult",          2.0)
-        self.trail_activation     = self._get_param("trail_activation",     0.008)  # 0.8%
-        self.trail_stop_pct       = self._get_param("trail_stop_pct",       0.004)  # 0.4%
-        self.time_stop_hours      = self._get_param("time_stop_hours",      3.0)
+        self.quick_take_profit    = self._get_param("quick_take_profit",    0.008)  # 0.8%
+        self.tight_stop_loss      = self._get_param("tight_stop_loss",      0.003)  # 0.3%
+        self.atr_tp_mult          = self._get_param("atr_tp_mult",          3.0)
+        self.atr_sl_mult          = self._get_param("atr_sl_mult",          1.5)
+        self.trail_activation     = self._get_param("trail_activation",     0.005)  # 0.5%
+        self.trail_stop_pct       = self._get_param("trail_stop_pct",       0.002)  # 0.2%
+        self.time_stop_hours      = self._get_param("time_stop_hours",      1.5)
         self.time_stop_pnl_min    = self._get_param("time_stop_pnl_min",    0.001)
-        self.extended_time_stop_hours   = self._get_param("extended_time_stop_hours",   4.0)
+        self.extended_time_stop_hours   = self._get_param("extended_time_stop_hours",   3.0)
         self.extended_time_stop_pnl_max = self._get_param("extended_time_stop_pnl_max", 0.005)
-        self.stale_position_hours = self._get_param("stale_position_hours", 5.0)
+        self.stale_position_hours = self._get_param("stale_position_hours", 3.0)
 
         self.trailing_activation   = self.trail_activation
         self.trailing_stop_pct    = self.trail_stop_pct
         self.base_stop_loss       = self.tight_stop_loss
         self.base_take_profit     = self.quick_take_profit
-        self.atr_trail_mult       = 2.0
+        self.atr_trail_mult       = 1.5
 
-        self.partial_tp_threshold    = 0.010   # 1.0% — take half off at this profit
-        self.stagnation_minutes      = 60
-        self.stagnation_pnl_threshold = 0.002
+        self.partial_tp_threshold    = 0.004   # 0.4% — take half off at this profit
+        self.stagnation_minutes      = 30
+        self.stagnation_pnl_threshold = 0.001
 
         # ------------------------------------------------------------------
         # Indicator periods
