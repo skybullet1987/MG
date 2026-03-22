@@ -193,9 +193,9 @@ def cleanup_position(algo, symbol, record_pnl=False, exit_price=None):
     algo.lowest_prices.pop(symbol, None) if hasattr(algo, 'lowest_prices') else None
     algo._entry_directions.pop(symbol, None) if hasattr(algo, '_entry_directions') else None
     algo.entry_times.pop(symbol, None)
-    # Clear trail_stop on mnq_data if this is the active contract
-    if hasattr(algo, 'mnq_data') and algo.mnq_data is not None:
-        algo.mnq_data['trail_stop'] = None
+    # Clear trail_stop on instrument_data for this contract
+    if hasattr(algo, 'instrument_data') and symbol in algo.instrument_data:
+        algo.instrument_data[symbol]['trail_stop'] = None
     if hasattr(algo, '_spike_entries'):
         algo._spike_entries.pop(symbol, None)
     if hasattr(algo, '_partial_tp_taken'):
