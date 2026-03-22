@@ -47,7 +47,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.extended_time_stop_pnl_max = self._get_param("extended_time_stop_pnl_max", 0.015)
         self.stale_position_hours       = self._get_param("stale_position_hours",       6.0)
 
-        self.trailing_activation = self.trail_activation        self.trailing_stop_pct   = self.trail_stop_pct
+        self.trailing_activation = self.trail_activation
+        self.trailing_stop_pct   = self.trail_stop_pct
         self.base_stop_loss      = self.tight_stop_loss
         self.base_take_profit    = self.quick_take_profit
         self.atr_trail_mult      = 2.0
