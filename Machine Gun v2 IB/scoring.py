@@ -3,10 +3,30 @@ from AlgorithmImports import *
 import numpy as np
 # endregion
 
+# =============================================================================
+# LEGACY MODULE — scoring.py is preserved for reference only.
+#
+# As of v8.0.0, signal evaluation has been moved to setups.py which implements
+# three explicit, separately-attributable setup families:
+#   - trend_pullback
+#   - mean_reversion
+#   - breakout_compression
+#
+# MicroScalpEngine is no longer imported by main.py.  It remains here as a
+# reference implementation and may be useful for comparative analysis.
+# =============================================================================
+
 
 class MicroScalpEngine:
     """
-    Micro-Scalping Signal Engine - v7.3.0 (MNQ/Futures)
+    LEGACY: Micro-Scalping Signal Engine - v7.3.0 (MNQ/Futures)
+
+    This class is no longer used in the main trading pipeline.  It is kept
+    for reference and backward compatibility.  See setups.py for the current
+    setup-driven architecture.
+
+    Original docstring below:
+    -------------------------
 
     High-frequency market microstructure scalping system.
     Uses cutting-edge microstructure signals tuned for 1-minute bars on Micro NASDAQ 100 (MNQ).
