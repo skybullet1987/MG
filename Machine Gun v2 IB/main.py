@@ -25,7 +25,7 @@ from execution import (
     record_exit_pnl,
 )
 from config import MGConfig
-from candidates import (
+from scoring import (
     REJECT_ALREADY_INVESTED,
     REJECT_COOLDOWN,
     REJECT_DAILY_LOSS_EXCEEDED,
@@ -37,9 +37,9 @@ from candidates import (
     REJECT_SYMBOL_TRADE_LIMIT,
     REJECT_VIX_EXTREME,
     REJECT_ZERO_CONTRACTS,
+    evaluate_all_setups,
 )
-from setups import evaluate_all_setups
-from reporting import DiagnosticsLogger
+from execution import DiagnosticsLogger
 
 from collections import deque
 import numpy as np
@@ -63,8 +63,14 @@ class MNQStrategy(QCAlgorithm):
 
     Architecture overview (v8.0.0)
     --------------------------------
-    The strategy uses a setup-driven pipeline:
+    The strategy uses a setup-driven pipeline implemented across 4 files:
+      - main.py      : orchestration, data handling, order lifecycle
+      - scoring.py   : SetupCandidate types, constants, and setup evaluators
+      - execution.py : order placement, exits, safety checks, DiagnosticsLogger
+      - config.py    : all tunable parameters (MGConfig)
 
+    Pipeline per bar
+    ----------------
       1. Every bar: evaluate_all_setups() checks each active contract against
          three explicit setup families (trend_pullback, mean_reversion,
          breakout_compression) and returns structured SetupCandidates.
