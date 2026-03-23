@@ -80,7 +80,7 @@ class MNQStrategy(QCAlgorithm):
         self.last_trade_date        = None
         self.exit_cooldown_hours    = 0.5
         self.cancel_cooldown_minutes = 1
-        self.max_symbol_trades_per_day = 10
+        self.max_symbol_trades_per_day = 5
 
         self.stale_order_timeout_seconds      = 30
         self.live_stale_order_timeout_seconds = 60
@@ -96,11 +96,6 @@ class MNQStrategy(QCAlgorithm):
         self.rate_limit_cooldown_minutes        = 10
 
         self.max_drawdown_limit    = 0.20
-        self.cooldown_hours        = 4
-        self.consecutive_losses    = 0
-        self.max_consecutive_losses = 4
-        self._consecutive_loss_halve_remaining = 0
-        self.circuit_breaker_expiry = None
 
         self._positions_synced    = False
         self._session_blacklist   = set()
@@ -113,41 +108,24 @@ class MNQStrategy(QCAlgorithm):
         self._retry_pending       = {}
         self._rate_limit_until    = None
         self._last_mismatch_warning = None
-        self._failed_exit_attempts = {}
-        self._failed_exit_counts   = {}
         self._daily_open_value     = None
         self.pnl_by_tag            = {}
 
-        self.peak_value       = None
-        self.drawdown_cooldown = 0
-        self.entry_prices     = {}
-        self.highest_prices   = {}
-        self.lowest_prices    = {}
-        self._entry_directions = {}
-        self.entry_times      = {}
-        self.entry_volumes    = {}
-        self._partial_tp_taken      = {}
-        self._breakeven_stops       = {}
-        self._partial_sell_symbols  = set()
-        self._choppy_regime_entries = {}
-        self.partial_tp_threshold   = 0.004  # 0.4% partial TP for MNQ
-        self.stagnation_minutes     = 60
-        self.stagnation_pnl_threshold = 0.001
-        self.rsi_peaked_overbought = {}
         self.trade_count      = 0
         self._pending_orders  = {}
         self._cancel_cooldowns = {}
         self._exit_cooldowns  = {}
         self._symbol_loss_cooldowns = {}
-        self._cash_mode_until = None
-        self._recent_trade_outcomes = deque(maxlen=20)
-        self.trailing_grace_hours = 0.5
         self._slip_abs        = deque(maxlen=50)
         self._slippage_alert_until = None
         self.slip_alert_threshold  = 0.001
         self.slip_outlier_threshold = 0.002
         self.slip_alert_duration_hours = 2
         self._recent_tickets  = deque(maxlen=25)
+
+        # Bracket order tracking — replaces manual exit (CheckExits) logic
+        self._pending_entry_info = {}  # entry_order_id → {direction, contracts}
+        self._bracket_orders     = {}  # symbol → {tp_id, sl_id, direction, entry_price}
 
         self._rolling_wins      = deque(maxlen=50)
         self._rolling_win_sizes = deque(maxlen=50)
@@ -375,7 +353,6 @@ class MNQStrategy(QCAlgorithm):
 
         self._update_market_context()
         self.Rebalance()
-        self.CheckExits()
 
     def _update_symbol_data(self, symbol, bar):
         """Update instrument data indicators from the latest bar."""
@@ -563,12 +540,9 @@ class MNQStrategy(QCAlgorithm):
         if not self._is_rth():
             return  # Only enter new trades during Regular Trading Hours
 
+        # Circuit breaker 1: max 3% daily portfolio loss
         if self._daily_loss_exceeded():
-            self._log_skip("max daily loss exceeded")
-            return
-
-        if self._cash_mode_until is not None and self.Time < self._cash_mode_until:
-            self._log_skip("cash mode - poor recent performance")
+            self._log_skip("max daily loss exceeded (3%)")
             return
 
         self.log_budget = 20
@@ -585,52 +559,9 @@ class MNQStrategy(QCAlgorithm):
             self._log_skip("max daily trades")
             return
 
-        val = self.Portfolio.TotalPortfolioValue
-        if self.peak_value is None or self.peak_value < 1:
-            self.peak_value = val
-        if self.drawdown_cooldown > 0:
-            self.drawdown_cooldown -= 1
-            if self.drawdown_cooldown <= 0:
-                self.peak_value = val
-                self.consecutive_losses = 0
-            else:
-                self._log_skip(f"drawdown cooldown {self.drawdown_cooldown}h")
-                return
-
-        self.peak_value = max(self.peak_value, val)
-        dd = (self.peak_value - val) / self.peak_value if self.peak_value > 0 else 0
-        if dd > self.max_drawdown_limit:
-            self.drawdown_cooldown = self.cooldown_hours
-            self._log_skip(f"drawdown {dd:.1%} > limit")
-            return
-
-        if self.consecutive_losses >= self.max_consecutive_losses:
-            self.drawdown_cooldown = 0.5
-            self._consecutive_loss_halve_remaining = 3
-            self.consecutive_losses = 0
-            self._log_skip("consecutive loss cooldown")
-            return
-
-        if self.consecutive_losses >= 3:
-            self.circuit_breaker_expiry = self.Time + timedelta(minutes=15)
-            self.consecutive_losses = 0
-            self._log_skip("circuit breaker triggered (3 consecutive losses)")
-            return
-
-        if self.circuit_breaker_expiry is not None and self.Time < self.circuit_breaker_expiry:
-            self._log_skip("circuit breaker active")
-            return
-
-        # VIX-based position limit — avoid choppy (< 12) and erratic (> 25) regimes
-        if self.vix_value < 12:
-            self._log_skip(f"VIX too low ({self.vix_value:.1f}) — market too slow/choppy")
-            return
+        # VIX-based position limit — avoid erratic (> 25) regimes
         if self.vix_value > 25:
             self._log_skip(f"VIX too high ({self.vix_value:.1f}) — market too erratic/dangerous")
-            return
-
-        if len(self.Transactions.GetOpenOrders()) >= self.max_concurrent_open_orders:
-            self._log_skip("too many open orders")
             return
 
         # === Per-symbol trading loop ===
@@ -648,6 +579,11 @@ class MNQStrategy(QCAlgorithm):
 
             mnq = self.instrument_data.get(active_contract)
             if mnq is None or not self._is_ready(mnq):
+                continue
+
+            # Circuit breaker 2: max 5 trades per symbol per day
+            if mnq.get('trade_count_today', 0) >= self.max_symbol_trades_per_day:
+                self._log_skip(f"{active_contract.Value}: max {self.max_symbol_trades_per_day} trades/day reached")
                 continue
 
             # Score this contract
@@ -681,11 +617,13 @@ class MNQStrategy(QCAlgorithm):
                 if expected_move_pct < self.min_expected_profit_pct:
                     continue
 
+            # Margin safety check: ensure enough remaining margin before entry
+            if self.Portfolio.MarginRemaining <= 500:
+                self._log_skip(f"Insufficient margin: ${self.Portfolio.MarginRemaining:.0f} remaining")
+                break
+
             vol = self._annualized_vol(mnq)
             contracts = self._calculate_position_size(net_score, threshold_now, vol)
-
-            if self._consecutive_loss_halve_remaining > 0:
-                contracts = max(0, contracts - 1)
 
             if contracts < 1:
                 continue
@@ -694,10 +632,14 @@ class MNQStrategy(QCAlgorithm):
                 direction = factors.get('_direction', 1)
                 price = self.Securities[active_contract].Price
                 order_qty = contracts * direction
-                self._entry_directions[active_contract] = direction
                 ticket = self.MarketOrder(active_contract, order_qty, tag=f"MG Entry score={net_score:.2f}")
                 if ticket is not None:
                     self._recent_tickets.append(ticket)
+                    # Store entry info keyed by order ID so OnOrderEvent can attach bracket orders
+                    self._pending_entry_info[ticket.OrderId] = {
+                        'direction': direction,
+                        'contracts': contracts,
+                    }
                     orders_queued_this_rebalance += 1
                     components = factors
                     dir_str = "LONG" if direction == 1 else "SHORT"
@@ -710,12 +652,6 @@ class MNQStrategy(QCAlgorithm):
                     self.Debug(f"{active_contract.Value} ENTRY ({dir_str}): {contracts} contract(s) | score={net_score:.2f} | ${price:.2f} | {sig_str}")
                     self.trade_count += 1
                     mnq['trade_count_today'] = mnq.get('trade_count_today', 0) + 1
-                    adx_ind = mnq.get('adx')
-                    is_choppy = (adx_ind is not None and adx_ind.IsReady
-                                 and adx_ind.Current.Value < 25)
-                    self._choppy_regime_entries[active_contract] = is_choppy
-                    if self._consecutive_loss_halve_remaining > 0:
-                        self._consecutive_loss_halve_remaining -= 1
                     if self.LiveMode:
                         self._last_live_trade_time = self.Time
             except Exception as e:
@@ -728,183 +664,42 @@ class MNQStrategy(QCAlgorithm):
             return False
         return len(mnq['prices']) >= 10 and mnq['rsi'].IsReady
 
-    def CheckExits(self):
-        if self.IsWarmingUp:
-            return
-        if self._rate_limit_until is not None and self.Time < self._rate_limit_until:
-            return
-
-        for kvp in self.Portfolio:
-            if not is_invested_not_dust(self, kvp.Key):
-                self._failed_exit_attempts.pop(kvp.Key, None)
-                self._failed_exit_counts.pop(kvp.Key, None)
-                continue
-
-            if self._failed_exit_counts.get(kvp.Key, 0) >= 3:
-                continue
-            self._check_exit(kvp.Key, self.Securities[kvp.Key].Price, kvp.Value)
-
-        for kvp in self.Portfolio:
-            symbol = kvp.Key
-            if not is_invested_not_dust(self, symbol):
-                continue
-            if symbol not in self.entry_prices:
-                self.entry_prices[symbol] = kvp.Value.AveragePrice
-                self.entry_times[symbol] = self.Time
-                if kvp.Value.Quantity < 0:
-                    self.lowest_prices[symbol] = kvp.Value.AveragePrice
-                    self._entry_directions[symbol] = -1
-                else:
-                    self.highest_prices[symbol] = kvp.Value.AveragePrice
-                    self._entry_directions[symbol] = 1
-                self.Debug(f"ORPHAN RECOVERY: {symbol.Value} re-tracked")
-
-    def _check_exit(self, symbol, price, holding):
-        if len(self.Transactions.GetOpenOrders(symbol)) > 0:
-            return
-        if symbol in self._cancel_cooldowns and self.Time < self._cancel_cooldowns[symbol]:
-            return
-
-        if symbol not in self.entry_prices:
-            self.entry_prices[symbol] = holding.AveragePrice
-            self.entry_times[symbol] = self.Time
-            if holding.Quantity < 0:
-                self.lowest_prices[symbol] = holding.AveragePrice
-                self._entry_directions[symbol] = -1
-            else:
-                self.highest_prices[symbol] = holding.AveragePrice
-                self._entry_directions[symbol] = 1
-
-        is_short = holding.Quantity < 0
-        entry = self.entry_prices[symbol]
-
-        if is_short:
-            lowest = self.lowest_prices.get(symbol, entry)
-            if price < lowest:
-                self.lowest_prices[symbol] = price
-                lowest = price
-            pnl = (entry - price) / entry if entry > 0 else 0
-            dd = (price - lowest) / lowest if lowest > 0 else 0
-        else:
-            highest = self.highest_prices.get(symbol, entry)
-            if price > highest:
-                self.highest_prices[symbol] = price
-                highest = price
-            pnl = (price - entry) / entry if entry > 0 else 0
-            dd = (highest - price) / highest if highest > 0 else 0
-
+    def _submit_bracket_orders(self, symbol, fill_price, direction, contracts):
+        """Submit TP (LimitOrder) and SL (StopMarketOrder) bracket legs after an entry fill."""
         mnq = self.instrument_data.get(symbol)
-        hours = (self.Time - self.entry_times.get(symbol, self.Time)).total_seconds() / 3600
-        minutes = hours * 60
-
-        atr = mnq['atr'].Current.Value if mnq and mnq['atr'].IsReady else None
-        if atr and entry > 0:
-            sl = max((atr * self.atr_sl_mult) / entry, self.tight_stop_loss)
-            tp = max((atr * self.atr_tp_mult) / entry, self.quick_take_profit)
+        atr_val = mnq['atr'].Current.Value if mnq and mnq['atr'].IsReady else None
+        if atr_val and fill_price > 0:
+            sl_pct = max((atr_val * self.atr_sl_mult) / fill_price, self.tight_stop_loss)
+            tp_pct = max((atr_val * self.atr_tp_mult) / fill_price, self.quick_take_profit)
         else:
-            sl = self.tight_stop_loss
-            tp = self.quick_take_profit
+            sl_pct = self.tight_stop_loss
+            tp_pct = self.quick_take_profit
 
-        if tp < sl * 1.5:
-            tp = sl * 1.5
+        if tp_pct < sl_pct * 1.5:
+            tp_pct = sl_pct * 1.5
 
-        if self._choppy_regime_entries.get(symbol, False):
-            tp = tp * 0.65
+        exit_qty = -contracts * direction  # opposite of entry to close position
+        if direction == 1:  # Long entry
+            tp_price = fill_price * (1 + tp_pct)
+            sl_price = fill_price * (1 - sl_pct)
+        else:  # Short entry
+            tp_price = fill_price * (1 - tp_pct)
+            sl_price = fill_price * (1 + sl_pct)
 
-        if self.volatility_regime == "low":
-            tp = tp * 0.75
+        tp_ticket = self.LimitOrder(symbol, exit_qty, tp_price, tag="Take Profit")
+        sl_ticket = self.StopMarketOrder(symbol, exit_qty, sl_price, tag="Stop Loss")
 
-        trailing_activation = self.trail_activation
-        trailing_stop_pct   = self.trail_stop_pct
-
-        if mnq and mnq['rsi'].IsReady:
-            rsi_now = mnq['rsi'].Current.Value
-            if rsi_now > 85:
-                self.rsi_peaked_overbought[symbol] = True
-
-        if (not self._partial_tp_taken.get(symbol, False)
-                and pnl >= self.partial_tp_threshold):
-            if partial_smart_sell(self, symbol, 0.50, "Partial TP"):
-                self._partial_tp_taken[symbol] = True
-                if is_short:
-                    self._breakeven_stops[symbol] = entry * 0.999
-                else:
-                    self._breakeven_stops[symbol] = entry * 1.001
-                self.Debug(f"PARTIAL TP: {symbol.Value} | PnL:{pnl:+.2%} | SL→entry±0.1%")
-                return
-
-        tag = ""
-
-        if self._partial_tp_taken.get(symbol, False):
-            be_price = self._breakeven_stops.get(symbol, entry)
-            if is_short:
-                if price >= be_price:
-                    tag = "Breakeven Stop"
-            else:
-                if price <= be_price:
-                    tag = "Breakeven Stop"
-        elif pnl <= -sl:
-            tag = "Stop Loss"
-
-        if not tag and minutes > self.stagnation_minutes and pnl < self.stagnation_pnl_threshold:
-            tag = "Stagnation Exit"
-
-        elif not tag:
-            if not self._partial_tp_taken.get(symbol, False) and pnl >= tp:
-                tag = "Take Profit"
-
-            elif pnl > trailing_activation and dd >= trailing_stop_pct:
-                tag = "Trailing Stop"
-
-            elif atr and entry > 0 and holding.Quantity != 0:
-                trail_offset = atr * self.atr_trail_mult
-                if is_short:
-                    trail_level = lowest + trail_offset
-                else:
-                    trail_level = highest - trail_offset
-                if mnq:
-                    mnq['trail_stop'] = trail_level
-                if mnq and mnq['trail_stop'] is not None:
-                    if holding.Quantity > 0 and price <= mnq['trail_stop']:
-                        tag = "ATR Trail"
-                    elif holding.Quantity < 0 and price >= mnq['trail_stop']:
-                        tag = "ATR Trail"
-
-            if not tag and hours >= self.time_stop_hours and pnl < self.time_stop_pnl_min:
-                tag = "Time Stop"
-
-            if not tag and hours >= self.extended_time_stop_hours and pnl < self.extended_time_stop_pnl_max:
-                tag = "Extended Time Stop"
-
-            if not tag and hours >= self.stale_position_hours:
-                tag = "Stale Position Exit"
-
-        if tag:
-            if pnl < 0:
-                self._symbol_loss_cooldowns[symbol] = self.Time + timedelta(hours=1)
-            sold = smart_liquidate(self, symbol, tag)
-            if sold:
-                self._exit_cooldowns[symbol] = self.Time + timedelta(hours=self.exit_cooldown_hours)
-                self.rsi_peaked_overbought.pop(symbol, None)
-                self.entry_volumes.pop(symbol, None)
-                self._choppy_regime_entries.pop(symbol, None)
-                self.Debug(f"{tag}: {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.1f}h")
-            else:
-                fail_count = self._failed_exit_counts.get(symbol, 0) + 1
-                self._failed_exit_counts[symbol] = fail_count
-                self.Debug(f"⚠️ EXIT FAILED ({tag}) #{fail_count}: {symbol.Value} | PnL:{pnl:+.2%}")
-                if fail_count >= 3:
-                    self.Debug(f"FATAL EXIT FAILURE: {symbol.Value} — escalating to market order")
-                    try:
-                        qty = abs(holding.Quantity)
-                        if qty > 0:
-                            self.MarketOrder(symbol, -qty, tag=f"Force Exit (fail#{fail_count})")
-                    except Exception as e:
-                        self.Debug(f"Force market exit error for {symbol.Value}: {e}")
-                    self._failed_exit_counts.pop(symbol, None)
-                    self.rsi_peaked_overbought.pop(symbol, None)
-                    self.entry_volumes.pop(symbol, None)
-                    self._choppy_regime_entries.pop(symbol, None)
+        if tp_ticket is not None and sl_ticket is not None:
+            self._bracket_orders[symbol] = {
+                'tp_id': tp_ticket.OrderId,
+                'sl_id': sl_ticket.OrderId,
+                'direction': direction,
+                'entry_price': fill_price,
+            }
+            dir_str = "LONG" if direction == 1 else "SHORT"
+            self.Debug(f"BRACKET: {symbol.Value} ({dir_str}) | TP=${tp_price:.2f} SL=${sl_price:.2f}")
+        else:
+            self.Debug(f"⚠️ BRACKET FAILED for {symbol.Value} — tp={tp_ticket} sl={sl_ticket}")
 
     def OnOrderEvent(self, event):
         try:
@@ -917,10 +712,7 @@ class MNQStrategy(QCAlgorithm):
                 self._pending_orders[symbol] += intended_qty
                 if symbol not in self._submitted_orders:
                     has_position = symbol in self.Portfolio and self.Portfolio[symbol].Invested
-                    if has_position:
-                        inferred_intent = 'exit'
-                    else:
-                        inferred_intent = 'entry'
+                    inferred_intent = 'exit' if has_position else 'entry'
                     self._submitted_orders[symbol] = {
                         'order_id': event.OrderId,
                         'time': self.Time,
@@ -934,68 +726,54 @@ class MNQStrategy(QCAlgorithm):
                     self._pending_orders[symbol] -= abs(event.FillQuantity)
                     if self._pending_orders[symbol] <= 0:
                         self._pending_orders.pop(symbol, None)
-                intended_dir = self._entry_directions.get(symbol, 1)
-                if symbol not in self.entry_prices:
-                    self.entry_prices[symbol] = event.FillPrice
-                    self.entry_times[symbol] = self.Time
-                    if intended_dir == -1:
-                        self.lowest_prices[symbol] = event.FillPrice
-                    else:
-                        self.highest_prices[symbol] = event.FillPrice
                 slip_log(self, symbol, event.Direction, event.FillPrice)
             elif event.Status == OrderStatus.Filled:
                 self._pending_orders.pop(symbol, None)
                 self._submitted_orders.pop(symbol, None)
                 self._order_retries.pop(event.OrderId, None)
-                # Determine entry vs exit using the ACTUAL portfolio quantity after the fill.
-                # This is robust against stale entry_prices / _entry_directions state and
-                # correctly handles short exits (Buy fills that reduce a negative qty) and
-                # long exits (Sell fills that reduce a positive qty).
-                post_fill_qty = self.Portfolio[symbol].Quantity if symbol in self.Portfolio else 0
-                is_long_entry = event.Direction == OrderDirection.Buy and post_fill_qty > 0
-                is_short_entry = event.Direction == OrderDirection.Sell and post_fill_qty < 0
-                if is_long_entry:
-                    self.entry_prices[symbol] = event.FillPrice
-                    self.highest_prices[symbol] = event.FillPrice
-                    self.entry_times[symbol] = self.Time
-                    self._entry_directions[symbol] = 1
+
+                # --- Entry fill: attach bracket orders ---
+                entry_info = self._pending_entry_info.pop(event.OrderId, None)
+                if entry_info is not None:
                     self.daily_trade_count += 1
-                    self.rsi_peaked_overbought.pop(symbol, None)
-                elif is_short_entry:
-                    self.entry_prices[symbol] = event.FillPrice
-                    self.lowest_prices[symbol] = event.FillPrice
-                    self.entry_times[symbol] = self.Time
-                    self._entry_directions[symbol] = -1
-                    self.daily_trade_count += 1
-                    self.rsi_peaked_overbought.pop(symbol, None)
+                    self._submit_bracket_orders(
+                        symbol,
+                        event.FillPrice,
+                        entry_info['direction'],
+                        entry_info['contracts'],
+                    )
                 else:
-                    # Exit: covering a short (Buy) or closing a long (Sell)
-                    if symbol in self._partial_sell_symbols:
-                        self._partial_sell_symbols.discard(symbol)
-                    else:
+                    # --- Bracket fill: cancel the other leg and record PnL ---
+                    bracket = self._bracket_orders.get(symbol)
+                    if bracket is not None:
                         order = self.Transactions.GetOrderById(event.OrderId)
                         exit_tag = order.Tag if order and order.Tag else "Unknown"
-                        entry = self.entry_prices.get(symbol, None)
-                        if entry is None:
-                            entry = event.FillPrice
-                            self.Debug(f"⚠️ WARNING: Missing entry price for {symbol.Value} exit, using fill price")
-                        # Infer PnL direction from fill direction:
-                        #   Buy = covering a short  → profit when fill < entry
-                        #   Sell = closing a long   → profit when fill > entry
-                        if event.Direction == OrderDirection.Buy:
-                            pnl = (entry - event.FillPrice) / entry if entry > 0 else 0
-                        else:
+                        if event.OrderId == bracket['tp_id']:
+                            # TP filled — cancel the SL
+                            try:
+                                self.Transactions.CancelOrder(bracket['sl_id'])
+                            except Exception as ce:
+                                self.Debug(f"Cancel SL error {symbol.Value}: {ce}")
+                        elif event.OrderId == bracket['sl_id']:
+                            # SL filled — cancel the TP
+                            try:
+                                self.Transactions.CancelOrder(bracket['tp_id'])
+                            except Exception as ce:
+                                self.Debug(f"Cancel TP error {symbol.Value}: {ce}")
+                        # Record PnL
+                        entry = bracket['entry_price']
+                        direction = bracket['direction']
+                        if direction == 1:
                             pnl = (event.FillPrice - entry) / entry if entry > 0 else 0
+                        else:
+                            pnl = (entry - event.FillPrice) / entry if entry > 0 else 0
                         self._rolling_wins.append(1 if pnl > 0 else 0)
-                        self._recent_trade_outcomes.append(1 if pnl > 0 else 0)
                         if pnl > 0:
                             self._rolling_win_sizes.append(pnl)
                             self.winning_trades += 1
-                            self.consecutive_losses = 0
                         else:
                             self._rolling_loss_sizes.append(abs(pnl))
                             self.losing_trades += 1
-                            self.consecutive_losses += 1
                         self.total_pnl += pnl
                         if exit_tag not in self.pnl_by_tag:
                             self.pnl_by_tag[exit_tag] = []
@@ -1006,64 +784,26 @@ class MNQStrategy(QCAlgorithm):
                             'pnl_pct': pnl,
                             'exit_reason': exit_tag,
                         })
-                        if len(self._recent_trade_outcomes) >= 12:
-                            recent_wr = sum(self._recent_trade_outcomes) / len(self._recent_trade_outcomes)
-                            if recent_wr < 0.25:
-                                self._cash_mode_until = self.Time + timedelta(minutes=30)
-                                self.Debug(f"⚠️ CASH MODE: WR={recent_wr:.0%} over {len(self._recent_trade_outcomes)} trades. Pausing 30min.")
+                        self.Debug(f"EXIT ({exit_tag}): {symbol.Value} | entry=${entry:.2f} exit=${event.FillPrice:.2f} PnL:{pnl:+.2%}")
+                        self._bracket_orders.pop(symbol, None)
                         cleanup_position(self, symbol)
-                        self._failed_exit_attempts.pop(symbol, None)
-                        self._failed_exit_counts.pop(symbol, None)
+
                 slip_log(self, symbol, event.Direction, event.FillPrice)
             elif event.Status == OrderStatus.Canceled:
                 self._pending_orders.pop(symbol, None)
                 self._submitted_orders.pop(symbol, None)
                 self._order_retries.pop(event.OrderId, None)
-                if symbol not in self.entry_prices and is_invested_not_dust(self, symbol):
-                    holding = self.Portfolio[symbol]
-                    self.entry_prices[symbol] = holding.AveragePrice
-                    self.entry_times[symbol] = self.Time
-                    if holding.Quantity < 0:
-                        self.lowest_prices[symbol] = holding.AveragePrice
-                        self._entry_directions[symbol] = -1
-                    else:
-                        self.highest_prices[symbol] = holding.AveragePrice
-                        self._entry_directions[symbol] = 1
-                    self.Debug(f"RE-TRACKED after cancel: {symbol.Value}")
+                # If a pending entry was canceled before filling, remove its info
+                self._pending_entry_info.pop(event.OrderId, None)
             elif event.Status == OrderStatus.Invalid:
                 self._pending_orders.pop(symbol, None)
                 self._submitted_orders.pop(symbol, None)
                 self._order_retries.pop(event.OrderId, None)
-                # Log the rejection reason so we can diagnose margin/other issues
+                self._pending_entry_info.pop(event.OrderId, None)
                 msg = getattr(event, 'Message', '') or ''
                 self.Debug(f"INVALID ORDER: {symbol.Value} dir={event.Direction} qty={event.Quantity} | Reason: {msg or 'unknown'}")
-                # Handle invalid exit orders: a Sell exiting a long OR a Buy covering a short
-                if is_invested_not_dust(self, symbol):
-                    holding = self.Portfolio[symbol]
-                    is_invalid_sell_exit = (event.Direction == OrderDirection.Sell and holding.Quantity > 0)
-                    is_invalid_buy_exit = (event.Direction == OrderDirection.Buy and holding.Quantity < 0)
-                    if is_invalid_sell_exit or is_invalid_buy_exit:
-                        fail_count = self._failed_exit_counts.get(symbol, 0) + 1
-                        self._failed_exit_counts[symbol] = fail_count
-                        exit_dir = "sell" if is_invalid_sell_exit else "buy"
-                        self.Debug(f"Invalid {exit_dir} exit #{fail_count}: {symbol.Value}")
-                        if fail_count >= 3:
-                            self.Debug(f"FORCE CLEANUP: {symbol.Value} after {fail_count} failed exits")
-                            cleanup_position(self, symbol)
-                            self._failed_exit_counts.pop(symbol, None)
-                        elif symbol not in self.entry_prices:
-                            self.entry_prices[symbol] = holding.AveragePrice
-                            self.entry_times[symbol] = self.Time
-                            if holding.Quantity < 0:
-                                self.lowest_prices[symbol] = holding.AveragePrice
-                                self._entry_directions[symbol] = -1
-                            else:
-                                self.highest_prices[symbol] = holding.AveragePrice
-                                self._entry_directions[symbol] = 1
-                            self.Debug(f"RE-TRACKED after invalid: {symbol.Value}")
                 # If this was a failed entry attempt (not invested), apply a cooldown
-                # to prevent the bot from spamming the same order every minute bar.
-                if not is_invested_not_dust(self, symbol) and symbol not in self.entry_prices:
+                if not is_invested_not_dust(self, symbol):
                     cooldown_until = self.Time + timedelta(minutes=self.invalid_entry_cooldown_minutes)
                     self._symbol_entry_cooldowns[symbol.Value] = cooldown_until
                     self.Debug(f"Entry cooldown set for {symbol.Value} until {cooldown_until} after invalid order")

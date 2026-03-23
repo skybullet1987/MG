@@ -139,39 +139,27 @@ def cancel_stale_new_orders(algo):
     try:
         open_orders = algo.Transactions.GetOpenOrders()
         timeout_seconds = effective_stale_timeout(algo)
+        # Collect bracket order IDs so we never cancel a live TP or SL order
+        bracket_ids = set()
+        if hasattr(algo, '_bracket_orders'):
+            for b in algo._bracket_orders.values():
+                bracket_ids.add(b.get('tp_id'))
+                bracket_ids.add(b.get('sl_id'))
         for order in open_orders:
+            # Never cancel bracket (TP/SL) legs — they are intentionally long-lived
+            if order.Id in bracket_ids:
+                continue
             order_time = order.Time
             if order_time.tzinfo is not None:
                 order_time = order_time.replace(tzinfo=None)
             order_age = (algo.Time - order_time).total_seconds()
             if order_age > timeout_seconds:
                 algo.Debug(f"Canceling stale: {order.Symbol.Value} (age: {order_age/60:.1f}m, timeout {timeout_seconds/60:.1f}m)")
-
-                if is_invested_not_dust(algo, order.Symbol):
-                    algo.Debug(f"STALE ORDER but position exists: {order.Symbol.Value} — re-tracking")
-                    holding = algo.Portfolio[order.Symbol]
-                    algo.entry_prices[order.Symbol] = holding.AveragePrice
-                    if holding.Quantity < 0:
-                        if hasattr(algo, 'lowest_prices'):
-                            algo.lowest_prices[order.Symbol] = holding.AveragePrice
-                        if hasattr(algo, '_entry_directions'):
-                            algo._entry_directions[order.Symbol] = -1
-                    else:
-                        algo.highest_prices[order.Symbol] = holding.AveragePrice
-                        if hasattr(algo, '_entry_directions'):
-                            algo._entry_directions[order.Symbol] = 1
-                    algo.entry_times[order.Symbol] = algo.Time
-                    algo.Transactions.CancelOrder(order.Id)
-                    continue
-
                 algo.Transactions.CancelOrder(order.Id)
                 algo._cancel_cooldowns[order.Symbol] = algo.Time + timedelta(minutes=algo.cancel_cooldown_minutes)
 
-                has_position_or_tracked = order.Symbol in algo.entry_prices or (
-                    order.Symbol in algo.Portfolio and algo.Portfolio[order.Symbol].Quantity != 0
-                )
-
-                if has_position_or_tracked:
+                has_position = is_invested_not_dust(algo, order.Symbol)
+                if has_position:
                     algo.Debug(f"STALE EXIT: {order.Symbol.Value} - cooldown only, not blacklisted")
                 else:
                     algo._symbol_entry_cooldowns[order.Symbol.Value] = algo.Time + timedelta(minutes=15)
@@ -182,55 +170,38 @@ def cancel_stale_new_orders(algo):
 
 def cleanup_position(algo, symbol, record_pnl=False, exit_price=None):
     """
-    Clean up position tracking for a symbol.
-    If record_pnl=True, records the PnL before cleanup using record_exit_pnl helper.
+    Clean up bracket order tracking for a symbol after a position is fully closed.
     """
-    entry_price = algo.entry_prices.get(symbol, None)
-    if record_pnl and entry_price is not None and entry_price > 0:
-        if exit_price is None:
-            try:
-                exit_price = algo.Securities[symbol].Price if symbol in algo.Securities else 0
-            except Exception:
-                exit_price = 0
-        if exit_price > 0:
-            record_exit_pnl(algo, symbol, entry_price, exit_price)
-    algo.entry_prices.pop(symbol, None)
-    algo.highest_prices.pop(symbol, None)
-    algo.lowest_prices.pop(symbol, None) if hasattr(algo, 'lowest_prices') else None
-    algo._entry_directions.pop(symbol, None) if hasattr(algo, '_entry_directions') else None
-    algo.entry_times.pop(symbol, None)
+    # Cancel any lingering bracket legs for this symbol
+    bracket = algo._bracket_orders.pop(symbol, None) if hasattr(algo, '_bracket_orders') else None
+    if bracket is not None:
+        for order_id in (bracket.get('tp_id'), bracket.get('sl_id')):
+            if order_id is not None:
+                try:
+                    algo.Transactions.CancelOrder(order_id)
+                except Exception:
+                    pass
     # Clear trail_stop on instrument_data for this contract
     if hasattr(algo, 'instrument_data') and symbol in algo.instrument_data:
         algo.instrument_data[symbol]['trail_stop'] = None
-    if hasattr(algo, '_spike_entries'):
-        algo._spike_entries.pop(symbol, None)
-    if hasattr(algo, '_partial_tp_taken'):
-        algo._partial_tp_taken.pop(symbol, None)
-    if hasattr(algo, '_breakeven_stops'):
-        algo._breakeven_stops.pop(symbol, None)
 
 
 def sync_existing_positions(algo):
-    """Sync existing futures positions on startup (no AddCrypto needed — futures already added)."""
+    """Sync existing futures positions on startup. Any open positions have bracket orders
+    submitted immediately so exits are handled natively."""
     algo.Debug("=" * 50)
     algo.Debug("=== SYNCING EXISTING POSITIONS ===")
     synced_count = 0
-    positions_to_close = []
     for symbol in algo.Portfolio.Keys:
         if not is_invested_not_dust(algo, symbol):
             continue
         holding = algo.Portfolio[symbol]
         ticker = symbol.Value
-        if symbol in algo.entry_prices:
-            continue
         if symbol not in algo.Securities:
             algo.Debug(f"RESYNC: {ticker} not in Securities — skipping (futures may not be active contract)")
             continue
-        algo.entry_prices[symbol] = holding.AveragePrice
-        algo.highest_prices[symbol] = holding.AveragePrice
-        if hasattr(algo, 'lowest_prices'):
-            algo.lowest_prices[symbol] = holding.AveragePrice
-        algo.entry_times[symbol] = algo.Time
+        if symbol in algo._bracket_orders:
+            continue
         synced_count += 1
         current_price = algo.Securities[symbol].Price if symbol in algo.Securities else holding.Price
         is_short = holding.Quantity < 0
@@ -239,21 +210,20 @@ def sync_existing_positions(algo):
         else:
             pnl_pct = (current_price - holding.AveragePrice) / holding.AveragePrice if holding.AveragePrice > 0 else 0
         algo.Debug(f"SYNCED: {ticker} | Entry: ${holding.AveragePrice:.2f} | Now: ${current_price:.2f} | PnL: {pnl_pct:+.2%}")
-        if not is_short and current_price > holding.AveragePrice:
-            algo.highest_prices[symbol] = current_price
+        # Re-establish bracket orders for the existing position
         if pnl_pct >= algo.base_take_profit:
-            positions_to_close.append((symbol, ticker, pnl_pct, "Sync TP"))
+            algo.Debug(f"IMMEDIATE TP (Sync): {ticker} at {pnl_pct:+.2%}")
+            smart_liquidate(algo, symbol, "Sync TP")
         elif pnl_pct <= -algo.base_stop_loss:
-            positions_to_close.append((symbol, ticker, pnl_pct, "Sync SL"))
+            algo.Debug(f"IMMEDIATE SL (Sync): {ticker} at {pnl_pct:+.2%}")
+            smart_liquidate(algo, symbol, "Sync SL")
+        elif hasattr(algo, '_submit_bracket_orders'):
+            direction = -1 if is_short else 1
+            contracts = abs(int(holding.Quantity))
+            algo._submit_bracket_orders(symbol, holding.AveragePrice, direction, contracts)
     algo.Debug(f"Synced {synced_count} futures positions")
     algo.Debug(f"Portfolio: ${algo.Portfolio.TotalPortfolioValue:.2f}")
     algo.Debug("=" * 50)
-    for symbol, ticker, pnl_pct, reason in positions_to_close:
-        algo.Debug(f"IMMEDIATE {reason}: {ticker} at {pnl_pct:+.2%}")
-        sold = smart_liquidate(algo, symbol, reason)
-        if not sold:
-            algo.Debug(f"⚠️ IMMEDIATE {reason} FAILED: {ticker} — cleaning up tracking")
-            cleanup_position(algo, symbol)
 
 
 def debug_limited(algo, msg):
@@ -304,10 +274,8 @@ def persist_state(algo):
             "winning_trades": algo.winning_trades,
             "losing_trades": algo.losing_trades,
             "total_pnl": algo.total_pnl,
-            "consecutive_losses": algo.consecutive_losses,
             "daily_trade_count": algo.daily_trade_count,
             "trade_count": algo.trade_count,
-            "peak_value": algo.peak_value if algo.peak_value is not None else 0,
         }
         algo.ObjectStore.Save("live_state", json.dumps(state))
     except Exception as e:
@@ -323,12 +291,8 @@ def load_persisted_state(algo):
             algo.winning_trades = data.get("winning_trades", 0)
             algo.losing_trades = data.get("losing_trades", 0)
             algo.total_pnl = data.get("total_pnl", 0.0)
-            algo.consecutive_losses = data.get("consecutive_losses", 0)
             algo.daily_trade_count = data.get("daily_trade_count", 0)
             algo.trade_count = data.get("trade_count", 0)
-            peak = data.get("peak_value", 0)
-            if peak > 0:
-                algo.peak_value = peak
             algo.Debug(f"Loaded persisted state: trades W:{algo.winning_trades}/L:{algo.losing_trades}")
     except Exception as e:
         algo.Debug(f"Load persist error: {e}")
@@ -405,54 +369,23 @@ def verify_order_fills(algo):
         order_age_seconds = (current_time - order_info['time']).total_seconds()
         order_id = order_info['order_id']
         timeout = algo.order_timeout_seconds
-        intent = order_info.get('intent', 'entry')
 
         if order_age_seconds > algo.order_fill_check_threshold_seconds:
             try:
                 order = algo.Transactions.GetOrderById(order_id)
                 if order is not None and order.Status == OrderStatus.Filled:
-                    if intent == 'exit':
-                        entry = algo.entry_prices.get(symbol, None)
-                        if entry:
-                            current_price = algo.Securities[symbol].Price if symbol in algo.Securities else None
-                            if current_price is not None and current_price > 0:
-                                pnl = record_exit_pnl(algo, symbol, entry, current_price)
-                                if pnl is not None:
-                                    algo.Debug(f"⚠️ MISSED EXIT FILL: {symbol.Value} | PnL: {pnl:+.2%}")
-                            cleanup_position(algo, symbol)
-                        symbols_to_remove.append(symbol)
-                        algo._order_retries.pop(order_id, None)
-                        continue
-                    else:
-                        if symbol in algo.Portfolio and algo.Portfolio[symbol].Invested:
-                            holding = algo.Portfolio[symbol]
-                            entry_price = holding.AveragePrice
-                            if symbol not in algo.entry_prices:
-                                algo.entry_prices[symbol] = entry_price
-                                algo.highest_prices[symbol] = entry_price
-                                algo.entry_times[symbol] = order_info['time']
-                                algo.daily_trade_count += 1
-                                algo.Debug(f"FILL VERIFIED (missed event): {symbol.Value} | Entry: ${entry_price:.2f}")
-                        symbols_to_remove.append(symbol)
-                        algo._order_retries.pop(order_id, None)
-                        continue
-            except Exception as e:
-                algo.Debug(f"Error checking order status for {symbol.Value}: {e}")
-
-            if intent == 'exit':
-                holding = algo.Portfolio[symbol] if symbol in algo.Portfolio else None
-                if holding is None or not holding.Invested or holding.Quantity == 0:
-                    entry = algo.entry_prices.get(symbol, None)
-                    if entry:
-                        current_price = algo.Securities[symbol].Price if symbol in algo.Securities else None
-                        if current_price is not None and current_price > 0:
-                            pnl = record_exit_pnl(algo, symbol, entry, current_price)
-                            if pnl is not None:
-                                algo.Debug(f"⚠️ PHANTOM EXIT DETECTED: {symbol.Value} | PnL: {pnl:+.2%}")
-                        cleanup_position(algo, symbol)
                     symbols_to_remove.append(symbol)
                     algo._order_retries.pop(order_id, None)
                     continue
+            except Exception as e:
+                algo.Debug(f"Error checking order status for {symbol.Value}: {e}")
+
+            # Check if position is already gone
+            holding = algo.Portfolio[symbol] if symbol in algo.Portfolio else None
+            if holding is None or not holding.Invested or holding.Quantity == 0:
+                symbols_to_remove.append(symbol)
+                algo._order_retries.pop(order_id, None)
+                continue
 
         if order_age_seconds > timeout:
             retry_count = algo._order_retries.get(order_id, 0)
@@ -492,31 +425,12 @@ def health_check(algo):
     if algo.Portfolio.Cash < 500:
         issues.append(f"Low cash: ${algo.Portfolio.Cash:.2f}")
 
-    for symbol in list(algo.entry_prices.keys()):
-        open_orders = algo.Transactions.GetOpenOrders(symbol)
-        if len(open_orders) > 0:
-            all_stale = True
-            for o in open_orders:
-                order_time = normalize_order_time(o.Time)
-                if (algo.Time - order_time).total_seconds() <= algo.live_stale_order_timeout_seconds:
-                    all_stale = False
-                    break
-            if not all_stale:
-                continue
-            for o in open_orders:
-                try:
-                    algo.Transactions.CancelOrder(o.Id)
-                    issues.append(f"Canceled stale order: {symbol.Value}")
-                except Exception as e:
-                    algo.Debug(f"Error canceling stale order for {symbol.Value}: {e}")
-
+    # Check for any stale bracket orders whose position has been closed
+    bracket_orders = getattr(algo, '_bracket_orders', {})
+    for symbol, bracket in list(bracket_orders.items()):
         if not is_invested_not_dust(algo, symbol):
-            issues.append(f"Orphan tracking: {symbol.Value}")
+            issues.append(f"Orphan bracket: {symbol.Value} — position closed, cleaning brackets")
             cleanup_position(algo, symbol)
-
-    for kvp in algo.Portfolio:
-        if is_invested_not_dust(algo, kvp.Key) and kvp.Key not in algo.entry_prices:
-            issues.append(f"Untracked position: {kvp.Key.Value}")
 
     open_orders = algo.Transactions.GetOpenOrders()
     if len(open_orders) > 0:
@@ -532,8 +446,8 @@ def health_check(algo):
 
 def resync_holdings_full(algo):
     """
-    Live-only safety: backfill tracking for any holdings not registered via OnOrderEvent.
-    Adapted for futures: no AddCrypto calls, just track by Symbol directly.
+    Live-only safety: detect any holdings not covered by bracket orders and
+    re-establish brackets so they have native exits.
     """
     if algo.IsWarmingUp:
         return
@@ -541,84 +455,45 @@ def resync_holdings_full(algo):
         return
 
     if not hasattr(algo, '_last_resync_log') or (algo.Time - algo._last_resync_log).total_seconds() > algo.resync_log_interval_seconds:
-        algo.Debug(f"RESYNC CHECK: tracked={len(algo.entry_prices)}")
+        bracket_count = len(getattr(algo, '_bracket_orders', {}))
+        algo.Debug(f"RESYNC CHECK: brackets={bracket_count}")
         algo._last_resync_log = algo.Time
 
-    # Forward resync: find holdings we're not tracking
-    missing = []
+    bracket_orders = getattr(algo, '_bracket_orders', {})
+
+    # Forward resync: find holdings without bracket coverage
     for symbol in algo.Portfolio.Keys:
         if not is_invested_not_dust(algo, symbol):
             continue
-        if symbol in algo.entry_prices:
+        if symbol in bracket_orders:
             continue
         if symbol in algo._submitted_orders:
-            continue
-        if symbol in algo._exit_cooldowns and algo.Time < algo._exit_cooldowns[symbol]:
             continue
         if has_non_stale_open_orders(algo, symbol):
             continue
-        missing.append(symbol)
+        try:
+            holding = algo.Portfolio[symbol]
+            is_short = holding.Quantity < 0
+            direction = -1 if is_short else 1
+            contracts = abs(int(holding.Quantity))
+            current_price = algo.Securities[symbol].Price if symbol in algo.Securities else holding.Price
+            algo.Debug(f"RESYNCED: {symbol.Value} | Qty: {holding.Quantity} | Entry: ${holding.AveragePrice:.2f}")
+            if hasattr(algo, '_submit_bracket_orders'):
+                algo._submit_bracket_orders(symbol, holding.AveragePrice, direction, contracts)
+        except Exception as e:
+            algo.Debug(f"Resync error {symbol.Value}: {e}")
 
-    if missing:
-        algo.Debug(f"RESYNC: detected {len(missing)} holdings without tracking; backfilling.")
-        for symbol in missing:
-            try:
-                holding = algo.Portfolio[symbol]
-                entry = holding.AveragePrice
-                algo.entry_prices[symbol] = entry
-                algo.entry_times[symbol] = algo.Time
-                if holding.Quantity < 0:
-                    if hasattr(algo, 'lowest_prices'):
-                        algo.lowest_prices[symbol] = entry
-                    if hasattr(algo, '_entry_directions'):
-                        algo._entry_directions[symbol] = -1
-                else:
-                    algo.highest_prices[symbol] = entry
-                    if hasattr(algo, '_entry_directions'):
-                        algo._entry_directions[symbol] = 1
-                current_price = algo.Securities[symbol].Price if symbol in algo.Securities else holding.Price
-                if holding.Quantity < 0:
-                    pnl_pct = (entry - current_price) / entry if entry > 0 else 0
-                else:
-                    pnl_pct = (current_price - entry) / entry if entry > 0 else 0
-                algo.Debug(f"RESYNCED: {symbol.Value} | Qty: {holding.Quantity} | Entry: ${entry:.2f} | Now: ${current_price:.2f} | PnL: {pnl_pct:+.2%}")
-            except Exception as e:
-                algo.Debug(f"Resync error {symbol.Value}: {e}")
-
-    # Reverse resync: detect phantom positions
-    phantoms = []
-    for symbol in list(algo.entry_prices.keys()):
+    # Reverse resync: detect phantom bracket tracking (bracket exists but no position)
+    for symbol in list(bracket_orders.keys()):
         if symbol in algo._submitted_orders:
-            continue
-        if symbol in algo._exit_cooldowns and algo.Time < algo._exit_cooldowns[symbol]:
             continue
         holding = algo.Portfolio[symbol] if symbol in algo.Portfolio else None
         if holding is None or not holding.Invested or holding.Quantity == 0:
-            open_orders = algo.Transactions.GetOpenOrders(symbol)
-            if len(open_orders) > 0:
-                all_stuck = True
-                for o in open_orders:
-                    order_time = normalize_order_time(o.Time)
-                    if (algo.Time - order_time).total_seconds() <= algo.live_stale_order_timeout_seconds:
-                        all_stuck = False
-                        break
-                if not all_stuck:
-                    continue
-                for o in open_orders:
-                    try:
-                        algo.Transactions.CancelOrder(o.Id)
-                    except Exception as e:
-                        algo.Debug(f"Error canceling stuck order for {symbol.Value}: {e}")
-            phantoms.append(symbol)
-
-    if phantoms:
-        algo.Debug(f"⚠️ REVERSE RESYNC: detected {len(phantoms)} phantom positions")
-        for symbol in phantoms:
-            algo.Debug(f"⚠️ PHANTOM POSITION: {symbol.Value} — tracked but broker qty=0, cleaning up")
-            cleanup_position(algo, symbol, record_pnl=True)
+            algo.Debug(f"⚠️ PHANTOM BRACKET: {symbol.Value} — tracked but broker qty=0, cleaning up")
+            cleanup_position(algo, symbol)
             if hasattr(algo, 'exit_cooldown_hours') and hasattr(algo, '_exit_cooldowns'):
                 algo._exit_cooldowns[symbol] = algo.Time + timedelta(hours=algo.exit_cooldown_hours)
-        persist_state(algo)
+    persist_state(algo)
 
 
 def normalize_order_time(order_time):
@@ -637,11 +512,9 @@ def record_exit_pnl(algo, symbol, entry_price, exit_price, exit_tag="Unknown"):
     if pnl > 0:
         algo._rolling_win_sizes.append(pnl)
         algo.winning_trades += 1
-        algo.consecutive_losses = 0
     else:
         algo._rolling_loss_sizes.append(abs(pnl))
         algo.losing_trades += 1
-        algo.consecutive_losses += 1
     algo.total_pnl += pnl
     if not hasattr(algo, 'pnl_by_tag'):
         algo.pnl_by_tag = {}
@@ -681,14 +554,16 @@ def portfolio_sanity_check(algo):
     tracked_value = 0.0
     tracked_positions = {}
 
-    for sym in list(algo.entry_prices.keys()):
+    for kvp in algo.Portfolio:
+        sym = kvp.Key
+        if not is_invested_not_dust(algo, sym):
+            continue
         if sym in algo.Securities:
             price = algo.Securities[sym].Price
-            if sym in algo.Portfolio:
-                qty = algo.Portfolio[sym].Quantity
-                value = abs(qty) * price
-                tracked_value += value
-                tracked_positions[sym.Value] = {'qty': qty, 'price': price, 'value': value}
+            qty = kvp.Value.Quantity
+            value = abs(qty) * price
+            tracked_value += value
+            tracked_positions[sym.Value] = {'qty': qty, 'price': price, 'value': value}
 
     expected = cash + tracked_value
     abs_diff = abs(total_qc - expected)
@@ -742,8 +617,8 @@ def daily_report(algo):
     for kvp in algo.Portfolio:
         if is_invested_not_dust(algo, kvp.Key):
             s = kvp.Key
-            entry = algo.entry_prices.get(s, kvp.Value.AveragePrice)
             cur = algo.Securities[s].Price if s in algo.Securities else kvp.Value.Price
+            entry = kvp.Value.AveragePrice
             pnl = (cur - entry) / entry if entry > 0 else 0
             qty = kvp.Value.Quantity
             algo.Debug(f"  {s.Value}: qty={qty} ${entry:.2f}→${cur:.2f} ({pnl:+.2%})")
