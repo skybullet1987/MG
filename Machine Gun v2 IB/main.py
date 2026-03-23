@@ -745,8 +745,10 @@ class MNQStrategy(QCAlgorithm):
                 self.entry_times[symbol] = self.Time
                 if kvp.Value.Quantity < 0:
                     self.lowest_prices[symbol] = kvp.Value.AveragePrice
+                    self._entry_directions[symbol] = -1
                 else:
                     self.highest_prices[symbol] = kvp.Value.AveragePrice
+                    self._entry_directions[symbol] = 1
                 self.Debug(f"ORPHAN RECOVERY: {symbol.Value} re-tracked")
 
     def _check_exit(self, symbol, price, holding):
@@ -760,8 +762,10 @@ class MNQStrategy(QCAlgorithm):
             self.entry_times[symbol] = self.Time
             if holding.Quantity < 0:
                 self.lowest_prices[symbol] = holding.AveragePrice
+                self._entry_directions[symbol] = -1
             else:
                 self.highest_prices[symbol] = holding.AveragePrice
+                self._entry_directions[symbol] = 1
 
         is_short = holding.Quantity < 0
         entry = self.entry_prices[symbol]
@@ -935,23 +939,29 @@ class MNQStrategy(QCAlgorithm):
                 self._pending_orders.pop(symbol, None)
                 self._submitted_orders.pop(symbol, None)
                 self._order_retries.pop(event.OrderId, None)
-                intended_dir = self._entry_directions.get(symbol, 1)
-                is_new_entry = symbol not in self.entry_prices
-                is_long_entry = is_new_entry and event.Direction == OrderDirection.Buy and intended_dir == 1
-                is_short_entry = is_new_entry and event.Direction == OrderDirection.Sell and intended_dir == -1
+                # Determine entry vs exit using the ACTUAL portfolio quantity after the fill.
+                # This is robust against stale entry_prices / _entry_directions state and
+                # correctly handles short exits (Buy fills that reduce a negative qty) and
+                # long exits (Sell fills that reduce a positive qty).
+                post_fill_qty = self.Portfolio[symbol].Quantity if symbol in self.Portfolio else 0
+                is_long_entry = event.Direction == OrderDirection.Buy and post_fill_qty > 0
+                is_short_entry = event.Direction == OrderDirection.Sell and post_fill_qty < 0
                 if is_long_entry:
                     self.entry_prices[symbol] = event.FillPrice
                     self.highest_prices[symbol] = event.FillPrice
                     self.entry_times[symbol] = self.Time
+                    self._entry_directions[symbol] = 1
                     self.daily_trade_count += 1
                     self.rsi_peaked_overbought.pop(symbol, None)
                 elif is_short_entry:
                     self.entry_prices[symbol] = event.FillPrice
                     self.lowest_prices[symbol] = event.FillPrice
                     self.entry_times[symbol] = self.Time
+                    self._entry_directions[symbol] = -1
                     self.daily_trade_count += 1
                     self.rsi_peaked_overbought.pop(symbol, None)
                 else:
+                    # Exit: covering a short (Buy) or closing a long (Sell)
                     if symbol in self._partial_sell_symbols:
                         self._partial_sell_symbols.discard(symbol)
                     else:
@@ -961,7 +971,10 @@ class MNQStrategy(QCAlgorithm):
                         if entry is None:
                             entry = event.FillPrice
                             self.Debug(f"⚠️ WARNING: Missing entry price for {symbol.Value} exit, using fill price")
-                        if intended_dir == -1:
+                        # Infer PnL direction from fill direction:
+                        #   Buy = covering a short  → profit when fill < entry
+                        #   Sell = closing a long   → profit when fill > entry
+                        if event.Direction == OrderDirection.Buy:
                             pnl = (entry - event.FillPrice) / entry if entry > 0 else 0
                         else:
                             pnl = (event.FillPrice - entry) / entry if entry > 0 else 0
@@ -1004,8 +1017,10 @@ class MNQStrategy(QCAlgorithm):
                     self.entry_times[symbol] = self.Time
                     if holding.Quantity < 0:
                         self.lowest_prices[symbol] = holding.AveragePrice
+                        self._entry_directions[symbol] = -1
                     else:
                         self.highest_prices[symbol] = holding.AveragePrice
+                        self._entry_directions[symbol] = 1
                     self.Debug(f"RE-TRACKED after cancel: {symbol.Value}")
             elif event.Status == OrderStatus.Invalid:
                 self._pending_orders.pop(symbol, None)
@@ -1014,20 +1029,29 @@ class MNQStrategy(QCAlgorithm):
                 # Log the rejection reason so we can diagnose margin/other issues
                 msg = getattr(event, 'Message', '') or ''
                 self.Debug(f"INVALID ORDER: {symbol.Value} dir={event.Direction} qty={event.Quantity} | Reason: {msg or 'unknown'}")
-                if event.Direction == OrderDirection.Sell:
-                    fail_count = self._failed_exit_counts.get(symbol, 0) + 1
-                    self._failed_exit_counts[symbol] = fail_count
-                    self.Debug(f"Invalid sell #{fail_count}: {symbol.Value}")
-                    if fail_count >= 3:
-                        self.Debug(f"FORCE CLEANUP: {symbol.Value} after {fail_count} failed exits")
-                        cleanup_position(self, symbol)
-                        self._failed_exit_counts.pop(symbol, None)
-                    elif symbol not in self.entry_prices:
-                        if is_invested_not_dust(self, symbol):
-                            holding = self.Portfolio[symbol]
+                # Handle invalid exit orders: a Sell exiting a long OR a Buy covering a short
+                if is_invested_not_dust(self, symbol):
+                    holding = self.Portfolio[symbol]
+                    is_invalid_sell_exit = (event.Direction == OrderDirection.Sell and holding.Quantity > 0)
+                    is_invalid_buy_exit = (event.Direction == OrderDirection.Buy and holding.Quantity < 0)
+                    if is_invalid_sell_exit or is_invalid_buy_exit:
+                        fail_count = self._failed_exit_counts.get(symbol, 0) + 1
+                        self._failed_exit_counts[symbol] = fail_count
+                        exit_dir = "sell" if is_invalid_sell_exit else "buy"
+                        self.Debug(f"Invalid {exit_dir} exit #{fail_count}: {symbol.Value}")
+                        if fail_count >= 3:
+                            self.Debug(f"FORCE CLEANUP: {symbol.Value} after {fail_count} failed exits")
+                            cleanup_position(self, symbol)
+                            self._failed_exit_counts.pop(symbol, None)
+                        elif symbol not in self.entry_prices:
                             self.entry_prices[symbol] = holding.AveragePrice
-                            self.highest_prices[symbol] = holding.AveragePrice
                             self.entry_times[symbol] = self.Time
+                            if holding.Quantity < 0:
+                                self.lowest_prices[symbol] = holding.AveragePrice
+                                self._entry_directions[symbol] = -1
+                            else:
+                                self.highest_prices[symbol] = holding.AveragePrice
+                                self._entry_directions[symbol] = 1
                             self.Debug(f"RE-TRACKED after invalid: {symbol.Value}")
                 # If this was a failed entry attempt (not invested), apply a cooldown
                 # to prevent the bot from spamming the same order every minute bar.

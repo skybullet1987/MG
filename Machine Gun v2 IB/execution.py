@@ -54,6 +54,8 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
     Liquidate a futures position. Futures trade in whole contracts — no dust,
     no minimum notional, no fee reserve required.
     """
+    if not tag:
+        tag = "Exit"
     if len(algo.Transactions.GetOpenOrders(symbol)) > 0:
         return False
     if symbol not in algo.Portfolio or algo.Portfolio[symbol].Quantity == 0:
@@ -152,8 +154,12 @@ def cancel_stale_new_orders(algo):
                     if holding.Quantity < 0:
                         if hasattr(algo, 'lowest_prices'):
                             algo.lowest_prices[order.Symbol] = holding.AveragePrice
+                        if hasattr(algo, '_entry_directions'):
+                            algo._entry_directions[order.Symbol] = -1
                     else:
                         algo.highest_prices[order.Symbol] = holding.AveragePrice
+                        if hasattr(algo, '_entry_directions'):
+                            algo._entry_directions[order.Symbol] = 1
                     algo.entry_times[order.Symbol] = algo.Time
                     algo.Transactions.CancelOrder(order.Id)
                     continue
@@ -560,10 +566,21 @@ def resync_holdings_full(algo):
                 holding = algo.Portfolio[symbol]
                 entry = holding.AveragePrice
                 algo.entry_prices[symbol] = entry
-                algo.highest_prices[symbol] = entry
                 algo.entry_times[symbol] = algo.Time
+                if holding.Quantity < 0:
+                    if hasattr(algo, 'lowest_prices'):
+                        algo.lowest_prices[symbol] = entry
+                    if hasattr(algo, '_entry_directions'):
+                        algo._entry_directions[symbol] = -1
+                else:
+                    algo.highest_prices[symbol] = entry
+                    if hasattr(algo, '_entry_directions'):
+                        algo._entry_directions[symbol] = 1
                 current_price = algo.Securities[symbol].Price if symbol in algo.Securities else holding.Price
-                pnl_pct = (current_price - entry) / entry if entry > 0 else 0
+                if holding.Quantity < 0:
+                    pnl_pct = (entry - current_price) / entry if entry > 0 else 0
+                else:
+                    pnl_pct = (current_price - entry) / entry if entry > 0 else 0
                 algo.Debug(f"RESYNCED: {symbol.Value} | Qty: {holding.Quantity} | Entry: ${entry:.2f} | Now: ${current_price:.2f} | PnL: {pnl_pct:+.2%}")
             except Exception as e:
                 algo.Debug(f"Resync error {symbol.Value}: {e}")
