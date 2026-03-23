@@ -25,12 +25,12 @@ class MNQStrategy(QCAlgorithm):
         self.SetCash(3000)  # Need ~$1,300 margin per MNQ contract
         self.SetBrokerageModel(BrokerageName.InteractiveBrokersBrokerage, AccountType.Margin)
 
-        self.entry_threshold = 0.50
+        self.entry_threshold = 0.75
         self.high_conviction_threshold = 0.60
 
         # TP/SL Parameters — recalibrated for MNQ micro-scalp
         self.quick_take_profit = self._get_param("quick_take_profit", 0.0025)  # 0.25% (~50 NQ points)
-        self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.0015)  # 0.15% (~30 NQ points)
+        self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.002)   # 0.20% (~40 NQ points)
         self.atr_tp_mult  = self._get_param("atr_tp_mult",  2.5)
         self.atr_sl_mult  = self._get_param("atr_sl_mult",  1.5)
         self.trail_activation  = self._get_param("trail_activation",  0.005)   # 0.5%
@@ -45,7 +45,7 @@ class MNQStrategy(QCAlgorithm):
         self.trailing_stop_pct   = self.trail_stop_pct
         self.base_stop_loss      = self.tight_stop_loss
         self.base_take_profit    = self.quick_take_profit
-        self.atr_trail_mult      = 2.0
+        self.atr_trail_mult      = 3.5
 
         # Position sizing — contract-based, not percentage-based
         self.max_contracts     = 2       # Max 2 contracts per instrument
@@ -71,7 +71,7 @@ class MNQStrategy(QCAlgorithm):
         # Fee parameters — flat rate, not percentage
         self.expected_round_trip_fees = 1.26   # $1.26 per RT (not percentage!)
         self.fee_slippage_buffer      = 0.50   # $0.50 buffer
-        self.min_expected_profit_pct  = 0.001  # 0.1% — lower threshold for low-ATR periods
+        self.min_expected_profit_pct  = 0.0015  # 0.15% — ensure ATR-based move covers fees/spread
         self.adx_min_period           = 10
 
         self.skip_hours_utc         = []
@@ -498,6 +498,11 @@ class MNQStrategy(QCAlgorithm):
         long_score, long_components = self._scoring_engine.calculate_scalp_score(mnq)
         short_score, short_components = self._scoring_engine.calculate_short_score(mnq)
 
+        # Require a minimum score gap to avoid trading on mixed/choppy signals
+        min_gap = 0.15
+        if abs(long_score - short_score) < min_gap:
+            return None
+
         if short_score > long_score and short_score >= self._get_threshold():
             components = short_components.copy()
             components['_scalp_score'] = short_score
@@ -616,9 +621,12 @@ class MNQStrategy(QCAlgorithm):
             self._log_skip("circuit breaker active")
             return
 
-        # VIX-based position limit in extreme regimes
-        if self.vix_value >= 35:
-            self._log_skip(f"VIX extreme ({self.vix_value:.1f}) — halting new entries")
+        # VIX-based position limit — avoid choppy (< 12) and erratic (> 25) regimes
+        if self.vix_value < 12:
+            self._log_skip(f"VIX too low ({self.vix_value:.1f}) — market too slow/choppy")
+            return
+        if self.vix_value > 25:
+            self._log_skip(f"VIX too high ({self.vix_value:.1f}) — market too erratic/dangerous")
             return
 
         if len(self.Transactions.GetOpenOrders()) >= self.max_concurrent_open_orders:
