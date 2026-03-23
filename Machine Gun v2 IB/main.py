@@ -265,7 +265,7 @@ class MNQStrategy(QCAlgorithm):
         if self.LiveMode:
             cleanup_object_store(self)
             load_persisted_state(self)
-            self.Debug("=== LIVE TRADING (MNQ/M2K/MGC MICRO-SCALP) v8.0.0 ===")
+            self.Debug("=== LIVE TRADING (MNQ/M2K/MGC MICRO-SCALP) v{} ===".format(self._cfg.VERSION))
             self.Debug("Capital: ${:.2f} | Mode: {}".format(self.Portfolio.Cash, self._cfg.MODE))
 
     def CustomSecurityInitializer(self, security):
@@ -348,7 +348,7 @@ class MNQStrategy(QCAlgorithm):
                 for order in open_orders:
                     self.Transactions.CancelOrder(order.Id)
         except Exception as e:
-            self.Debug("Error canceling stale orders: {}".format(e))
+            self.Debug("Error canceling stale orders: {}: {}".format(type(e).__name__, e))
 
     # -------------------------------------------------------------------------
     # Instrument data factory
@@ -670,7 +670,7 @@ class MNQStrategy(QCAlgorithm):
             candidates = evaluate_all_setups(
                 active_contract, mnq,
                 self.market_regime, session, self.vix_value,
-                self._cfg,
+                self._cfg, log_fn=self.Debug,
             )
             for c in candidates:
                 self.diagnostics.record_candidate_generated(c)
@@ -706,6 +706,8 @@ class MNQStrategy(QCAlgorithm):
                 continue
 
             sym = candidate.symbol
+            # Skip if we already queued an order for this symbol this rebalance tick
+            # (ranking may surface the same symbol via different setup families)
             if sym in used_symbols:
                 continue
 
@@ -745,7 +747,7 @@ class MNQStrategy(QCAlgorithm):
                         candidate.setup_type, dir_str, sym.Value,
                         contracts, price, candidate.score, candidate.components_str()))
             except Exception as e:
-                self.Debug("ORDER FAILED: {} - {}".format(sym.Value, e))
+                self.Debug("ORDER FAILED: {} - {}: {}".format(sym.Value, type(e).__name__, e))
 
         self._last_skip_reason = None
 
@@ -1037,7 +1039,8 @@ class MNQStrategy(QCAlgorithm):
                     self.Debug("Entry cooldown: {} until {}".format(symbol.Value, cooldown_until))
 
         except Exception as e:
-            self.Debug("OnOrderEvent error: {}".format(e))
+            self.Debug("OnOrderEvent error for {}: {}: {}".format(
+                getattr(event, "Symbol", "?"), type(e).__name__, e))
 
         if self.LiveMode:
             persist_state(self)

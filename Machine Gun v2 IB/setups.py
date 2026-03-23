@@ -756,15 +756,24 @@ def evaluate_breakout_compression(symbol, mnq, regime, session, vix, config):
 # Top-level: evaluate all enabled setups for one symbol
 # =============================================================================
 
-def evaluate_all_setups(symbol, mnq, regime, session, vix, config):
+def evaluate_all_setups(symbol, mnq, regime, session, vix, config, log_fn=None):
     """
     Evaluate all enabled setup families for a single active contract.
 
     Returns a list of SetupCandidates (may be empty if no setup fires).
     Each candidate is independent — the best one (by score) will be chosen
     by the portfolio selector, not here.
+
+    Parameters
+    ----------
+    log_fn : callable, optional
+        A function accepting a single string argument (e.g. algo.Debug).
+        When provided, any exception raised inside an individual setup evaluator
+        is logged rather than silently discarded.  Individual setup errors never
+        block the evaluation of the other setups.
     """
     candidates = []
+    sym_name = symbol.Value if hasattr(symbol, "Value") else str(symbol)
 
     try:
         if config.ENABLE_TREND_PULLBACK:
@@ -772,7 +781,9 @@ def evaluate_all_setups(symbol, mnq, regime, session, vix, config):
             if c is not None:
                 candidates.append(c)
     except Exception as e:
-        pass   # individual setup errors must not stop other setups
+        # Log but continue — one setup error must not block the others
+        if log_fn is not None:
+            log_fn("setup error [trend_pullback] {}: {}: {}".format(sym_name, type(e).__name__, e))
 
     try:
         if config.ENABLE_MEAN_REVERSION:
@@ -780,7 +791,8 @@ def evaluate_all_setups(symbol, mnq, regime, session, vix, config):
             if c is not None:
                 candidates.append(c)
     except Exception as e:
-        pass
+        if log_fn is not None:
+            log_fn("setup error [mean_reversion] {}: {}: {}".format(sym_name, type(e).__name__, e))
 
     try:
         if config.ENABLE_BREAKOUT_COMPRESSION:
@@ -788,6 +800,7 @@ def evaluate_all_setups(symbol, mnq, regime, session, vix, config):
             if c is not None:
                 candidates.append(c)
     except Exception as e:
-        pass
+        if log_fn is not None:
+            log_fn("setup error [breakout_compression] {}: {}: {}".format(sym_name, type(e).__name__, e))
 
     return candidates
