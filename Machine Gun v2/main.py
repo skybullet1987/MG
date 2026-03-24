@@ -32,13 +32,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.SetCash(1000)
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
-        self.entry_threshold = 0.50
-        self.high_conviction_threshold = 0.60
+        self.entry_threshold = 0.60
+        self.high_conviction_threshold = 0.75
 
         self.quick_take_profit = self._get_param("quick_take_profit", 0.150)
         self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.035)
-        self.atr_tp_mult  = self._get_param("atr_tp_mult",  4.0)
-        self.atr_sl_mult  = self._get_param("atr_sl_mult",  2.0)
+        self.atr_tp_mult  = self._get_param("atr_tp_mult",  6.0)
+        self.atr_sl_mult  = self._get_param("atr_sl_mult",  2.5)
         self.trail_activation  = self._get_param("trail_activation",  0.040)
         self.trail_stop_pct    = self._get_param("trail_stop_pct",    0.025)
         self.time_stop_hours   = self._get_param("time_stop_hours",   3.0)
@@ -51,11 +51,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.trailing_stop_pct   = self.trail_stop_pct
         self.base_stop_loss      = self.tight_stop_loss
         self.base_take_profit    = self.quick_take_profit
-        self.atr_trail_mult      = 2.0
+        self.atr_trail_mult      = 3.5
 
-        self.position_size_pct  = 0.80
-        self.base_max_positions = 6
-        self.max_positions      = 6
+        self.position_size_pct  = 0.50
+        self.base_max_positions = 3
+        self.max_positions      = 3
         self.min_notional       = 5.5
         self.max_position_usd   = self._get_param("max_position_usd", 500.0)  # $500 cap prevents over-concentration at scale
         self.min_price_usd      = 0.001
@@ -75,14 +75,14 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.max_spread_pct         = 0.008
         self.spread_median_window   = 12
         self.spread_widen_mult      = 2.5
-        self.min_dollar_volume_usd  = 20000
-        self.min_volume_usd         = 10000
+        self.min_dollar_volume_usd  = 100000
+        self.min_volume_usd         = 100000
 
         self.skip_hours_utc         = []
         self.max_daily_trades       = 24000
         self.daily_trade_count      = 0
         self.last_trade_date        = None
-        self.exit_cooldown_hours    = 1.0
+        self.exit_cooldown_hours    = 2.0
         self.cancel_cooldown_minutes = 1
         self.max_symbol_trades_per_day = 3
 
@@ -1131,9 +1131,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 if crypto:
                     crypto['trail_stop'] = trail_level
                 if crypto and crypto['trail_stop'] is not None:
-                    if holding.Quantity > 0 and price <= crypto['trail_stop']:
+                    if minutes >= 15 and holding.Quantity > 0 and price <= crypto['trail_stop']:
                         tag = "ATR Trail"
-                    elif holding.Quantity < 0 and price >= crypto['trail_stop']:
+                    elif minutes >= 15 and holding.Quantity < 0 and price >= crypto['trail_stop']:
                         tag = "ATR Trail"
 
             if not tag and hours >= self.time_stop_hours and pnl < self.time_stop_pnl_min:
