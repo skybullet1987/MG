@@ -1,18 +1,30 @@
 # region imports
 from AlgorithmImports import *
 from execution import *
-from scoring import MicroScalpEngine
 import numpy as np
 from datetime import timedelta
 from mg2_data import is_ready, annualized_vol, compute_portfolio_risk_estimate
 # endregion
 
 """
-mg2_entries.py — Setup-Driven Entry Logic for Machine Gun v2
+mg2_entries.py — Concentrated Entry Logic for Leader Breakout v0
+================================================================
+Evaluates the focused universe with the single IgnitionBreakout setup,
+selects at most the top 1–2 candidates ranked by leadership quality,
+and executes entries with concentrated two-tier sizing.
 
 Also owns trade attribution (DiagnosticsEngine / TradeRecord) so that
-per-trade metadata is kept alongside the entry logic that generates it.
+per-trade metadata lives alongside the entry logic that generates it.
 """
+
+# During a bear market regime, require higher setup confidence
+BEAR_REGIME_MIN_CONFIDENCE = 0.70
+
+# Max candidates to execute per rebalance cycle (the "concentrated" part)
+MAX_NEW_POSITIONS_PER_CYCLE = 2
+
+# Minimum dollar volume required for a symbol to be a valid candidate
+MIN_CANDIDATE_DOLLAR_VOLUME = 80_000   # 80k USD per bar (on top of universe filter)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Trade Attribution — DiagnosticsEngine
@@ -22,37 +34,24 @@ class TradeRecord:
     """Full metadata record for one completed round-trip trade."""
 
     __slots__ = [
-        # Identity
         'symbol', 'entry_time', 'exit_time',
-        # Setup attribution
         'setup_type', 'confidence',
-        # Entry signal components (dict: name → value)
         'entry_components',
-        # Market context at entry
         'market_regime', 'volatility_regime',
-        'btc_5bar_return', 'rs_vs_btc',
-        # Execution quality
+        'btc_5bar_return', 'rs_vs_btc', 'rs_medium',
         'spread_at_entry', 'spread_at_exit',
         'estimated_slippage_entry', 'realized_slippage_exit',
-        # Performance
         'entry_price', 'exit_price',
-        'gross_pnl_pct',  # (exit - entry) / entry
-        'net_pnl_pct',    # gross minus round-trip fee estimate
-        # Exit
+        'gross_pnl_pct', 'net_pnl_pct',
         'exit_tag', 'hold_minutes',
-        # Misc
-        'breakout_freshness', 'atr_at_entry',
+        'breakout_freshness', 'vol_ratio', 'atr_at_entry',
     ]
 
     def __init__(self):
         for s in self.__slots__:
             setattr(self, s, None)
 
-    def to_dict(self):
-        return {s: getattr(self, s) for s in self.__slots__}
-
-    def net_pnl_estimate(self, fee_pct=0.006):
-        """Estimate net PnL after round-trip fees if not already set."""
+    def net_pnl_estimate(self, fee_pct=0.008):
         if self.gross_pnl_pct is not None:
             slip = (self.estimated_slippage_entry or 0.0) + (self.realized_slippage_exit or 0.0)
             return self.gross_pnl_pct - fee_pct - slip
@@ -62,64 +61,58 @@ class TradeRecord:
 class DiagnosticsEngine:
     """
     Lightweight trade attribution engine.
-    Stores completed trade records and provides summary statistics.
+    Records per-trade metadata and provides summary statistics.
     """
 
-    # Fee estimate for net PnL calculation (round-trip: entry + exit, taker)
-    ROUND_TRIP_FEE_PCT = 0.008  # 0.4% × 2 taker fills = 0.8% (conservative)
+    ROUND_TRIP_FEE_PCT = 0.008  # 0.4% × 2 taker fills = 0.8%
 
     def __init__(self, algo):
         self.algo = algo
         self._open_records = {}   # symbol → TradeRecord (in-progress)
-        self.completed = []       # list of completed TradeRecord
-
-    # ── Entry recording ───────────────────────────────────────────────────────
+        self.completed     = []   # list of completed TradeRecord
 
     def record_entry(self, symbol, setup_type, confidence, components,
                      entry_price, spread_at_entry=None, estimated_slippage=None):
         algo = self.algo
         rec = TradeRecord()
-        rec.symbol        = symbol.Value if hasattr(symbol, 'Value') else str(symbol)
-        rec.entry_time    = algo.Time
-        rec.setup_type    = setup_type or 'Unknown'
-        rec.confidence    = confidence
-        rec.entry_components = {k: v for k, v in components.items()
-                                if not k.startswith('_') and k != 'setup_type'}
-        rec.market_regime     = algo.market_regime
-        rec.volatility_regime = algo.volatility_regime
-        rec.spread_at_entry   = spread_at_entry
+        rec.symbol             = symbol.Value if hasattr(symbol, 'Value') else str(symbol)
+        rec.entry_time         = algo.Time
+        rec.setup_type         = setup_type or 'Unknown'
+        rec.confidence         = confidence
+        rec.entry_components   = {k: v for k, v in (components or {}).items()
+                                  if not k.startswith('_') and k != 'setup_type'}
+        rec.market_regime      = algo.market_regime
+        rec.volatility_regime  = algo.volatility_regime
+        rec.spread_at_entry    = spread_at_entry
         rec.estimated_slippage_entry = estimated_slippage
-        rec.entry_price       = entry_price
+        rec.entry_price        = entry_price
+        rec.vol_ratio          = components.get('vol_ratio') if components else None
+        rec.breakout_freshness = components.get('freshness') if components else None
 
         btc_rets = list(algo.btc_returns)
-        if len(btc_rets) >= 5:
-            rec.btc_5bar_return = float(sum(btc_rets[-5:]))
-        else:
-            rec.btc_5bar_return = None
+        rec.btc_5bar_return = float(sum(btc_rets[-5:])) if len(btc_rets) >= 5 else None
 
         crypto = algo.crypto_data.get(symbol)
         if crypto:
             rs_hist = list(crypto.get('rs_vs_btc', []))
-            rec.rs_vs_btc = float(rs_hist[-1]) if rs_hist else None
-            rec.breakout_freshness = crypto.get('breakout_freshness', None)
+            rec.rs_vs_btc  = float(rs_hist[-1]) if rs_hist else None
+            rec.rs_medium  = float(crypto.get('rs_vs_btc_medium', 0.0))
             rec.atr_at_entry = (float(crypto['atr'].Current.Value)
                                 if crypto.get('atr') and crypto['atr'].IsReady else None)
 
         self._open_records[symbol] = rec
 
-    # ── Exit recording ────────────────────────────────────────────────────────
-
     def record_exit(self, symbol, exit_price, exit_tag,
                     realized_slippage=None, spread_at_exit=None):
         algo = self.algo
-        rec = self._open_records.pop(symbol, None)
+        rec  = self._open_records.pop(symbol, None)
         if rec is None:
             return
 
-        rec.exit_time  = algo.Time
-        rec.exit_price = exit_price
-        rec.exit_tag   = exit_tag
-        rec.spread_at_exit = spread_at_exit
+        rec.exit_time              = algo.Time
+        rec.exit_price             = exit_price
+        rec.exit_tag               = exit_tag
+        rec.spread_at_exit         = spread_at_exit
         rec.realized_slippage_exit = realized_slippage
 
         if rec.entry_price and rec.entry_price > 0:
@@ -131,52 +124,20 @@ class DiagnosticsEngine:
 
         self.completed.append(rec)
 
-    # ── Statistics ────────────────────────────────────────────────────────────
-
-    def stats_by_setup(self):
-        by_setup = {}
-        for rec in self.completed:
-            st = rec.setup_type or 'Unknown'
-            if st not in by_setup:
-                by_setup[st] = []
-            by_setup[st].append(rec)
-
-        result = {}
-        for st, records in by_setup.items():
-            pnls_net = [r.net_pnl_pct for r in records if r.net_pnl_pct is not None]
-            wins = [p for p in pnls_net if p > 0]
-            losses = [p for p in pnls_net if p <= 0]
-            result[st] = {
-                'count':       len(records),
-                'win_rate':    len(wins) / len(pnls_net) if pnls_net else 0.0,
-                'avg_win':     float(np.mean(wins))   if wins   else 0.0,
-                'avg_loss':    float(np.mean(losses)) if losses else 0.0,
-                'avg_net_pnl': float(np.mean(pnls_net)) if pnls_net else 0.0,
-                'total_net_pnl': float(sum(pnls_net)) if pnls_net else 0.0,
-                'profit_factor': (sum(wins) / abs(sum(losses))
-                                  if losses and sum(losses) != 0 else float('inf')),
-                'avg_hold_min': float(np.mean([r.hold_minutes for r in records
-                                               if r.hold_minutes is not None])),
-            }
-        return result
-
     def stats_by_exit(self):
         by_exit = {}
         for rec in self.completed:
             tag = rec.exit_tag or 'Unknown'
-            if tag not in by_exit:
-                by_exit[tag] = []
-            by_exit[tag].append(rec)
-
+            by_exit.setdefault(tag, []).append(rec)
         result = {}
         for tag, records in by_exit.items():
             pnls = [r.net_pnl_pct for r in records if r.net_pnl_pct is not None]
             result[tag] = {
-                'count':       len(records),
-                'avg_net_pnl': float(np.mean(pnls)) if pnls else 0.0,
+                'count':         len(records),
+                'avg_net_pnl':   float(np.mean(pnls)) if pnls else 0.0,
                 'total_net_pnl': float(sum(pnls)) if pnls else 0.0,
-                'win_rate':    (sum(1 for p in pnls if p > 0) / len(pnls)
-                                if pnls else 0.0),
+                'win_rate':      (sum(1 for p in pnls if p > 0) / len(pnls)
+                                  if pnls else 0.0),
             }
         return result
 
@@ -184,9 +145,7 @@ class DiagnosticsEngine:
         by_regime = {}
         for rec in self.completed:
             regime = rec.market_regime or 'unknown'
-            if regime not in by_regime:
-                by_regime[regime] = []
-            by_regime[regime].append(rec)
+            by_regime.setdefault(regime, []).append(rec)
         result = {}
         for regime, records in by_regime.items():
             pnls = [r.net_pnl_pct for r in records if r.net_pnl_pct is not None]
@@ -200,35 +159,26 @@ class DiagnosticsEngine:
 
     def print_summary(self):
         algo = self.algo
-        n = len(self.completed)
+        n    = len(self.completed)
         if n == 0:
             algo.Debug("DIAGNOSTICS: No completed trades to report.")
             return
 
         all_pnls = [r.net_pnl_pct for r in self.completed if r.net_pnl_pct is not None]
-        wins  = [p for p in all_pnls if p > 0]
-        losses = [p for p in all_pnls if p <= 0]
+        wins     = [p for p in all_pnls if p > 0]
+        losses   = [p for p in all_pnls if p <= 0]
 
         algo.Debug("=" * 60)
-        algo.Debug(f"DIAGNOSTICS SUMMARY — {n} completed trades")
+        algo.Debug(f"LEADER BREAKOUT v0 SUMMARY — {n} completed trades")
         if all_pnls:
-            algo.Debug(f"  Win rate:       {len(wins)/len(all_pnls):.1%}")
-            algo.Debug(f"  Avg net PnL:    {float(np.mean(all_pnls)):.2%}")
+            algo.Debug(f"  Win rate:     {len(wins)/len(all_pnls):.1%}")
+            algo.Debug(f"  Avg net PnL:  {float(np.mean(all_pnls)):.2%}")
         if wins:
-            algo.Debug(f"  Avg win:        {float(np.mean(wins)):.2%}")
+            algo.Debug(f"  Avg win:      {float(np.mean(wins)):.2%}")
         if losses:
-            algo.Debug(f"  Avg loss:       {float(np.mean(losses)):.2%}")
-        if wins and losses:
-            pf = sum(wins) / abs(sum(losses))
-            algo.Debug(f"  Profit factor:  {pf:.2f}")
-
-        algo.Debug("─── By Setup Type ───")
-        for st, stats in self.stats_by_setup().items():
-            algo.Debug(
-                f"  {st}: n={stats['count']} wr={stats['win_rate']:.1%} "
-                f"avg={stats['avg_net_pnl']:+.2%} pf={stats['profit_factor']:.2f} "
-                f"hold={stats['avg_hold_min']:.0f}min"
-            )
+            algo.Debug(f"  Avg loss:     {float(np.mean(losses)):.2%}")
+        if wins and losses and sum(losses) != 0:
+            algo.Debug(f"  Profit factor:{sum(wins)/abs(sum(losses)):.2f}")
 
         algo.Debug("─── By Exit Tag ───")
         for tag, stats in self.stats_by_exit().items():
@@ -246,89 +196,31 @@ class DiagnosticsEngine:
 
         algo.Debug("=" * 60)
 
-    def print_open_positions(self):
-        """Log currently open (un-exited) trade records."""
-        algo = self.algo
-        if not self._open_records:
-            return
-        algo.Debug(f"DIAGNOSTICS: {len(self._open_records)} open positions tracked:")
-        for sym, rec in self._open_records.items():
-            sym_name = sym.Value if hasattr(sym, 'Value') else str(sym)
-            price = algo.Securities[sym].Price if sym in algo.Securities else 0
-            if rec.entry_price and rec.entry_price > 0 and price > 0:
-                unreal_pnl = (price - rec.entry_price) / rec.entry_price
-                algo.Debug(f"  {sym_name}: setup={rec.setup_type} conf={rec.confidence:.2f} "
-                           f"entry=${rec.entry_price:.4f} now=${price:.4f} "
-                           f"pnl={unreal_pnl:+.2%} hold={rec.hold_minutes or '?'}min")
 
-
-# During a bear market regime, only trade very high-confidence setups
-BEAR_REGIME_MIN_CONFIDENCE = 0.70
-
-
-def _normalize(v, mn, mx):
-    if mx - mn <= 0:
-        return 0.5
-    return max(0, min(1, (v - mn) / (mx - mn)))
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def log_skip(algo, reason):
     if algo.LiveMode:
         debug_limited(algo, f"Rebalance skip: {reason}")
-        algo._last_skip_reason = reason
-    elif reason != algo._last_skip_reason:
+    elif reason != getattr(algo, '_last_skip_reason', None):
         debug_limited(algo, f"Rebalance skip: {reason}")
-        algo._last_skip_reason = reason
+    algo._last_skip_reason = reason
 
 
-def calculate_factor_scores(algo, symbol, crypto):
-    """
-    Evaluate momentum-breakout setups for a symbol.
-
-    Returns a components dict that includes:
-    - '_scalp_score'  : float confidence (0-1)
-    - '_direction'    : 1 (long-only)
-    - '_long_score'   : same as confidence
-    - 'setup_type'    : str name of the winning setup or None
-    - all setup-specific component keys
-
-    Returns an empty dict if no setup qualifies or data is insufficient.
-    """
-    setup_type, confidence, components = algo._scoring_engine.evaluate_setup(crypto)
-
-    if setup_type is None or confidence == 0.0:
-        return {}   # No valid setup — do not enter
-
-    # Spread penalty: widen spread → reduce effective confidence
-    sp = get_spread_pct(algo, symbol)
-    if sp is not None and sp > 0:
-        spread_penalty = min((sp / 0.006) * 0.12, 0.15)
-        confidence = max(0.0, confidence * (1.0 - spread_penalty))
-
-    # Bear-regime gate: higher bar during downtrend
-    if algo.market_regime == "bear" and confidence < BEAR_REGIME_MIN_CONFIDENCE:
-        return {}
-
-    result = dict(components)
-    result['_scalp_score']  = confidence
-    result['_direction']    = 1
-    result['_long_score']   = confidence
-    result['_spread_at_entry'] = sp
-    return result
-
-
-def calculate_composite_score(algo, factors, crypto=None):
-    """Return the pre-computed confidence from the setup evaluator."""
-    return factors.get('_scalp_score', 0.0)
-
-
-def apply_fee_adjustment(algo, score):
-    """Return score unchanged – entry thresholds already require meaningful moves."""
-    return score
+def daily_loss_exceeded(algo):
+    if algo._daily_open_value is None or algo._daily_open_value <= 0:
+        return False
+    current = algo.Portfolio.TotalPortfolioValue
+    if current <= 0:
+        return True
+    drop = (algo._daily_open_value - current) / algo._daily_open_value
+    return drop >= 0.04
 
 
 def check_correlation(algo, new_symbol):
-    """Reject candidate if it is too correlated with any existing position."""
+    """Reject candidate if it is too correlated with an existing position."""
     if not algo.entry_prices:
         return True
     new_crypto = algo.crypto_data.get(new_symbol)
@@ -355,16 +247,31 @@ def check_correlation(algo, new_symbol):
     return True
 
 
-def daily_loss_exceeded(algo):
-    """Returns True if the portfolio has dropped >= 4% from today's open value."""
-    if algo._daily_open_value is None or algo._daily_open_value <= 0:
-        return False
-    current = algo.Portfolio.TotalPortfolioValue
-    if current <= 0:
-        return True
-    drop = (algo._daily_open_value - current) / algo._daily_open_value
-    return drop >= 0.04   # raised from 3% to give the algo more room to run
+def _leadership_rank(cand):
+    """
+    Composite leadership rank for sorting candidates.
+    Higher = stronger leader.  Used to pick the top 1–2.
+    """
+    f = cand.get('factors', {})
+    rs_short  = float(f.get('rs_short',  0.0))
+    rs_medium = float(f.get('rs_medium', 0.0))
+    vol_ratio = float(f.get('vol_ratio', 0.0))
+    freshness = int(f.get('freshness',   5))
+    conf      = float(cand.get('net_score', 0.0))
 
+    fresh_score = 1.0 if freshness == 0 else (0.7 if freshness == 1 else 0.4)
+
+    return (
+        (rs_short + rs_medium) * 0.35 +
+        min(vol_ratio / 10.0, 1.0)    * 0.25 +
+        fresh_score                    * 0.20 +
+        conf                           * 0.20
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main entry-point: rebalance
+# ─────────────────────────────────────────────────────────────────────────────
 
 def rebalance(algo):
     if algo.IsWarmingUp:
@@ -374,13 +281,13 @@ def rebalance(algo):
         log_skip(algo, "max daily loss exceeded")
         return
 
-    # BTC dump filter: don't enter during rapid BTC sell-off
-    if len(algo.btc_returns) >= 5 and sum(list(algo.btc_returns)[-5:]) < -0.012:
+    # BTC dump filter
+    if len(algo.btc_returns) >= 5 and sum(list(algo.btc_returns)[-5:]) < -0.015:
         log_skip(algo, "BTC dumping")
         return
 
     if algo._cash_mode_until is not None and algo.Time < algo._cash_mode_until:
-        log_skip(algo, "cash mode - poor recent performance")
+        log_skip(algo, "cash mode")
         return
 
     algo.log_budget = 20
@@ -407,7 +314,7 @@ def rebalance(algo):
     if algo.drawdown_cooldown > 0:
         algo.drawdown_cooldown -= 1
         if algo.drawdown_cooldown <= 0:
-            algo.peak_value = val
+            algo.peak_value         = val
             algo.consecutive_losses = 0
         else:
             log_skip(algo, f"drawdown cooldown {algo.drawdown_cooldown}h")
@@ -420,41 +327,28 @@ def rebalance(algo):
         return
 
     if algo.consecutive_losses >= algo.max_consecutive_losses:
-        algo.drawdown_cooldown = 3
-        algo._consecutive_loss_halve_remaining = 3
-        algo.consecutive_losses = 0
-        log_skip(algo, "consecutive loss cooldown (5 losses)")
+        algo.drawdown_cooldown                  = algo.cooldown_hours
+        algo._consecutive_loss_halve_remaining  = 3
+        algo.consecutive_losses                 = 0
+        log_skip(algo, "max consecutive losses — cooldown")
         return
-    if algo.consecutive_losses >= 4:
-        algo.circuit_breaker_expiry = algo.Time + timedelta(hours=1)
-        algo.consecutive_losses = 0
-        log_skip(algo, "circuit breaker triggered (4 consecutive losses)")
-        return
+
     if algo.circuit_breaker_expiry is not None and algo.Time < algo.circuit_breaker_expiry:
         log_skip(algo, "circuit breaker active")
         return
 
     pos_count = get_actual_position_count(algo)
     if pos_count >= algo.max_positions:
-        log_skip(algo, "at max positions")
         return
-
-    fg_value = getattr(algo, 'fear_greed_value', 50)
-    if fg_value >= 85:
-        effective_max_pos = max(1, algo.max_positions // 2)
-        if pos_count >= effective_max_pos:
-            log_skip(algo, f"Fear&Greed extreme greed ({fg_value}) — reduced max positions")
-            return
 
     if len(algo.Transactions.GetOpenOrders()) >= algo.max_concurrent_open_orders:
         log_skip(algo, "too many open orders")
         return
 
-    # ── Score every symbol that has a valid setup ──────────────────────────
-    count_scored        = 0
-    count_above_thresh  = 0
-    scores              = []
-    threshold_now       = algo.entry_threshold  # now interpreted as min confidence
+    # ── Evaluate universe: collect IgnitionBreakout candidates ───────────────
+    candidates        = []
+    count_evaluated   = 0
+    reject_reasons    = {}
 
     for symbol in list(algo.crypto_data.keys()):
         if symbol.Value in SYMBOL_BLACKLIST or symbol.Value in algo._session_blacklist:
@@ -464,89 +358,106 @@ def rebalance(algo):
             continue
         if has_open_orders(algo, symbol):
             continue
+        if is_invested_not_dust(algo, symbol):
+            continue
         if not spread_ok(algo, symbol):
+            reject_reasons['spread'] = reject_reasons.get('spread', 0) + 1
             continue
 
         crypto = algo.crypto_data[symbol]
         if not is_ready(crypto):
             continue
 
-        factor_scores = calculate_factor_scores(algo, symbol, crypto)
-        if not factor_scores:
+        count_evaluated += 1
+
+        # Dollar-volume filter (pre-screen before setup evaluation)
+        dv_list = list(crypto.get('dollar_volume', []))
+        if len(dv_list) >= 6:
+            recent_dv = float(np.mean(dv_list[-6:]))
+            if recent_dv < MIN_CANDIDATE_DOLLAR_VOLUME:
+                reject_reasons['dollar_volume'] = reject_reasons.get('dollar_volume', 0) + 1
+                continue
+
+        setup_type, confidence, components = algo._scoring_engine.evaluate_setup(crypto)
+        if setup_type is None:
+            reason = components.get('_reject', 'no_setup')
+            reject_reasons[reason] = reject_reasons.get(reason, 0) + 1
             continue
-        count_scored += 1
 
-        composite_score = calculate_composite_score(algo, factor_scores, crypto)
-        net_score       = apply_fee_adjustment(algo, composite_score)
+        # Bear-regime gate: tighter confidence requirement
+        if algo.market_regime == "bear" and confidence < BEAR_REGIME_MIN_CONFIDENCE:
+            reject_reasons['bear_regime'] = reject_reasons.get('bear_regime', 0) + 1
+            continue
 
-        crypto['recent_net_scores'].append(net_score)
+        spread_at_entry = get_spread_pct(algo, symbol)
 
-        if net_score >= threshold_now:
-            # Require setup to persist for at least 2 of the last 3 bars
-            if len(crypto['recent_net_scores']) >= 3:
-                above_count = sum(1 for s in list(crypto['recent_net_scores'])[-3:]
-                                  if s >= threshold_now)
-                if above_count < 2:
-                    continue
-            count_above_thresh += 1
-            scores.append({
-                'symbol':          symbol,
-                'setup_type':      factor_scores.get('setup_type'),
-                'composite_score': composite_score,
-                'net_score':       net_score,
-                'factors':         factor_scores,
-                'volatility':      (crypto['volatility'][-1]
-                                    if len(crypto['volatility']) > 0 else 0.05),
-                'dollar_volume':   (list(crypto['dollar_volume'])[-6:]
-                                    if len(crypto['dollar_volume']) >= 6 else []),
-                'spread_at_entry': factor_scores.get('_spread_at_entry'),
-            })
+        candidates.append({
+            'symbol':          symbol,
+            'setup_type':      setup_type,
+            'confidence':      confidence,
+            'net_score':       confidence,
+            'factors':         components,
+            'volatility':      (float(crypto['volatility'][-1])
+                                if len(crypto.get('volatility', [])) > 0 else 0.05),
+            'dollar_volume':   dv_list[-6:] if len(dv_list) >= 6 else dv_list,
+            'spread_at_entry': spread_at_entry,
+        })
 
     try:
         cash = algo.Portfolio.CashBook["USD"].Amount
     except (KeyError, AttributeError):
         cash = algo.Portfolio.Cash
 
-    # ── Throttled REBALANCE logging — avoid per-minute browser flooding ───────
-    # Log only every 5 minutes, OR when candidate count is notably high (>10),
-    # OR when a new candidate count vs last logged count is significantly different.
-    _now = algo.Time
-    _last_log = getattr(algo, '_last_rebalance_log_time', None)
-    _last_count = getattr(algo, '_last_rebalance_log_count', -1)
-    _log_interval_minutes = 5
+    # ── No candidates: log periodically, not every minute ────────────────────
+    _now       = algo.Time
+    _last_log  = getattr(algo, '_last_rebalance_log_time', None)
+    _log_every = 10   # minutes between summary logs when nothing qualifies
     _should_log = (
         _last_log is None
-        or (_now - _last_log).total_seconds() >= _log_interval_minutes * 60
-        or count_above_thresh >= 10          # warn if unusually high
-        or abs(count_above_thresh - _last_count) >= 5  # notable change
+        or (_now - _last_log).total_seconds() >= _log_every * 60
+        or len(candidates) > 0
     )
-    if _should_log:
-        algo.Debug(f"REBALANCE: {count_above_thresh}/{count_scored} setup-qualified "
-                   f"thresh={threshold_now:.2f} | cash=${cash:.2f}")
-        algo._last_rebalance_log_time  = _now
-        algo._last_rebalance_log_count = count_above_thresh
 
-    if not scores:
-        log_skip(algo, "no setup candidates qualified")
+    if not candidates:
+        if _should_log:
+            top_rejects = sorted(reject_reasons.items(), key=lambda x: -x[1])[:3]
+            reject_str  = " | ".join(f"{k}:{v}" for k, v in top_rejects)
+            algo.Debug(
+                f"SCAN: {count_evaluated} evaluated, 0 qualified "
+                f"({reject_str}) | {algo.market_regime} | ${cash:.0f}"
+            )
+            algo._last_rebalance_log_time = _now
+        algo._last_skip_reason = "no_candidates"
         return
 
-    # Sort by confidence descending (highest-conviction first)
-    scores.sort(key=lambda x: x['net_score'], reverse=True)
+    # ── Rank by leadership quality and take top candidates ────────────────────
+    candidates.sort(key=_leadership_rank, reverse=True)
 
-    # ── Log top candidates (max 3) so we can see what would trade ─────────────
-    if scores and _should_log:
-        top = scores[:3]
-        for cand in top:
-            algo.Debug(
-                f"  TOP: {cand['symbol'].Value} setup={cand['setup_type']} "
-                f"conf={cand['net_score']:.3f}"
-            )
+    # Log top candidates (always when we have any)
+    algo.Debug(
+        f"CANDIDATES: {len(candidates)} qualified | "
+        f"taking top {min(MAX_NEW_POSITIONS_PER_CYCLE, len(candidates))} | "
+        f"{algo.market_regime}/{algo.volatility_regime} | ${cash:.0f}"
+    )
+    for cand in candidates[:3]:
+        f = cand['factors']
+        algo.Debug(
+            f"  {cand['symbol'].Value} conf={cand['confidence']:.2f} "
+            f"rs={f.get('rs_short', 0):.4f}+{f.get('rs_medium', 0):.4f} "
+            f"vol={f.get('vol_ratio', 0):.1f}x fresh={f.get('freshness', 99)}"
+        )
 
-    algo._last_skip_reason = None
-    execute_trades(algo, scores, threshold_now)
+    algo._last_rebalance_log_time = _now
+    algo._last_skip_reason        = None
+
+    execute_trades(algo, candidates[:MAX_NEW_POSITIONS_PER_CYCLE])
 
 
-def execute_trades(algo, candidates, threshold_now):
+# ─────────────────────────────────────────────────────────────────────────────
+# execute_trades — place orders for selected candidates
+# ─────────────────────────────────────────────────────────────────────────────
+
+def execute_trades(algo, candidates):
     if not algo._positions_synced:
         return
     if algo.LiveMode and algo.kraken_status in ("maintenance", "cancel_only"):
@@ -565,85 +476,51 @@ def execute_trades(algo, candidates, threshold_now):
     open_buy_orders_value = get_open_buy_orders_value(algo)
 
     if available_cash <= 0:
-        debug_limited(algo, f"SKIP TRADES: No cash available (${available_cash:.2f})")
+        debug_limited(algo, f"SKIP TRADES: No cash (${available_cash:.2f})")
         return
     if open_buy_orders_value > available_cash * algo.open_orders_cash_threshold:
-        debug_limited(algo, (f"SKIP TRADES: ${open_buy_orders_value:.2f} reserved "
-                             f"(>{algo.open_orders_cash_threshold:.0%} of ${available_cash:.2f})"))
+        debug_limited(algo, f"SKIP TRADES: ${open_buy_orders_value:.2f} reserved")
         return
 
-    reject_pending_orders    = 0
-    reject_open_orders       = 0
-    reject_already_invested  = 0
-    reject_spread            = 0
-    reject_exit_cooldown     = 0
-    reject_loss_cooldown     = 0
-    reject_correlation       = 0
-    reject_price_invalid     = 0
-    reject_price_too_low     = 0
-    reject_cash_reserve      = 0
-    reject_min_qty_too_large = 0
-    reject_dollar_volume     = 0
-    reject_notional          = 0
-    success_count            = 0
+    success_count = 0
 
     for cand in candidates:
         if algo.daily_trade_count >= algo.max_daily_trades:
             break
         if get_actual_position_count(algo) >= algo.max_positions:
             break
+        if success_count >= MAX_NEW_POSITIONS_PER_CYCLE:
+            break
 
         sym        = cand['symbol']
-        net_score  = cand.get('net_score', 0.5)
-        setup_type = cand.get('setup_type', 'Unknown')
+        confidence = cand.get('confidence', 0.55)
+        setup_type = cand.get('setup_type', 'IgnitionBreakout')
 
+        # Final per-symbol checks
         if sym in algo._pending_orders and algo._pending_orders[sym] > 0:
-            reject_pending_orders += 1
             continue
         if has_open_orders(algo, sym):
-            reject_open_orders += 1
             continue
         if is_invested_not_dust(algo, sym):
-            reject_already_invested += 1
             continue
         if not spread_ok(algo, sym):
-            reject_spread += 1
             continue
-
-        # Live: depth check
-        if algo.LiveMode:
-            _crypto_depth = algo.crypto_data.get(sym)
-            if _crypto_depth:
-                bid_size = _crypto_depth.get('bid_size', 0)
-                if bid_size > 0:
-                    _sec_depth   = algo.Securities[sym]
-                    _price_depth = _sec_depth.Price if _sec_depth.Price > 0 else 1
-                    _estimated_val = algo.Portfolio.TotalPortfolioValue * 0.35
-                    _our_qty = _estimated_val / _price_depth
-                    if _our_qty > bid_size * 0.20:
-                        continue
-
         if sym in algo._exit_cooldowns and algo.Time < algo._exit_cooldowns[sym]:
-            reject_exit_cooldown += 1
             continue
         if (sym.Value in algo._symbol_entry_cooldowns
                 and algo.Time < algo._symbol_entry_cooldowns[sym.Value]):
-            reject_loss_cooldown += 1
             continue
         if sym in algo._symbol_loss_cooldowns and algo.Time < algo._symbol_loss_cooldowns[sym]:
-            reject_loss_cooldown += 1
             continue
         if not check_correlation(algo, sym):
-            reject_correlation += 1
+            algo.Debug(f"SKIP {sym.Value}: correlated with existing position")
             continue
 
         sec   = algo.Securities[sym]
         price = sec.Price
         if price is None or price <= 0:
-            reject_price_invalid += 1
             continue
         if price < algo.min_price_usd:
-            reject_price_too_low += 1
             continue
 
         try:
@@ -655,20 +532,18 @@ def execute_trades(algo, candidates, threshold_now):
         pending_exit_fees = 0
         for _exit_sym in list(algo.entry_prices.keys()):
             if is_invested_not_dust(algo, _exit_sym):
-                _holding_val = abs(algo.Portfolio[_exit_sym].Quantity) * algo.Securities[_exit_sym].Price
-                pending_exit_fees += _holding_val * 0.004
+                _hval = abs(algo.Portfolio[_exit_sym].Quantity) * algo.Securities[_exit_sym].Price
+                pending_exit_fees += _hval * 0.004
         available_cash = max(0, available_cash - open_buy_orders_value - pending_exit_fees)
         total_value    = algo.Portfolio.TotalPortfolioValue
         fee_reserve    = max(total_value * algo.cash_reserve_pct, 0.50)
         reserved_cash  = available_cash - fee_reserve
         if reserved_cash <= 0:
-            reject_cash_reserve += 1
             continue
 
-        min_qty         = get_min_quantity(algo, sym)
+        min_qty          = get_min_quantity(algo, sym)
         min_notional_usd = get_min_notional_usd(algo, sym)
         if min_qty * price > reserved_cash * 0.90:
-            reject_min_qty_too_large += 1
             continue
 
         crypto = algo.crypto_data.get(sym)
@@ -677,30 +552,22 @@ def execute_trades(algo, candidates, threshold_now):
         if crypto.get('trade_count_today', 0) >= algo.max_symbol_trades_per_day:
             continue
 
-        # Expected move filter
+        # Expected-move check (uses algo's ATR parameters)
         atr_val = crypto['atr'].Current.Value if crypto['atr'].IsReady else None
         if atr_val and price > 0:
             expected_move_pct = (atr_val * algo.atr_tp_mult) / price
-            spread = get_spread_pct(algo, sym)
-            spread_cost = spread if spread is not None else 0.004
-            min_required = (algo.expected_round_trip_fees
-                            + algo.fee_slippage_buffer
-                            + algo.min_expected_profit_pct
-                            + spread_cost)
+            spread_cost       = cand.get('spread_at_entry') or 0.004
+            min_required      = (algo.expected_round_trip_fees
+                                 + algo.fee_slippage_buffer
+                                 + algo.min_expected_profit_pct
+                                 + spread_cost)
             if expected_move_pct < min_required:
+                algo.Debug(f"SKIP {sym.Value}: expected move {expected_move_pct:.2%} < {min_required:.2%}")
                 continue
 
-        # Dollar-volume filter
-        if len(crypto['dollar_volume']) >= 3:
-            dv_window = min(len(crypto['dollar_volume']), 12)
-            recent_dv = np.mean(list(crypto['dollar_volume'])[-dv_window:])
-            if recent_dv < algo.min_dollar_volume_usd:
-                reject_dollar_volume += 1
-                continue
-
-        # ── Position sizing ────────────────────────────────────────────────
+        # ── Concentrated position sizing (two tiers) ──────────────────────────
         vol  = annualized_vol(algo, crypto)
-        size = algo._scoring_engine.calculate_position_size(net_score, threshold_now, vol)
+        size = algo._scoring_engine.calculate_position_size(confidence, algo.entry_threshold, vol)
 
         # Post-loss halving
         if algo._consecutive_loss_halve_remaining > 0:
@@ -709,26 +576,6 @@ def execute_trades(algo, candidates, threshold_now):
         # Slippage penalty
         slippage_penalty = get_slippage_penalty(algo, sym)
         size *= slippage_penalty
-
-        # Correlation-based sizing reduction with existing positions
-        existing_count = get_actual_position_count(algo)
-        if existing_count >= 2:
-            max_corr = 0
-            if crypto and len(crypto['returns']) >= 12:
-                new_rets = list(crypto['returns'])[-12:]
-                for existing_sym in list(algo.entry_prices.keys()):
-                    if existing_sym == sym:
-                        continue
-                    existing_crypto = algo.crypto_data.get(existing_sym)
-                    if existing_crypto and len(existing_crypto['returns']) >= 12:
-                        exist_rets = list(existing_crypto['returns'])[-12:]
-                        try:
-                            corr = abs(np.corrcoef(new_rets, exist_rets)[0, 1])
-                            max_corr = max(max_corr, corr)
-                        except Exception:
-                            pass
-            if max_corr > 0.5:
-                size *= (1.0 - max_corr)
 
         val = reserved_cash * size
         val = max(val, algo.min_notional)
@@ -741,12 +588,10 @@ def execute_trades(algo, candidates, threshold_now):
 
         total_cost_with_fee = val * 1.006
         if total_cost_with_fee > available_cash:
-            reject_cash_reserve += 1
             continue
         if (val < min_notional_usd * algo.min_notional_fee_buffer
                 or val < algo.min_notional
                 or val > reserved_cash):
-            reject_notional += 1
             continue
 
         # Min order size compliance
@@ -756,44 +601,45 @@ def execute_trades(algo, candidates, threshold_now):
             lot_size       = float(sec_props.LotSize or 0)
             actual_min     = max(min_order_size, lot_size)
             if actual_min > 0 and qty < actual_min:
-                algo.Debug(f"REJECT ENTRY {sym.Value}: qty={qty} < min_order_size={actual_min}")
-                reject_notional += 1
+                algo.Debug(f"REJECT {sym.Value}: qty={qty} < min_order_size={actual_min}")
                 continue
             if min_order_size > 0:
                 post_fee_qty = qty * (1.0 - KRAKEN_SELL_FEE_BUFFER)
                 if post_fee_qty < min_order_size:
-                    required_qty = round_quantity(algo, sym, min_order_size / (1.0 - KRAKEN_SELL_FEE_BUFFER))
+                    required_qty = round_quantity(
+                        algo, sym, min_order_size / (1.0 - KRAKEN_SELL_FEE_BUFFER)
+                    )
                     if required_qty * price <= available_cash * 0.99:
                         qty = required_qty
                         val = qty * price
                     else:
-                        algo.Debug(f"REJECT ENTRY {sym.Value}: post-fee qty too small and can't upsize")
-                        reject_notional += 1
                         continue
         except Exception as e:
-            algo.Debug(f"Warning: could not check min_order_size for {sym.Value}: {e}")
+            algo.Debug(f"Warning: min_order_size check failed for {sym.Value}: {e}")
 
-        # ── Place order ────────────────────────────────────────────────────
+        # ── Place order ────────────────────────────────────────────────────────
         try:
             ticket = place_limit_or_market(algo, sym, qty, timeout_seconds=30,
                                            tag=f"Entry:{setup_type}")
             if ticket is not None:
                 algo._recent_tickets.append(ticket)
                 components = cand.get('factors', {})
-
-                # Attribution log
+                f = components
                 algo.Debug(
-                    f"ENTRY [{setup_type}] {sym.Value} | conf={net_score:.2f} "
-                    f"${val:.0f} | spread={cand.get('spread_at_entry', 0) or 0:.3%} "
+                    f"ENTRY [{setup_type}] {sym.Value} "
+                    f"conf={confidence:.2f} ${val:.0f} "
+                    f"rs={f.get('rs_short', 0):.4f}+{f.get('rs_medium', 0):.4f} "
+                    f"vol={f.get('vol_ratio', 0):.1f}x fresh={f.get('freshness', 99)} "
+                    f"spread={cand.get('spread_at_entry') or 0:.3%} "
                     f"regime={algo.market_regime}/{algo.volatility_regime}"
                 )
 
-                # Record in diagnostics engine if available
+                # Record in diagnostics
                 diag = getattr(algo, '_diagnostics', None)
                 if diag is not None:
-                    sp = cand.get('spread_at_entry')
+                    sp       = cand.get('spread_at_entry')
                     est_slip = getattr(algo, '_last_estimated_slippage', None)
-                    diag.record_entry(sym, setup_type, net_score, components,
+                    diag.record_entry(sym, setup_type, confidence, components,
                                       price, spread_at_entry=sp,
                                       estimated_slippage=est_slip)
 
@@ -801,25 +647,17 @@ def execute_trades(algo, candidates, threshold_now):
                 algo.trade_count += 1
                 crypto['trade_count_today'] = crypto.get('trade_count_today', 0) + 1
 
-                # Track whether entry was in a choppy regime (for exit tuning)
-                adx_ind = crypto.get('adx')
-                is_choppy = (adx_ind is not None and adx_ind.IsReady
-                             and adx_ind.Current.Value < 20)
-                algo._choppy_regime_entries[sym] = is_choppy
-
                 if algo._consecutive_loss_halve_remaining > 0:
                     algo._consecutive_loss_halve_remaining -= 1
                 if algo.LiveMode:
                     algo._last_live_trade_time = algo.Time
         except Exception as e:
-            algo.Debug(f"ORDER FAILED: {sym.Value} - {e}")
+            algo.Debug(f"ORDER FAILED: {sym.Value} — {e}")
             algo._session_blacklist.add(sym.Value)
             continue
 
-        if algo.LiveMode and success_count >= 3:
+        if algo.LiveMode and success_count >= 2:
             break
 
-    if success_count > 0 or (reject_exit_cooldown + reject_loss_cooldown) > 3:
-        debug_limited(algo, (f"EXECUTE: {success_count}/{len(candidates)} | rejects: "
-                             f"cd={reject_exit_cooldown} loss={reject_loss_cooldown} "
-                             f"corr={reject_correlation} dv={reject_dollar_volume}"))
+    if success_count > 0:
+        debug_limited(algo, f"EXECUTED: {success_count}/{len(candidates)} entries")

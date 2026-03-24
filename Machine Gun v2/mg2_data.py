@@ -56,7 +56,9 @@ def initialize_symbol(algo, symbol):
         'last_loss_time': None,
 
         # ── Relative strength vs BTC ───────────────────────────────────────
-        'rs_vs_btc':  deque(maxlen=algo.medium_period),
+        'rs_vs_btc':        deque(maxlen=algo.medium_period),
+        # Medium-term RS: 20-bar cumulative relative return vs BTC (scalar)
+        'rs_vs_btc_medium': 0.0,
 
         # ── Z-score ────────────────────────────────────────────────────────
         'zscore':     deque(maxlen=algo.short_period),
@@ -74,11 +76,12 @@ def initialize_symbol(algo, symbol):
         # Median BB width over last 30 bars (updated every bar)
         'bb_width_median_30':    0.0,
 
-        # ── Breakout freshness (NEW) ───────────────────────────────────────
-        # Rolling 20-bar high (the high of every bar in the window)
+        # ── Breakout freshness ─────────────────────────────────────────────
         # We track the "age" (bars) since price last broke above the prior 20-bar high
         'breakout_freshness':    999,   # 999 = no recent breakout
         'prev_range_high_20':    0.0,   # previous 20-bar high (before current bar)
+        # The price level of the 20-bar high that was broken (used for failed-breakout exit)
+        'breakout_level':        0.0,
 
         # ── Order-flow persistence (NEW) ──────────────────────────────────
         # How many consecutive bars have had above-baseline volume
@@ -171,6 +174,12 @@ def update_symbol_data(algo, symbol, bar, quote_bar=None):
         btc_ret  = np.sum(list(algo.btc_returns)[-algo.short_period:])
         crypto['rs_vs_btc'].append(coin_ret - btc_ret)
 
+    # Medium-term RS (20-bar cumulative): updated every bar
+    if len(crypto['returns']) >= 20 and len(algo.btc_returns) >= 20:
+        coin_ret_med = np.sum(list(crypto['returns'])[-20:])
+        btc_ret_med  = np.sum(list(algo.btc_returns)[-20:])
+        crypto['rs_vs_btc_medium'] = float(coin_ret_med - btc_ret_med)
+
     # ── Bollinger Bands ───────────────────────────────────────────────────
     if len(crypto['prices']) >= algo.medium_period:
         prices_arr = np.array(list(crypto['prices'])[-algo.medium_period:])
@@ -213,8 +222,9 @@ def update_symbol_data(algo, symbol, bar, quote_bar=None):
         range_high_20 = float(np.max(highs_list[-21:-1]))
 
         if high > crypto['prev_range_high_20'] and crypto['prev_range_high_20'] > 0:
-            # Price just broke a new 20-bar high — reset freshness
+            # Price just broke a new 20-bar high — reset freshness and record the level
             crypto['breakout_freshness'] = 0
+            crypto['breakout_level']     = crypto['prev_range_high_20']
         elif crypto['breakout_freshness'] < 999:
             # Increment age of last breakout
             crypto['breakout_freshness'] = min(crypto['breakout_freshness'] + 1, 999)
