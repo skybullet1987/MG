@@ -66,20 +66,27 @@ class MicroScalpEngine:
         try:
             # ----------------------------------------------------------
             # Signal 1: Order Book Imbalance (OBI)
-            # OBI = (bid_size - ask_size) / (bid_size + ask_size)
-            # Strong buy pressure when OBI > 0.6 (bid wall dominates).
-            # Tightened from 0.5 → 0.6 to reduce false signals.
+            # Multi-bar rolling OBI: use average of last 3–5 bars for
+            # smoother, less noisy buy-pressure signal.
             # ----------------------------------------------------------
-            bid_size = crypto.get('bid_size', 0.0)
-            ask_size = crypto.get('ask_size', 0.0)
-            total_size = bid_size + ask_size
-            if total_size > 0:
-                obi = (bid_size - ask_size) / total_size
-                if obi > self.OBI_STRONG_THRESHOLD:
+            obi_history = list(crypto.get('obi_history', []))
+            if len(obi_history) >= 3:
+                obi = float(np.mean(obi_history))
+                if obi > self.OBI_STRONG_THRESHOLD and min(obi_history) > 0.10:
                     components['obi'] = 0.20
-                elif obi > self.OBI_PARTIAL_THRESHOLD:
-                    # Partial credit for meaningful buy-side imbalance
+                elif obi > self.OBI_PARTIAL_THRESHOLD and min(obi_history) > 0.05:
                     components['obi'] = 0.10
+            else:
+                # Fallback to single-bar if not enough history
+                bid_size = crypto.get('bid_size', 0.0)
+                ask_size = crypto.get('ask_size', 0.0)
+                total_size = bid_size + ask_size
+                if total_size > 0:
+                    obi = (bid_size - ask_size) / total_size
+                    if obi > self.OBI_STRONG_THRESHOLD:
+                        components['obi'] = 0.20
+                    elif obi > self.OBI_PARTIAL_THRESHOLD:
+                        components['obi'] = 0.10
 
             # ----------------------------------------------------------
             # Signal 2: Volume Ignition
@@ -133,6 +140,7 @@ class MicroScalpEngine:
             # Signal 3b: Steady Grind (Bull Market Only)
             # Rewards a slow, steady EMA stack even when ADX is weak.
             # Price pulled back to the ultra-short EMA but trend is intact.
+            # Weight reduced from 0.25 to 0.15; requires volume confirmation.
             # ----------------------------------------------------------
             if self.algo.market_regime == "bull":
                 if (crypto['ema_ultra_short'].IsReady and crypto['ema_short'].IsReady
@@ -142,9 +150,10 @@ class MicroScalpEngine:
                     ema_ultra = crypto['ema_ultra_short'].Current.Value
                     ema_short = crypto['ema_short'].Current.Value
                     ema_medium = crypto['ema_medium'].Current.Value
+                    vol_ok = components.get('vol_ignition', 0) >= 0.10
                     if ema_ultra > ema_short and ema_short > ema_medium:
-                        if price <= ema_ultra * 1.002 and price > ema_short:
-                            components['steady_grind'] = 0.25
+                        if price <= ema_ultra * 1.002 and price > ema_short and vol_ok:
+                            components['steady_grind'] = 0.15  # reduced from 0.25
                             # steady_grind acts as an upgrade/replacement for micro_trend:
                             # it is a stronger, more specific bull signal, so we zero out
                             # micro_trend to prevent the two signals from stacking additively.
@@ -290,4 +299,15 @@ class MicroScalpEngine:
             size *= max(vol_scalar, 0.5)  # Never reduce below 50% of base size
 
         kelly = self.algo._kelly_fraction()
-        return size * kelly
+        size = size * kelly
+
+        # Cap at max 2% portfolio risk per trade
+        portfolio_value = self.algo.Portfolio.TotalPortfolioValue
+        if portfolio_value > 0:
+            atr_sl_pct = self.algo.atr_sl_mult * 0.01  # rough ATR as % approximation
+            if atr_sl_pct > 0:
+                max_loss_per_trade = 0.02  # 2% of portfolio
+                max_position_pct = max_loss_per_trade / max(atr_sl_pct, 0.01)
+                size = min(size, max_position_pct)
+
+        return size
