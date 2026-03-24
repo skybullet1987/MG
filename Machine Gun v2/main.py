@@ -263,7 +263,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self.Debug("Setup families: IgnitionBreakout | CompressionExpansion | MomentumContinuation")
 
     def CustomSecurityInitializer(self, security):
-        security.SetSlippageModel(RealisticCryptoSlippage())
+        security.SetSlippageModel(RealisticCryptoSlippage(self))
         security.SetFeeModel(MakerTakerFeeModel())
         security.SetFillModel(RealisticLimitFillModel())
 
