@@ -71,11 +71,37 @@ KRAKEN_SELL_FEE_BUFFER = 0.006  # 0.6% (0.4% base fee + 0.2% safety margin)
 
 
 class RealisticLimitFillModel(FillModel):
-    """Only fill limit orders if the bar's range fully crosses the limit price,
-    AND volume is sufficient to absorb the order."""
+    """
+    Conservative limit fill model for Kraken crypto.
+
+    Fill rules (designed to avoid over-optimistic backtest fills):
+    - Buy limit: price must trade THROUGH the limit by a configurable cushion
+      (i.e. bar low must be strictly below limit_price - cushion).  Mere
+      touch at the limit price does NOT guarantee fill.
+    - Sell limit: price must trade through upward (bar high > limit + cushion).
+    - During fast / high-volume candles a maker-miss probability is applied so
+      that a fraction of limit orders are simulated as not filling (queue jump
+      / latency / cancel-race realism).
+    - Volume participation cap: orders larger than 8% of bar volume are
+      rejected (was 10% — tighter for realism).
+    - Partial fill: if order size is between 4% and 8% of bar volume, only a
+      partial fill is simulated (50-80% of requested quantity).
+    """
+
+    # Price must trade through the limit by at least this fraction
+    FILL_THROUGH_CUSHION_PCT = 0.0003   # 0.03% through
+
+    # Fraction of volume at which partial fills start
+    PARTIAL_FILL_LOWER_PCT   = 0.04
+    PARTIAL_FILL_UPPER_PCT   = 0.08
+
+    # Probability that a maker limit order MISSES (is not filled) during a
+    # fast / breakout candle even when price traded through.
+    # Higher = more conservative.
+    MAKER_MISS_BASE_RATE  = 0.20   # 20% base miss rate on limit buys
+    FAST_CANDLE_MISS_RATE = 0.45   # 45% miss during fast candles
 
     def LimitFill(self, asset, order):
-        # Create the order event (unfilled by default)
         utc_time = Extensions.ConvertToUtc(asset.LocalTime, asset.Exchange.TimeZone)
         fill = OrderEvent(order, utc_time, OrderFee.Zero)
 
@@ -84,41 +110,94 @@ class RealisticLimitFillModel(FillModel):
 
         bar = asset.Cache.GetData[TradeBar]()
         if bar is None:
-            return fill  # no data → no fill
+            return fill
 
-        price = order.LimitPrice
-        qty = abs(order.Quantity)
+        price    = order.LimitPrice
+        qty      = abs(order.Quantity)
+        bar_vol  = bar.Volume if bar.Volume > 0 else 1
+        cushion  = price * self.FILL_THROUGH_CUSHION_PCT
 
         if order.Direction == OrderDirection.Buy:
-            if bar.Low > price:
-                return fill  # price never reached limit
-            if bar.Volume > 0 and qty > bar.Volume * 0.10:
-                return fill  # order too large relative to volume
+            # Must trade strictly below (price - cushion) — not just touch
+            if bar.Low >= price - cushion:
+                return fill
+            # Volume participation cap
+            if qty > bar_vol * self.PARTIAL_FILL_UPPER_PCT:
+                return fill
+            # Fast candle detection: large range relative to price
+            candle_range_pct = (bar.High - bar.Low) / max(bar.Open, 1e-10)
+            is_fast_candle   = candle_range_pct > 0.006   # > 0.6% candle range
+
+            # Maker miss simulation
+            miss_rate = self.FAST_CANDLE_MISS_RATE if is_fast_candle else self.MAKER_MISS_BASE_RATE
+            if random.random() < miss_rate:
+                return fill   # order missed — queue jump / latency
+
+            # Partial fill if order is a meaningful fraction of bar volume
+            if qty > bar_vol * self.PARTIAL_FILL_LOWER_PCT:
+                fill_fraction = random.uniform(0.50, 0.80)
+                filled_qty    = math.floor(qty * fill_fraction)
+                if filled_qty <= 0:
+                    return fill
+                fill.Status       = OrderStatus.PartiallyFilled
+                fill.FillQuantity = math.copysign(filled_qty, order.Quantity)
+                fill.FillPrice    = price
+                return fill
+
             fill_price = price
+
         elif order.Direction == OrderDirection.Sell:
-            if bar.High < price:
-                return fill  # price never reached limit
-            if bar.Volume > 0 and qty > bar.Volume * 0.10:
-                return fill  # order too large relative to volume
+            # Must trade strictly above (price + cushion)
+            if bar.High <= price + cushion:
+                return fill
+            if qty > bar_vol * self.PARTIAL_FILL_UPPER_PCT:
+                return fill
+            candle_range_pct = (bar.High - bar.Low) / max(bar.Open, 1e-10)
+            is_fast_candle   = candle_range_pct > 0.006
+            miss_rate = self.FAST_CANDLE_MISS_RATE if is_fast_candle else self.MAKER_MISS_BASE_RATE
+            if random.random() < miss_rate:
+                return fill
+            if qty > bar_vol * self.PARTIAL_FILL_LOWER_PCT:
+                fill_fraction = random.uniform(0.50, 0.80)
+                filled_qty    = math.floor(qty * fill_fraction)
+                if filled_qty <= 0:
+                    return fill
+                fill.Status       = OrderStatus.PartiallyFilled
+                fill.FillQuantity = math.copysign(-filled_qty, order.Quantity)
+                fill.FillPrice    = price
+                return fill
+
             fill_price = price
         else:
             return fill
 
-        fill.Status = OrderStatus.Filled
+        fill.Status       = OrderStatus.Filled
         fill.FillQuantity = order.Quantity
-        fill.FillPrice = fill_price
+        fill.FillPrice    = fill_price
         return fill
 
 
 class RealisticCryptoSlippage:
-    """Volume-aware slippage model for crypto.
-    Calibrated against empirical Kraken fill data.
-    Altcoins under $1 routinely have 0.3-0.5% effective slippage."""
+    """
+    Regime-aware slippage model for Kraken crypto.
+
+    Slippage is worse when:
+    - volatility is high
+    - the candle is a fast / wide range candle (breakout spike)
+    - BTC is dumping (stressed market)
+    - we are exiting a stop loss (adverse conditions, market-order escalation)
+    - the price tier is low (low-price alts have wide effective spreads)
+    - order size is a large fraction of bar volume
+
+    Exit slippage is materially more punitive than entry slippage in adverse
+    conditions, because stop-triggered exits and market-order escalations
+    get the worst fills.
+    """
 
     def __init__(self):
-        self.base_slippage_pct = 0.002    # 0.2% base (was 0.1% — too optimistic)
-        self.volume_impact_factor = 0.15   # was 0.10
-        self.max_slippage_pct = 0.03       # 3% cap (was 2%)
+        self.base_slippage_pct    = 0.0025   # 0.25% base — slightly more conservative
+        self.volume_impact_factor = 0.18     # volume impact coefficient
+        self.max_slippage_pct     = 0.05     # 5% hard cap (was 3%)
 
     def get_slippage_approximation(self, asset, order):
         price = asset.Price
@@ -127,27 +206,48 @@ class RealisticCryptoSlippage:
 
         slippage_pct = self.base_slippage_pct
 
+        # Volume participation impact
         volume = asset.Volume
         if volume > 0:
-            order_value = abs(order.Quantity) * price
+            order_value  = abs(order.Quantity) * price
             volume_value = volume * price
             if volume_value > 0:
                 participation_rate = order_value / volume_value
-                volume_impact = self.volume_impact_factor * (participation_rate ** 1.5)
+                volume_impact = self.volume_impact_factor * (participation_rate ** 1.3)
                 slippage_pct += volume_impact
 
-        # Price tier penalties — low-price alts have wider spreads
+        # Price tier penalties
         if price < 0.01:
-            slippage_pct *= 4.0    # was 3.0
+            slippage_pct *= 5.0
         elif price < 0.10:
-            slippage_pct *= 2.5    # was 2.0
+            slippage_pct *= 3.0
         elif price < 1.0:
-            slippage_pct *= 1.8    # was 1.5
+            slippage_pct *= 2.0
         elif price < 10.0:
-            slippage_pct *= 1.2    # NEW — mid-price alts still have wider spreads
+            slippage_pct *= 1.4
+
+        # Try to get regime context from the algorithm if accessible
+        try:
+            algo = asset.Portfolio.Algorithm
+            vol_regime = getattr(algo, 'volatility_regime', 'normal')
+            market_regime = getattr(algo, 'market_regime', 'unknown')
+
+            # High-volatility regime: +50% slippage
+            if vol_regime == 'high':
+                slippage_pct *= 1.5
+
+            # BTC dumping (bear regime): +30% slippage on everything
+            if market_regime == 'bear':
+                slippage_pct *= 1.3
+
+            # Exit direction gets worse execution in stressed conditions
+            is_exit = (order.Direction == OrderDirection.Sell)
+            if is_exit and (vol_regime == 'high' or market_regime == 'bear'):
+                slippage_pct *= 1.4   # exits get extra adversity
+        except Exception:
+            pass
 
         slippage_pct = min(slippage_pct, self.max_slippage_pct)
-
         return price * slippage_pct
 
 
@@ -791,8 +891,12 @@ def get_slippage_penalty(algo, symbol):
 def place_limit_or_market(algo, symbol, quantity, timeout_seconds=30, tag="Entry"):
     """
     Place a limit order at mid-price with fallback to market order after timeout.
-    Uses LimitOrder in both live and backtest mode to capture Maker fees (0.25%).
-    Returns the ticket from the order placement.
+
+    Backtest realism improvements:
+    - Higher reject rate during fast/breakout candles (maker miss simulation)
+    - Rate limited by volatility regime and spread width
+    - Reject probability is spread + volatility-regime-aware
+    - Order tracking for cancel-fill race simulation in VerifyOrderFills
     """
     try:
         sec = algo.Securities[symbol]
@@ -800,26 +904,37 @@ def place_limit_or_market(algo, symbol, quantity, timeout_seconds=30, tag="Entry
         ask = sec.AskPrice
 
         if bid > 0 and ask > 0:
-            # Place limit order just above best bid – still maker, improves fill odds
-            limit_price = bid * 1.0005  # 0.05% above bid – still below mid, still maker
-            limit_price = min(limit_price, ask)  # never cross the spread
+            # Limit order just above best bid (maker), but never cross spread
+            limit_price = bid * 1.0005
+            limit_price = min(limit_price, ask)
         else:
-            # No bid/ask data: use last price as limit price (fills immediately in backtest)
             limit_price = sec.Price
             if limit_price <= 0:
                 algo.Debug(f"Price unavailable for {symbol.Value}, using market order")
                 return algo.MarketOrder(symbol, quantity, tag=tag)
 
-        # BACKTEST REALISM: spread-aware simulation of limit orders not filling
-        # (order sits in book, price moves away, times out)
+        # BACKTEST REALISM: simulate limit order misses
+        # - Base miss rate depends on spread and volatility regime
+        # - Fast-candle / breakout entries are especially likely to miss
         if not algo.LiveMode:
             spread = get_spread_pct(algo, symbol)
-            if spread is not None:
-                reject_prob = min(0.15 + (spread / 0.008) * 0.35, 0.50)
-            else:
-                reject_prob = 0.25
-            if random.random() < reject_prob:
-                return None
+            spread_val = spread if spread is not None else 0.003
+
+            # Base miss probability: tighter spread = easier to fill
+            base_miss = min(0.15 + (spread_val / 0.006) * 0.30, 0.45)
+
+            # Volatility regime amplifier
+            vol_regime = getattr(algo, 'volatility_regime', 'normal')
+            if vol_regime == 'high':
+                base_miss = min(base_miss * 1.5, 0.65)
+
+            # During bear regime entries are harder to fill (thin bid side)
+            market_regime = getattr(algo, 'market_regime', 'unknown')
+            if market_regime == 'bear':
+                base_miss = min(base_miss * 1.2, 0.70)
+
+            if random.random() < base_miss:
+                return None  # limit order didn't fill — timed out / cancelled
 
         # Place maker limit order
         limit_ticket = algo.LimitOrder(symbol, quantity, limit_price, tag=tag)

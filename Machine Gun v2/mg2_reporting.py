@@ -6,6 +6,17 @@ import numpy as np
 # endregion
 
 
+def _get_setup_type_for_exit(algo, symbol):
+    """Retrieve the setup type from open diagnostics record if available."""
+    diag = getattr(algo, '_diagnostics', None)
+    if diag is None:
+        return None
+    rec = diag._open_records.get(symbol)
+    if rec is not None:
+        return rec.setup_type
+    return None
+
+
 def daily_report_v2(algo):
     daily_report(algo)
 
@@ -100,10 +111,13 @@ def on_order_event(algo, event):
                         algo.pnl_by_tag[exit_tag] = []
                     algo.pnl_by_tag[exit_tag].append(pnl)
                     algo.trade_log.append({
-                        'time': algo.Time,
-                        'symbol': symbol.Value,
-                        'pnl_pct': pnl,
-                        'exit_reason': exit_tag,
+                        'time':         algo.Time,
+                        'symbol':       symbol.Value,
+                        'pnl_pct':      pnl,
+                        'exit_reason':  exit_tag,
+                        'setup_type':   _get_setup_type_for_exit(algo, symbol),
+                        'market_regime': algo.market_regime,
+                        'vol_regime':   algo.volatility_regime,
                     })
                     if len(algo._recent_trade_outcomes) >= 12:
                         recent_wr = sum(algo._recent_trade_outcomes) / len(algo._recent_trade_outcomes)
@@ -183,31 +197,45 @@ def on_brokerage_message(algo, message):
 def on_end_of_algorithm(algo):
     total = algo.winning_trades + algo.losing_trades
     wr = algo.winning_trades / total if total > 0 else 0
-    algo.Debug("=== FINAL ===")
+    algo.Debug("=== FINAL REPORT — Machine Gun v2 Momentum Breakout Runner v8.0.0 ===")
     algo.Debug(f"Trades: {algo.trade_count} | WR: {wr:.1%}")
     algo.Debug(f"Final: ${algo.Portfolio.TotalPortfolioValue:.2f}")
     algo.Debug(f"PnL: {algo.total_pnl:+.2%}")
 
     if total > 0:
-        avg_win = float(np.mean(list(algo._rolling_win_sizes))) if len(algo._rolling_win_sizes) > 0 else 0
+        avg_win  = float(np.mean(list(algo._rolling_win_sizes)))  if len(algo._rolling_win_sizes)  > 0 else 0
         avg_loss = float(np.mean(list(algo._rolling_loss_sizes))) if len(algo._rolling_loss_sizes) > 0 else 0
         algo.Debug("=== REALISM CHECKS ===")
-        algo.Debug(f"Win Rate: {wr:.1%} (realistic range: 45-65%)")
-        algo.Debug(f"Avg Win: {avg_win:.2%} (should be > round-trip fees 0.65%)")
+        algo.Debug(f"Win Rate: {wr:.1%} (target range: 45-65% for this strategy)")
+        algo.Debug(f"Avg Win: {avg_win:.2%} (should be > round-trip fees 0.80%)")
         algo.Debug(f"Avg Loss: {avg_loss:.2%}")
         if algo.winning_trades > 0 and algo.losing_trades > 0 and avg_loss > 0:
             pf = (avg_win * algo.winning_trades) / (avg_loss * algo.losing_trades)
             algo.Debug(f"Profit Factor: {pf:.2f}")
         if wr > 0.70:
-            algo.Debug("⚠️ RED FLAG: Win rate > 70% — likely backtest overfitting")
-        if avg_win < 0.005:
-            algo.Debug("⚠️ RED FLAG: Avg win < 0.5% — too small to survive live fees")
+            algo.Debug("WARNING: Win rate > 70% — possible backtest overfitting")
+        if avg_win < 0.008:
+            algo.Debug("WARNING: Avg win < 0.8% — too small to survive live fees")
         try:
             days = max((algo.Time - algo.StartDate).days, 1)
             cagr = (algo.Portfolio.TotalPortfolioValue / 1000) ** (365 / days) - 1
             if cagr > 5.0:
-                algo.Debug("⚠️ RED FLAG: CAGR > 500% — backtest is unreliable")
+                algo.Debug("WARNING: CAGR > 500% — backtest is likely unreliable")
         except Exception:
             pass
+
+    # ── PnL by exit tag ───────────────────────────────────────────────────
+    if hasattr(algo, 'pnl_by_tag') and algo.pnl_by_tag:
+        algo.Debug("=== PNL BY EXIT TAG ===")
+        for tag, pnls in sorted(algo.pnl_by_tag.items()):
+            n = len(pnls)
+            avg = float(np.mean(pnls)) if pnls else 0
+            wins = sum(1 for p in pnls if p > 0)
+            algo.Debug(f"  {tag}: n={n} wr={wins/n:.1%} avg={avg:+.2%}")
+
+    # ── Diagnostics attribution summary ──────────────────────────────────
+    diag = getattr(algo, '_diagnostics', None)
+    if diag is not None:
+        diag.print_summary()
 
     persist_state(algo)
