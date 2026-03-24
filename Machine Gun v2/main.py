@@ -53,7 +53,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.quick_take_profit = self._get_param("quick_take_profit", 0.150)
         self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.035)
         self.atr_tp_mult       = self._get_param("atr_tp_mult",       6.0)
-        self.atr_sl_mult       = self._get_param("atr_sl_mult",       2.5)
+        self.atr_sl_mult       = self._get_param("atr_sl_mult",       3.0)   # raised from 2.5 — more breathing room
         # Trailing: wider activation allows runners to develop
         self.trail_activation  = self._get_param("trail_activation",  0.060)  # 6% (was 4%)
         self.trail_stop_pct    = self._get_param("trail_stop_pct",    0.040)  # 4% (was 2.5%)
@@ -109,9 +109,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.max_daily_trades        = 24000
         self.daily_trade_count       = 0
         self.last_trade_date         = None
-        self.exit_cooldown_hours     = 2.0
+        self.exit_cooldown_hours     = 1.0   # reduced from 2.0 — faster re-entry into momentum runners
         self.cancel_cooldown_minutes = 1
-        self.max_symbol_trades_per_day = 3
+        self.max_symbol_trades_per_day = 5   # raised from 3 — allow momentum re-entries
 
         # ── Fee / profit floor ────────────────────────────────────────────────
         self.expected_round_trip_fees = 0.008   # conservative: 0.8% round-trip (taker)

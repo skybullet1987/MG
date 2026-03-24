@@ -262,24 +262,6 @@ class DiagnosticsEngine:
                            f"pnl={unreal_pnl:+.2%} hold={rec.hold_minutes or '?'}min")
 
 
-mg2_entries.py — Setup-Driven Entry Logic for Machine Gun v2
-============================================================
-Entry logic is now driven by explicit named setups (IgnitionBreakout,
-CompressionExpansion, MomentumContinuation) instead of an additive
-"score soup."  Mean-reversion entries have been removed.
-
-Changes from previous version
-------------------------------
-• ``calculate_factor_scores()`` now calls ``engine.evaluate_setup()`` which
-  returns (setup_type, confidence, components) — a named setup or nothing.
-• A candidate is only accepted if a named setup qualifies (not a partial sum).
-• Diagnostic metadata (setup_type, spread, estimated_slippage, regime) is
-  attached to every candidate and forwarded to DiagnosticsEngine on fill.
-• Score persistence check is preserved: 2 of last 3 bars must pass threshold.
-• Bear-market entry gating: no entries during bear regime unless confidence
-  is very high (>= BEAR_REGIME_MIN_CONFIDENCE).
-"""
-
 # During a bear market regime, only trade very high-confidence setups
 BEAR_REGIME_MIN_CONFIDENCE = 0.70
 

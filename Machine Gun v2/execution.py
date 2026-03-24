@@ -89,7 +89,7 @@ class RealisticLimitFillModel(FillModel):
     """
 
     # Price must trade through the limit by at least this fraction
-    FILL_THROUGH_CUSHION_PCT = 0.0003   # 0.03% through
+    FILL_THROUGH_CUSHION_PCT = 0.0005   # 0.05% through (raised from 0.03% — breakout fills are optimistic)
 
     # Fraction of volume at which partial fills start
     PARTIAL_FILL_LOWER_PCT   = 0.04
@@ -99,7 +99,7 @@ class RealisticLimitFillModel(FillModel):
     # fast / breakout candle even when price traded through.
     # Higher = more conservative.
     MAKER_MISS_BASE_RATE  = 0.20   # 20% base miss rate on limit buys
-    FAST_CANDLE_MISS_RATE = 0.45   # 45% miss during fast candles
+    FAST_CANDLE_MISS_RATE = 0.50   # 50% miss during fast/breakout candles (raised from 45%)
 
     def LimitFill(self, asset, order):
         utc_time = Extensions.ConvertToUtc(asset.LocalTime, asset.Exchange.TimeZone)

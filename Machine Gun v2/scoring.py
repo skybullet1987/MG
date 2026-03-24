@@ -266,13 +266,25 @@ class IgnitionBreakoutSetup:
         if slope >= KALMAN_SLOPE_MIN:
             components['kalman_slope'] = 0.05
 
+        # ── Bonus: Volume persistence (multi-bar buying pressure) ─────────────
+        # Real ignition breakouts are preceded by sustained above-average volume,
+        # not just a single spike.  2+ consecutive above-baseline bars = genuine.
+        vol_persist = crypto.get('vol_persistence', 0)
+        if vol_persist >= 5:
+            components['vol_persistence'] = 0.08
+        elif vol_persist >= 2:
+            components['vol_persistence'] = 0.05
+        else:
+            components['vol_persistence'] = 0.0
+
         confidence = (components['range_break']
                       + components['vol_ignition']
                       + components['obi_pressure']
                       + components['ema_alignment']
                       + components['anti_chase']
                       + components['rs_vs_btc']
-                      + components['kalman_slope'])
+                      + components['kalman_slope']
+                      + components['vol_persistence'])
 
         # Must have both volume AND OBI — don't let one comp carry the whole score
         if components['vol_ignition'] == 0.0 and components['obi_pressure'] == 0.0:
@@ -378,13 +390,21 @@ class CompressionExpansionSetup:
         if rs > RS_BTC_POSITIVE:
             components['rs_vs_btc'] = min(rs * 5, 0.05)
 
+        # ── Bonus: Volume persistence (sustained buying into the expansion) ───
+        vol_persist = crypto.get('vol_persistence', 0)
+        if vol_persist >= 2:
+            components['vol_persistence'] = 0.04
+        else:
+            components['vol_persistence'] = 0.0
+
         confidence = (components['compression_quality']
                       + components['expansion_strength']
                       + components['breakout_direction']
                       + components['vol_ignition']
                       + components['anti_chase']
                       + components['obi_pressure']
-                      + components['rs_vs_btc'])
+                      + components['rs_vs_btc']
+                      + components['vol_persistence'])
 
         qualified = confidence >= cls.MIN_CONFIDENCE
         return qualified, round(min(confidence, 1.0), 4), components
@@ -453,14 +473,16 @@ class MomentumContinuationSetup:
             components['trend_strength'] = 0.15
 
         # ── Component 2: Level reclaim (25%) ─────────────────────────────────
-        vwap        = crypto.get('vwap', 0.0)
-        ema20_val   = (crypto['ema_medium'].Current.Value
-                       if crypto.get('ema_medium') and crypto['ema_medium'].IsReady else 0.0)
-        kalman_est  = crypto.get('kalman_estimate', 0.0)
+        vwap          = crypto.get('vwap', 0.0)
+        ema20_val     = (crypto['ema_medium'].Current.Value
+                         if crypto.get('ema_medium') and crypto['ema_medium'].IsReady else 0.0)
+        kalman_est    = crypto.get('kalman_estimate', 0.0)
+        vwap_sd2_lower  = crypto.get('vwap_sd2_lower', 0.0)   # VWAP -2σ band reclaim
 
         best_reclaim = 0.0
 
-        for level, weight in [(vwap, 0.25), (ema20_val, 0.22), (kalman_est, 0.20)]:
+        # Standard key levels + VWAP SD2 lower band as a fourth reclaim target
+        for level, weight in [(vwap, 0.25), (ema20_val, 0.22), (kalman_est, 0.20), (vwap_sd2_lower, 0.18)]:
             if level <= 0:
                 continue
             dist_below = (level - prices[-3]) / level if len(prices) >= 3 else 1.0
