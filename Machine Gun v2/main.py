@@ -13,7 +13,10 @@ from mg2_data import (
 )
 from mg2_entries import rebalance, execute_trades
 from mg2_exits import check_exits
-from mg2_reporting import daily_report_v2, reset_daily_counters
+from mg2_reporting import (
+    daily_report_v2, reset_daily_counters,
+    on_order_event, on_brokerage_message, on_end_of_algorithm,
+)
 # endregion
 
 
