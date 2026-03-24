@@ -35,8 +35,8 @@ class MicroScalpEngine:
     ADX_MODERATE_THRESHOLD  = 13     # moderate directional trend
     VWAP_BUFFER             = 1.0005  # 0.05% above VWAP for confirmed reclaim
     # Ranging-market mean reversion thresholds (used when ADX < ADX_MODERATE_THRESHOLD)
-    RSI_OVERSOLD_THRESHOLD        = 45   # RSI < 45 → oversold, mean reversion buy signal
-    RSI_MILDLY_OVERSOLD_THRESHOLD = 50   # RSI < 50 → mildly oversold, partial credit
+    RSI_OVERSOLD_THRESHOLD        = 35   # RSI < 35 → oversold, mean reversion buy signal
+    RSI_MILDLY_OVERSOLD_THRESHOLD = 40   # RSI < 40 → mildly oversold, partial credit
     BB_NEAR_LOWER_PCT             = 0.03  # within 3% of lower Bollinger Band = near support
 
     def __init__(self, algorithm):
@@ -102,8 +102,8 @@ class MicroScalpEngine:
                 adx_indicator = crypto.get('adx')
                 is_choppy = (adx_indicator is not None and adx_indicator.IsReady
                              and adx_indicator.Current.Value < 25)
-                vol_strong  = 1.8 if is_choppy else self.VOL_SURGE_STRONG
-                vol_partial = 1.2 if is_choppy else self.VOL_SURGE_PARTIAL
+                vol_strong  = 3.0 if is_choppy else self.VOL_SURGE_STRONG
+                vol_partial = 2.0 if is_choppy else self.VOL_SURGE_PARTIAL
                 if vol_baseline > 0:
                     ratio = current_vol / vol_baseline
                     if ratio >= vol_strong:
