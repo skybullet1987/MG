@@ -70,6 +70,36 @@ MIN_NOTIONAL_FALLBACK = {
 KRAKEN_SELL_FEE_BUFFER = 0.006  # 0.6% (0.4% base fee + 0.2% safety margin)
 
 
+class RealisticLimitFillModel(FillModel):
+    """Only fill limit orders if the bar's range fully crosses the limit price,
+    AND volume is sufficient to absorb the order."""
+
+    def LimitFill(self, asset, order, parameters):
+        bar = asset.GetLastData()
+        if bar is None:
+            return Fill.NoFill()
+
+        price = order.LimitPrice
+        qty = abs(order.Quantity)
+
+        if order.Direction == OrderDirection.Buy:
+            if bar.Low > price:
+                return Fill.NoFill()
+            if bar.Volume > 0 and qty > bar.Volume * 0.10:
+                return Fill.NoFill()
+            fill_price = price
+        elif order.Direction == OrderDirection.Sell:
+            if bar.High < price:
+                return Fill.NoFill()
+            if bar.Volume > 0 and qty > bar.Volume * 0.10:
+                return Fill.NoFill()
+            fill_price = price
+        else:
+            return Fill.NoFill()
+
+        return Fill(fill_price, qty)
+
+
 class RealisticCryptoSlippage:
     """Volume-aware slippage model for crypto.
     Calibrated against empirical Kraken fill data.
@@ -770,10 +800,16 @@ def place_limit_or_market(algo, symbol, quantity, timeout_seconds=30, tag="Entry
                 algo.Debug(f"Price unavailable for {symbol.Value}, using market order")
                 return algo.MarketOrder(symbol, quantity, tag=tag)
 
-        # BACKTEST REALISM: simulate ~25% of limit orders not filling
+        # BACKTEST REALISM: spread-aware simulation of limit orders not filling
         # (order sits in book, price moves away, times out)
-        if not algo.LiveMode and random.random() < 0.25:
-            return None
+        if not algo.LiveMode:
+            spread = get_spread_pct(algo, symbol)
+            if spread is not None:
+                reject_prob = min(0.15 + (spread / 0.008) * 0.35, 0.50)
+            else:
+                reject_prob = 0.25
+            if random.random() < reject_prob:
+                return None
 
         # Place maker limit order
         limit_ticket = algo.LimitOrder(symbol, quantity, limit_price, tag=tag)

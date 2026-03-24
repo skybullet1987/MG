@@ -10,9 +10,9 @@ from QuantConnect.Securities import CashAmount
 
 
 class MakerTakerFeeModel(FeeModel):
-    """Blended crypto fee model: 40% taker fills for limit orders."""
+    """Blended crypto fee model: 75% taker fills for limit orders."""
 
-    LIMIT_TAKER_RATIO = 0.40
+    LIMIT_TAKER_RATIO = 0.75
 
     def GetOrderFee(self, parameters):
         order = parameters.Order
@@ -58,7 +58,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.max_positions      = 3
         self.min_notional       = 5.5
         self.max_position_usd   = self._get_param("max_position_usd", 500.0)  # $500 cap prevents over-concentration at scale
-        self.min_price_usd      = 0.001
+        self.min_price_usd      = 0.01
         self.cash_reserve_pct   = 0.00
         self.min_notional_fee_buffer = 1.5
 
@@ -72,7 +72,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.lookback           = 48
         self.sqrt_annualization = np.sqrt(60 * 24 * 365)
 
-        self.max_spread_pct         = 0.008
+        self.max_spread_pct         = 0.004
         self.spread_median_window   = 12
         self.spread_widen_mult      = 2.5
         self.min_dollar_volume_usd  = 100000
@@ -229,6 +229,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def CustomSecurityInitializer(self, security):
         security.SetSlippageModel(RealisticCryptoSlippage())
         security.SetFeeModel(MakerTakerFeeModel())
+        security.SetFillModel(RealisticLimitFillModel())
 
     def _get_param(self, name, default):
         try:
@@ -338,6 +339,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             'last_loss_time': None,
             'bid_size': 0.0,
             'ask_size': 0.0,
+            'obi_history': deque(maxlen=5),
             'vwap_pv': deque(maxlen=20),
             'vwap_v': deque(maxlen=20),
             'vwap': 0.0,
@@ -498,6 +500,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 if bid_sz > 0 or ask_sz > 0:
                     crypto['bid_size'] = bid_sz
                     crypto['ask_size'] = ask_sz
+                    total = bid_sz + ask_sz
+                    if total > 0:
+                        obi_instant = (bid_sz - ask_sz) / total
+                        crypto['obi_history'].append(obi_instant)
             except Exception:
                 pass
 
@@ -763,6 +769,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             crypto['recent_net_scores'].append(net_score)
 
             if net_score >= threshold_now:
+                # Require score persistence: at least 2 of last 3 bars above threshold
+                if len(crypto['recent_net_scores']) >= 3:
+                    above_count = sum(1 for s in list(crypto['recent_net_scores'])[-3:] if s >= threshold_now)
+                    if above_count < 2:
+                        continue  # Score not persistent enough
                 count_above_thresh += 1
                 scores.append({
                     'symbol': symbol,
@@ -849,6 +860,18 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if not spread_ok(self, sym):
                 reject_spread += 1
                 continue
+            if self.LiveMode:
+                _crypto_depth = self.crypto_data.get(sym)
+                if _crypto_depth:
+                    bid_size = _crypto_depth.get('bid_size', 0)
+                    if bid_size > 0:
+                        _sec_depth = self.Securities[sym]
+                        _price_depth = _sec_depth.Price if _sec_depth.Price > 0 else 1
+                        # Compute tentative order value using min position size as estimate
+                        _estimated_val = self.Portfolio.TotalPortfolioValue * 0.35
+                        _our_qty = _estimated_val / _price_depth
+                        if _our_qty > bid_size * 0.20:
+                            continue  # Our order would move the market
             if sym in self._exit_cooldowns and self.Time < self._exit_cooldowns[sym]:
                 reject_exit_cooldown += 1
                 continue
@@ -875,7 +898,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             except (KeyError, AttributeError):
                 available_cash = self.Portfolio.Cash
 
-            available_cash = max(0, available_cash - open_buy_orders_value)
+            # Reserve cash for fees on existing positions' potential exits
+            pending_exit_fees = 0
+            for _exit_sym in list(self.entry_prices.keys()):
+                if is_invested_not_dust(self, _exit_sym):
+                    _holding_val = abs(self.Portfolio[_exit_sym].Quantity) * self.Securities[_exit_sym].Price
+                    pending_exit_fees += _holding_val * 0.004
+            available_cash = max(0, available_cash - open_buy_orders_value - pending_exit_fees)
             total_value = self.Portfolio.TotalPortfolioValue
             # Minimal fee reserve only
             fee_reserve = max(total_value * self.cash_reserve_pct, 0.50)
@@ -900,8 +929,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             atr_val = crypto['atr'].Current.Value if crypto['atr'].IsReady else None
             if atr_val and price > 0:
                 expected_move_pct = (atr_val * self.atr_tp_mult) / price
-                min_profit_gate = self.min_expected_profit_pct
-                min_required = self.expected_round_trip_fees + self.fee_slippage_buffer + min_profit_gate
+                spread = get_spread_pct(self, sym)
+                spread_cost = spread if spread is not None else 0.004
+                min_required = (self.expected_round_trip_fees
+                                + self.fee_slippage_buffer
+                                + self.min_expected_profit_pct
+                                + spread_cost)
                 if expected_move_pct < min_required:
                     continue
 
@@ -924,6 +957,27 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
             slippage_penalty = get_slippage_penalty(self, sym)
             size *= slippage_penalty
+
+            # Correlation-based size reduction: reduce size proportionally
+            # when new position is highly correlated with existing holdings
+            existing_count = get_actual_position_count(self)
+            if existing_count >= 2:
+                max_corr = 0
+                if crypto and len(crypto['returns']) >= 12:
+                    new_rets = list(crypto['returns'])[-12:]
+                    for existing_sym in list(self.entry_prices.keys()):
+                        if existing_sym == sym:
+                            continue
+                        existing_crypto = self.crypto_data.get(existing_sym)
+                        if existing_crypto and len(existing_crypto['returns']) >= 12:
+                            exist_rets = list(existing_crypto['returns'])[-12:]
+                            try:
+                                corr = abs(np.corrcoef(new_rets, exist_rets)[0, 1])
+                                max_corr = max(max_corr, corr)
+                            except Exception:
+                                pass
+                if max_corr > 0.5:
+                    size *= (1.0 - max_corr)
 
             val = reserved_cash * size
 
@@ -1074,6 +1128,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             sl = self.tight_stop_loss
             tp = self.quick_take_profit
 
+        # Adjust TP/SL for exit spread cost
+        exit_spread = get_spread_pct(self, symbol)
+        if exit_spread is not None:
+            spread_cost = exit_spread * 0.5
+            tp = tp + spread_cost
+            sl = max(sl - spread_cost, 0.005)
+
         if tp < sl * 1.5:
             tp = sl * 1.5
 
@@ -1126,7 +1187,14 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
 
             elif atr and entry > 0 and holding.Quantity != 0:
-                trail_offset = atr * self.atr_trail_mult
+                # Dynamic trail tightening based on unrealized PnL
+                if pnl > 0.05:
+                    effective_trail_mult = 1.5
+                elif pnl > 0.025:
+                    effective_trail_mult = 2.5
+                else:
+                    effective_trail_mult = self.atr_trail_mult
+                trail_offset = atr * effective_trail_mult
                 trail_level = highest - trail_offset  # anchor to highest price since entry
                 if crypto:
                     crypto['trail_stop'] = trail_level
@@ -1139,6 +1207,19 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if not tag and hours >= self.time_stop_hours and pnl < self.time_stop_pnl_min:
                 tag = "Time Stop"
 
+            # RSI momentum exit: exit when RSI peaked overbought and now falling back below 70
+            if not tag and crypto and crypto['rsi'].IsReady:
+                if self.rsi_peaked_overbought.get(symbol, False) and crypto['rsi'].Current.Value < 70:
+                    tag = "RSI Momentum Exit"
+
+            # Volume dry-up exit: exit if volume fell >50% vs entry vol for 2 consecutive bars
+            if not tag and hours >= 2.0 and crypto and len(crypto['volume']) >= 2:
+                entry_vol = self.entry_volumes.get(symbol, 0)
+                if entry_vol > 0:
+                    v1 = crypto['volume'][-1]
+                    v2 = crypto['volume'][-2]
+                    if v1 < entry_vol * 0.50 and v2 < entry_vol * 0.50:
+                        tag = "Volume Dry-up"
 
             if not tag and hours >= self.extended_time_stop_hours and pnl < self.extended_time_stop_pnl_max:
                 tag = "Extended Time Stop"
@@ -1348,6 +1429,30 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.Debug(f"Trades: {self.trade_count} | WR: {wr:.1%}")
         self.Debug(f"Final: ${self.Portfolio.TotalPortfolioValue:.2f}")
         self.Debug(f"PnL: {self.total_pnl:+.2%}")
+
+        # Realism validation
+        if total > 0:
+            avg_win = float(np.mean(list(self._rolling_win_sizes))) if len(self._rolling_win_sizes) > 0 else 0
+            avg_loss = float(np.mean(list(self._rolling_loss_sizes))) if len(self._rolling_loss_sizes) > 0 else 0
+            self.Debug("=== REALISM CHECKS ===")
+            self.Debug(f"Win Rate: {wr:.1%} (realistic range: 45-65%)")
+            self.Debug(f"Avg Win: {avg_win:.2%} (should be > round-trip fees 0.65%)")
+            self.Debug(f"Avg Loss: {avg_loss:.2%}")
+            if self.winning_trades > 0 and self.losing_trades > 0 and avg_loss > 0:
+                pf = (avg_win * self.winning_trades) / (avg_loss * self.losing_trades)
+                self.Debug(f"Profit Factor: {pf:.2f}")
+            if wr > 0.70:
+                self.Debug("⚠️ RED FLAG: Win rate > 70% — likely backtest overfitting")
+            if avg_win < 0.005:
+                self.Debug("⚠️ RED FLAG: Avg win < 0.5% — too small to survive live fees")
+            try:
+                days = max((self.Time - self.StartDate).days, 1)
+                cagr = (self.Portfolio.TotalPortfolioValue / 1000) ** (365 / days) - 1
+                if cagr > 5.0:
+                    self.Debug("⚠️ RED FLAG: CAGR > 500% — backtest is unreliable")
+            except Exception:
+                pass
+
         persist_state(self)
 
     def DailyReport(self):
