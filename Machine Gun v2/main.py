@@ -10,6 +10,7 @@ from datetime import timedelta
 from mg2_data import (
     initialize_symbol, update_symbol_data, update_market_context,
     annualized_vol, compute_portfolio_risk_estimate, universe_filter, is_ready,
+    FearGreedData,
 )
 from mg2_entries import rebalance, execute_trades, DiagnosticsEngine
 from mg2_exits import check_exits
@@ -228,7 +229,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self.Debug(f"Warning: Could not add BTC - {e}")
 
         try:
-            from alt_data import FearGreedData
             self.fear_greed_symbol = self.AddData(FearGreedData, "FNG", Resolution.Daily).Symbol
             self.fear_greed_value  = 50
         except Exception as e:
