@@ -11,13 +11,8 @@ from mg2_data import (
     initialize_symbol, update_symbol_data, update_market_context,
     annualized_vol, compute_portfolio_risk_estimate, universe_filter, is_ready,
 )
-from mg2_entries import rebalance, execute_trades
+from mg2_entries import rebalance, execute_trades, DiagnosticsEngine
 from mg2_exits import check_exits
-from mg2_reporting import (
-    daily_report_v2, reset_daily_counters,
-    on_order_event, on_brokerage_message, on_end_of_algorithm,
-)
-from mg2_diagnostics import DiagnosticsEngine
 # endregion
 
 
@@ -58,7 +53,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.quick_take_profit = self._get_param("quick_take_profit", 0.150)
         self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.035)
         self.atr_tp_mult       = self._get_param("atr_tp_mult",       6.0)
-        self.atr_sl_mult       = self._get_param("atr_sl_mult",       2.5)
+        self.atr_sl_mult       = self._get_param("atr_sl_mult",       3.0)   # raised from 2.5 — more breathing room
         # Trailing: wider activation allows runners to develop
         self.trail_activation  = self._get_param("trail_activation",  0.060)  # 6% (was 4%)
         self.trail_stop_pct    = self._get_param("trail_stop_pct",    0.040)  # 4% (was 2.5%)
@@ -114,9 +109,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.max_daily_trades        = 24000
         self.daily_trade_count       = 0
         self.last_trade_date         = None
-        self.exit_cooldown_hours     = 2.0
+        self.exit_cooldown_hours     = 1.0   # reduced from 2.0 — faster re-entry into momentum runners
         self.cancel_cooldown_minutes = 1
-        self.max_symbol_trades_per_day = 3
+        self.max_symbol_trades_per_day = 5   # raised from 3 — allow momentum re-entries
 
         # ── Fee / profit floor ────────────────────────────────────────────────
         self.expected_round_trip_fees = 0.008   # conservative: 0.8% round-trip (taker)
@@ -366,14 +361,14 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def DailyReport(self):
         if self.IsWarmingUp: return
-        daily_report_v2(self)
+        _daily_report(self)
 
     def ResetDailyCounters(self):
-        reset_daily_counters(self)
+        _reset_daily_counters(self)
 
     def HealthCheck(self):
         if self.IsWarmingUp: return
-        health_check(self)
+        _health_check(self)
 
     def ResyncHoldings(self):
         if self.IsWarmingUp: return
@@ -386,17 +381,433 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def PortfolioSanityCheck(self):
         if self.IsWarmingUp: return
-        portfolio_sanity_check(self)
+        _portfolio_sanity_check(self)
 
     def ReviewPerformance(self):
         if self.IsWarmingUp or len(self.trade_log) < 10: return
-        review_performance(self)
+        _review_performance(self)
 
     def OnOrderEvent(self, event):
-        on_order_event(self, event)
+        _on_order_event(self, event)
 
     def OnBrokerageMessage(self, message):
-        on_brokerage_message(self, message)
+        _on_brokerage_message(self, message)
 
     def OnEndOfAlgorithm(self):
-        on_end_of_algorithm(self)
+        _on_end_of_algorithm(self)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reporting helpers (merged from mg2_reporting.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_setup_type_for_exit(algo, symbol):
+    """Retrieve the setup type from open diagnostics record if available."""
+    diag = getattr(algo, '_diagnostics', None)
+    if diag is None:
+        return None
+    rec = diag._open_records.get(symbol)
+    if rec is not None:
+        return rec.setup_type
+    return None
+
+
+def _daily_report(algo):
+    """Generate daily report with portfolio status and position details."""
+    if algo.IsWarmingUp:
+        return
+    total = algo.winning_trades + algo.losing_trades
+    wr = algo.winning_trades / total if total > 0 else 0
+    avg = algo.total_pnl / total if total > 0 else 0
+    algo.Debug(f"=== DAILY {algo.Time.date()} ===")
+    algo.Debug(f"Portfolio: ${algo.Portfolio.TotalPortfolioValue:.2f} | Cash: ${algo.Portfolio.Cash:.2f}")
+    algo.Debug(f"Pos: {get_actual_position_count(algo)}/{algo.base_max_positions} | {algo.market_regime} {algo.volatility_regime} {algo.market_breadth:.0%}")
+    algo.Debug(f"Trades: {total} | WR: {wr:.1%} | Avg: {avg:+.2%}")
+    if algo._session_blacklist:
+        algo.Debug(f"Blacklist: {len(algo._session_blacklist)}")
+    for kvp in algo.Portfolio:
+        if is_invested_not_dust(algo, kvp.Key):
+            s = kvp.Key
+            entry = algo.entry_prices.get(s, kvp.Value.AveragePrice)
+            cur = algo.Securities[s].Price if s in algo.Securities else kvp.Value.Price
+            pnl = (cur - entry) / entry if entry > 0 else 0
+            algo.Debug(f"  {s.Value}: ${entry:.4f}→${cur:.4f} ({pnl:+.2%})")
+    persist_state(algo)
+
+
+def _reset_daily_counters(algo):
+    algo.daily_trade_count = 0
+    algo.last_trade_date = algo.Time.date()
+    algo._daily_open_value = algo.Portfolio.TotalPortfolioValue
+    for crypto in algo.crypto_data.values():
+        crypto['trade_count_today'] = 0
+    if len(algo._session_blacklist) > 0:
+        algo.Debug(f"Clearing session blacklist ({len(algo._session_blacklist)} items)")
+        algo._session_blacklist.clear()
+    algo._symbol_entry_cooldowns.clear()
+    persist_state(algo)
+
+
+def _on_order_event(algo, event):
+    try:
+        symbol = event.Symbol
+        algo.Debug(f"ORDER: {symbol.Value} {event.Status} {event.Direction} qty={event.FillQuantity or event.Quantity} price={event.FillPrice} id={event.OrderId}")
+        if event.Status == OrderStatus.Submitted:
+            if symbol not in algo._pending_orders:
+                algo._pending_orders[symbol] = 0
+            intended_qty = abs(event.Quantity) if event.Quantity != 0 else abs(event.FillQuantity)
+            algo._pending_orders[symbol] += intended_qty
+            if symbol not in algo._submitted_orders:
+                has_position = symbol in algo.Portfolio and algo.Portfolio[symbol].Invested
+                if event.Direction == OrderDirection.Sell and has_position:
+                    inferred_intent = 'exit'
+                elif event.Direction == OrderDirection.Buy and not has_position:
+                    inferred_intent = 'entry'
+                else:
+                    inferred_intent = 'entry' if event.Direction == OrderDirection.Buy else 'exit'
+                algo._submitted_orders[symbol] = {
+                    'order_id': event.OrderId,
+                    'time': algo.Time,
+                    'quantity': event.Quantity,
+                    'intent': inferred_intent
+                }
+            else:
+                algo._submitted_orders[symbol]['order_id'] = event.OrderId
+        elif event.Status == OrderStatus.PartiallyFilled:
+            if symbol in algo._pending_orders:
+                algo._pending_orders[symbol] -= abs(event.FillQuantity)
+                if algo._pending_orders[symbol] <= 0:
+                    algo._pending_orders.pop(symbol, None)
+            if event.Direction == OrderDirection.Buy:
+                if symbol not in algo.entry_prices:
+                    algo.entry_prices[symbol] = event.FillPrice
+                    algo.highest_prices[symbol] = event.FillPrice
+                    algo.entry_times[symbol] = algo.Time
+            slip_log(algo, symbol, event.Direction, event.FillPrice)
+        elif event.Status == OrderStatus.Filled:
+            algo._pending_orders.pop(symbol, None)
+            algo._submitted_orders.pop(symbol, None)
+            algo._order_retries.pop(event.OrderId, None)
+            if event.Direction == OrderDirection.Buy:
+                algo.entry_prices[symbol] = event.FillPrice
+                algo.highest_prices[symbol] = event.FillPrice
+                algo.entry_times[symbol] = algo.Time
+                algo.daily_trade_count += 1
+                crypto = algo.crypto_data.get(symbol)
+                if crypto and len(crypto['volume']) >= 1:
+                    algo.entry_volumes[symbol] = crypto['volume'][-1]
+                algo.rsi_peaked_overbought.pop(symbol, None)
+            else:
+                if symbol in algo._partial_sell_symbols:
+                    algo._partial_sell_symbols.discard(symbol)
+                else:
+                    order = algo.Transactions.GetOrderById(event.OrderId)
+                    exit_tag = order.Tag if order and order.Tag else "Unknown"
+                    entry = algo.entry_prices.get(symbol, None)
+                    if entry is None:
+                        entry = event.FillPrice
+                        algo.Debug(f"⚠️ WARNING: Missing entry price for {symbol.Value} sell, using fill price")
+                    pnl = (event.FillPrice - entry) / entry if entry > 0 else 0
+                    algo._rolling_wins.append(1 if pnl > 0 else 0)
+                    algo._recent_trade_outcomes.append(1 if pnl > 0 else 0)
+                    if pnl > 0:
+                        algo._rolling_win_sizes.append(pnl)
+                        algo.winning_trades += 1
+                        algo.consecutive_losses = 0
+                    else:
+                        algo._rolling_loss_sizes.append(abs(pnl))
+                        algo.losing_trades += 1
+                        algo.consecutive_losses += 1
+                    algo.total_pnl += pnl
+                    if not hasattr(algo, 'pnl_by_tag'):
+                        algo.pnl_by_tag = {}
+                    if exit_tag not in algo.pnl_by_tag:
+                        algo.pnl_by_tag[exit_tag] = []
+                    algo.pnl_by_tag[exit_tag].append(pnl)
+                    algo.trade_log.append({
+                        'time':         algo.Time,
+                        'symbol':       symbol.Value,
+                        'pnl_pct':      pnl,
+                        'exit_reason':  exit_tag,
+                        'setup_type':   _get_setup_type_for_exit(algo, symbol),
+                        'market_regime': algo.market_regime,
+                        'vol_regime':   algo.volatility_regime,
+                    })
+                    if len(algo._recent_trade_outcomes) >= 12:
+                        recent_wr = sum(algo._recent_trade_outcomes) / len(algo._recent_trade_outcomes)
+                        if recent_wr < 0.25:
+                            algo._cash_mode_until = algo.Time + timedelta(hours=2)
+                            algo.Debug(f"⚠️ CASH MODE: WR={recent_wr:.0%} over {len(algo._recent_trade_outcomes)} trades. Pausing 2h.")
+                    cleanup_position(algo, symbol)
+                    algo._failed_exit_attempts.pop(symbol, None)
+                    algo._failed_exit_counts.pop(symbol, None)
+            slip_log(algo, symbol, event.Direction, event.FillPrice)
+        elif event.Status == OrderStatus.Canceled:
+            algo._pending_orders.pop(symbol, None)
+            algo._submitted_orders.pop(symbol, None)
+            algo._order_retries.pop(event.OrderId, None)
+            if event.Direction == OrderDirection.Sell and symbol not in algo.entry_prices:
+                if is_invested_not_dust(algo, symbol):
+                    holding = algo.Portfolio[symbol]
+                    algo.entry_prices[symbol] = holding.AveragePrice
+                    algo.highest_prices[symbol] = holding.AveragePrice
+                    algo.entry_times[symbol] = algo.Time
+                    algo.Debug(f"RE-TRACKED after cancel: {symbol.Value}")
+        elif event.Status == OrderStatus.Invalid:
+            algo._pending_orders.pop(symbol, None)
+            algo._submitted_orders.pop(symbol, None)
+            algo._order_retries.pop(event.OrderId, None)
+            if event.Direction == OrderDirection.Sell:
+                price = algo.Securities[symbol].Price if symbol in algo.Securities else 0
+                min_notional = get_min_notional_usd(algo, symbol)
+                if price > 0 and symbol in algo.Portfolio and abs(algo.Portfolio[symbol].Quantity) * price < min_notional:
+                    algo.Debug(f"DUST CLEANUP on invalid sell: {symbol.Value} — releasing tracking")
+                    cleanup_position(algo, symbol)
+                    algo._failed_exit_counts.pop(symbol, None)
+                else:
+                    fail_count = algo._failed_exit_counts.get(symbol, 0) + 1
+                    algo._failed_exit_counts[symbol] = fail_count
+                    algo.Debug(f"Invalid sell #{fail_count}: {symbol.Value}")
+                    if fail_count >= 3:
+                        algo.Debug(f"FORCE CLEANUP: {symbol.Value} after {fail_count} failed exits — releasing tracking")
+                        cleanup_position(algo, symbol)
+                        algo._failed_exit_counts.pop(symbol, None)
+                    elif symbol not in algo.entry_prices:
+                        if is_invested_not_dust(algo, symbol):
+                            holding = algo.Portfolio[symbol]
+                            algo.entry_prices[symbol] = holding.AveragePrice
+                            algo.highest_prices[symbol] = holding.AveragePrice
+                            algo.entry_times[symbol] = algo.Time
+                            algo.Debug(f"RE-TRACKED after invalid: {symbol.Value}")
+            algo._session_blacklist.add(symbol.Value)
+    except Exception as e:
+        algo.Debug(f"OnOrderEvent error: {e}")
+    if algo.LiveMode:
+        persist_state(algo)
+
+
+def _on_brokerage_message(algo, message):
+    try:
+        txt = message.Message.lower()
+        if "system status:" in txt:
+            if "online" in txt:
+                algo.kraken_status = "online"
+            elif "maintenance" in txt:
+                algo.kraken_status = "maintenance"
+            elif "cancel_only" in txt:
+                algo.kraken_status = "cancel_only"
+            elif "post_only" in txt:
+                algo.kraken_status = "post_only"
+            else:
+                algo.kraken_status = "unknown"
+            algo.Debug(f"Kraken status update: {algo.kraken_status}")
+        if "rate limit" in txt or "too many" in txt:
+            algo.Debug(f"⚠️ RATE LIMIT - pausing {algo.rate_limit_cooldown_minutes}min")
+            algo._rate_limit_until = algo.Time + timedelta(minutes=algo.rate_limit_cooldown_minutes)
+    except Exception as e:
+        algo.Debug(f"BrokerageMessage parse error: {e}")
+
+
+def _on_end_of_algorithm(algo):
+    total = algo.winning_trades + algo.losing_trades
+    wr = algo.winning_trades / total if total > 0 else 0
+    algo.Debug("=== FINAL REPORT — Machine Gun v2 Momentum Breakout Runner v8.0.0 ===")
+    algo.Debug(f"Trades: {algo.trade_count} | WR: {wr:.1%}")
+    algo.Debug(f"Final: ${algo.Portfolio.TotalPortfolioValue:.2f}")
+    algo.Debug(f"PnL: {algo.total_pnl:+.2%}")
+
+    if total > 0:
+        avg_win  = float(np.mean(list(algo._rolling_win_sizes)))  if len(algo._rolling_win_sizes)  > 0 else 0
+        avg_loss = float(np.mean(list(algo._rolling_loss_sizes))) if len(algo._rolling_loss_sizes) > 0 else 0
+        algo.Debug("=== REALISM CHECKS ===")
+        algo.Debug(f"Win Rate: {wr:.1%} (target range: 45-65% for this strategy)")
+        algo.Debug(f"Avg Win: {avg_win:.2%} (should be > round-trip fees 0.80%)")
+        algo.Debug(f"Avg Loss: {avg_loss:.2%}")
+        if algo.winning_trades > 0 and algo.losing_trades > 0 and avg_loss > 0:
+            pf = (avg_win * algo.winning_trades) / (avg_loss * algo.losing_trades)
+            algo.Debug(f"Profit Factor: {pf:.2f}")
+        if wr > 0.70:
+            algo.Debug("WARNING: Win rate > 70% — possible backtest overfitting")
+        if avg_win < 0.008:
+            algo.Debug("WARNING: Avg win < 0.8% — too small to survive live fees")
+        try:
+            days = max((algo.Time - algo.StartDate).days, 1)
+            cagr = (algo.Portfolio.TotalPortfolioValue / 1000) ** (365 / days) - 1
+            if cagr > 5.0:
+                algo.Debug("WARNING: CAGR > 500% — backtest is likely unreliable")
+        except Exception:
+            pass
+
+    if hasattr(algo, 'pnl_by_tag') and algo.pnl_by_tag:
+        algo.Debug("=== PNL BY EXIT TAG ===")
+        for tag, pnls in sorted(algo.pnl_by_tag.items()):
+            n = len(pnls)
+            avg = float(np.mean(pnls)) if pnls else 0
+            wins = sum(1 for p in pnls if p > 0)
+            algo.Debug(f"  {tag}: n={n} wr={wins/n:.1%} avg={avg:+.2%}")
+
+    diag = getattr(algo, '_diagnostics', None)
+    if diag is not None:
+        diag.print_summary()
+
+    persist_state(algo)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Monitoring helpers (merged from execution.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _health_check(algo):
+    """
+    Enhanced health check with improved orphan detection and reverse resync.
+    """
+    if algo.IsWarmingUp:
+        return
+
+    resync_holdings_full(algo)
+
+    issues = []
+    if algo.Portfolio.Cash < 5:
+        issues.append(f"Low cash: ${algo.Portfolio.Cash:.2f}")
+
+    for symbol in list(algo.entry_prices.keys()):
+        open_orders = algo.Transactions.GetOpenOrders(symbol)
+        if len(open_orders) > 0:
+            all_stale = True
+            for o in open_orders:
+                order_time = normalize_order_time(o.Time)
+                if (algo.Time - order_time).total_seconds() <= algo.live_stale_order_timeout_seconds:
+                    all_stale = False
+                    break
+            if not all_stale:
+                continue
+            for o in open_orders:
+                try:
+                    algo.Transactions.CancelOrder(o.Id)
+                    issues.append(f"Canceled stale order: {symbol.Value} (order {o.Id})")
+                except Exception as e:
+                    algo.Debug(f"Error canceling stale order for {symbol.Value}: {e}")
+
+        if not is_invested_not_dust(algo, symbol):
+            issues.append(f"Orphan tracking: {symbol.Value}")
+            cleanup_position(algo, symbol)
+
+    for kvp in algo.Portfolio:
+        if is_invested_not_dust(algo, kvp.Key) and kvp.Key not in algo.entry_prices:
+            issues.append(f"Untracked position: {kvp.Key.Value}")
+
+    if len(algo._session_blacklist) > 50:
+        issues.append(f"Large session blacklist: {len(algo._session_blacklist)}")
+
+    open_orders = algo.Transactions.GetOpenOrders()
+    if len(open_orders) > 0:
+        issues.append(f"Open orders: {len(open_orders)}")
+
+    if issues:
+        algo.Debug("=== HEALTH CHECK ===")
+        for issue in issues:
+            algo.Debug(f"  ⚠️ {issue}")
+    else:
+        debug_limited(algo, "Health check: OK")
+
+
+def _portfolio_sanity_check(algo):
+    """
+    Check for portfolio value mismatches between QC and tracked positions.
+    """
+    if algo.IsWarmingUp:
+        return
+
+    total_qc = algo.Portfolio.TotalPortfolioValue
+
+    try:
+        usd_cash = algo.Portfolio.CashBook["USD"].Amount
+    except (KeyError, AttributeError):
+        usd_cash = algo.Portfolio.Cash
+
+    tracked_value = 0.0
+    tracked_positions = {}
+
+    for sym in list(algo.entry_prices.keys()):
+        if sym in algo.Securities:
+            price = algo.Securities[sym].Price
+            if sym in algo.Portfolio:
+                qty = algo.Portfolio[sym].Quantity
+                value = abs(qty) * price
+                tracked_value += value
+                tracked_positions[sym.Value] = {'qty': qty, 'price': price, 'value': value}
+
+    expected = usd_cash + tracked_value
+    abs_diff = abs(total_qc - expected)
+    if total_qc > 1.0:
+        pct_diff = abs_diff / total_qc
+        should_warn = pct_diff > algo.portfolio_mismatch_threshold and abs_diff > algo.portfolio_mismatch_min_dollars
+        if should_warn:
+            if algo._last_mismatch_warning is None or (algo.Time - algo._last_mismatch_warning).total_seconds() >= algo.portfolio_mismatch_cooldown_seconds:
+                algo.Debug(f"⚠️ PORTFOLIO MISMATCH: QC total=${total_qc:.2f} but usd_cash+tracked=${expected:.2f} (diff=${abs_diff:.2f}, {pct_diff:.2%})")
+                algo.Debug("=== PORTFOLIO BREAKDOWN ===")
+                algo.Debug(f"USD Cash: ${usd_cash:.2f}")
+                if tracked_positions:
+                    algo.Debug(f"Tracked Positions ({len(tracked_positions)}):")
+                    for ticker, info in tracked_positions.items():
+                        algo.Debug(f"  {ticker}: qty={info['qty']:.6f}, price=${info['price']:.4f}, value=${info['value']:.2f}")
+                else:
+                    algo.Debug("Tracked Positions: None")
+                untracked = []
+                for symbol in algo.Portfolio.Keys:
+                    holding = algo.Portfolio[symbol]
+                    if holding.Invested and holding.Quantity != 0:
+                        if symbol not in algo.entry_prices:
+                            price = algo.Securities[symbol].Price if symbol in algo.Securities else holding.Price
+                            value = abs(holding.Quantity) * price
+                            untracked.append({'ticker': symbol.Value, 'qty': holding.Quantity, 'price': price, 'value': value})
+                if untracked:
+                    algo.Debug(f"Untracked Portfolio Holdings ({len(untracked)}):")
+                    for info in untracked:
+                        algo.Debug(f"  {info['ticker']}: qty={info['qty']:.6f}, price=${info['price']:.4f}, value=${info['value']:.2f}")
+                else:
+                    algo.Debug("Untracked Portfolio Holdings: None")
+                crypto_cash = []
+                try:
+                    for currency, cash in algo.Portfolio.CashBook.items():
+                        if currency != "USD" and cash.Amount != 0:
+                            crypto_cash.append({'currency': currency, 'amount': cash.Amount, 'value': cash.ValueInAccountCurrency})
+                except Exception:
+                    pass
+                if crypto_cash:
+                    algo.Debug(f"Crypto CashBook Entries ({len(crypto_cash)}):")
+                    for info in crypto_cash:
+                        algo.Debug(f"  {info['currency']}: amount={info['amount']:.6f}, value=${info['value']:.2f}")
+                else:
+                    algo.Debug("Crypto CashBook Entries: None")
+                if total_qc > expected:
+                    algo.Debug(f"QC Portfolio is higher by ${abs_diff:.2f} ({pct_diff:.2%})")
+                else:
+                    algo.Debug(f"Tracked value is higher by ${abs_diff:.2f} ({pct_diff:.2%})")
+                algo.Debug("=== END BREAKDOWN ===")
+                algo.Debug("Triggering resync_holdings_full to attempt auto-fix...")
+                resync_holdings_full(algo)
+                algo._last_mismatch_warning = algo.Time
+
+
+def _review_performance(algo):
+    """Review recent performance and adjust max_positions accordingly."""
+    if algo.IsWarmingUp or len(algo.trade_log) < 10:
+        return
+
+    recent_trades = algo.trade_log[-15:] if len(algo.trade_log) >= 15 else algo.trade_log
+    if len(recent_trades) == 0:
+        return
+
+    recent_win_rate = sum(1 for t in recent_trades if t['pnl_pct'] > 0) / len(recent_trades)
+    recent_avg_pnl = np.mean([t['pnl_pct'] for t in recent_trades])
+    old_max = algo.max_positions
+
+    if recent_win_rate < 0.2 and recent_avg_pnl < -0.05:
+        algo.max_positions = 1
+        if old_max != 1:
+            algo.Debug(f"PERFORMANCE DECAY: max_pos=1 (WR:{recent_win_rate:.0%}, PnL:{recent_avg_pnl:+.2%})")
+    elif recent_win_rate > 0.35 and recent_avg_pnl > -0.01:
+        algo.max_positions = algo.base_max_positions
+        if old_max != algo.base_max_positions:
+            algo.Debug(f"PERFORMANCE RECOVERY: max_pos={algo.base_max_positions}")
