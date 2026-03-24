@@ -74,30 +74,40 @@ class RealisticLimitFillModel(FillModel):
     """Only fill limit orders if the bar's range fully crosses the limit price,
     AND volume is sufficient to absorb the order."""
 
-    def LimitFill(self, asset, order, parameters):
-        bar = asset.GetLastData()
+    def LimitFill(self, asset, order):
+        # Create the order event (unfilled by default)
+        utc_time = Extensions.ConvertToUtc(asset.LocalTime, asset.Exchange.TimeZone)
+        fill = OrderEvent(order, utc_time, OrderFee.Zero)
+
+        if order.Status == OrderStatus.Canceled:
+            return fill
+
+        bar = asset.Cache.GetData[TradeBar]()
         if bar is None:
-            return Fill.NoFill()
+            return fill  # no data → no fill
 
         price = order.LimitPrice
         qty = abs(order.Quantity)
 
         if order.Direction == OrderDirection.Buy:
             if bar.Low > price:
-                return Fill.NoFill()
+                return fill  # price never reached limit
             if bar.Volume > 0 and qty > bar.Volume * 0.10:
-                return Fill.NoFill()
+                return fill  # order too large relative to volume
             fill_price = price
         elif order.Direction == OrderDirection.Sell:
             if bar.High < price:
-                return Fill.NoFill()
+                return fill  # price never reached limit
             if bar.Volume > 0 and qty > bar.Volume * 0.10:
-                return Fill.NoFill()
+                return fill  # order too large relative to volume
             fill_price = price
         else:
-            return Fill.NoFill()
+            return fill
 
-        return Fill(fill_price, qty)
+        fill.Status = OrderStatus.Filled
+        fill.FillQuantity = order.Quantity
+        fill.FillPrice = fill_price
+        return fill
 
 
 class RealisticCryptoSlippage:
