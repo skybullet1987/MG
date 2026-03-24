@@ -253,6 +253,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def _record_exit_pnl(self, symbol, entry_price, exit_price, exit_tag="Unknown"):
         return record_exit_pnl(self, symbol, entry_price, exit_price, exit_tag=exit_tag)
 
+    def _kelly_fraction(self):
+        return kelly_fraction(self)
+
     def UniverseFilter(self, universe):
         return universe_filter(self, universe)
 
@@ -355,188 +358,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         review_performance(self)
 
     def OnOrderEvent(self, event):
-        try:
-            symbol = event.Symbol
-            self.Debug(f"ORDER: {symbol.Value} {event.Status} {event.Direction} qty={event.FillQuantity or event.Quantity} price={event.FillPrice} id={event.OrderId}")
-            if event.Status == OrderStatus.Submitted:
-                if symbol not in self._pending_orders:
-                    self._pending_orders[symbol] = 0
-                intended_qty = abs(event.Quantity) if event.Quantity != 0 else abs(event.FillQuantity)
-                self._pending_orders[symbol] += intended_qty
-                if symbol not in self._submitted_orders:
-                    has_position = symbol in self.Portfolio and self.Portfolio[symbol].Invested
-                    if event.Direction == OrderDirection.Sell and has_position:
-                        inferred_intent = 'exit'
-                    elif event.Direction == OrderDirection.Buy and not has_position:
-                        inferred_intent = 'entry'
-                    else:
-                        inferred_intent = 'entry' if event.Direction == OrderDirection.Buy else 'exit'
-                    self._submitted_orders[symbol] = {
-                        'order_id': event.OrderId,
-                        'time': self.Time,
-                        'quantity': event.Quantity,
-                        'intent': inferred_intent
-                    }
-                else:
-                    self._submitted_orders[symbol]['order_id'] = event.OrderId
-            elif event.Status == OrderStatus.PartiallyFilled:
-                if symbol in self._pending_orders:
-                    self._pending_orders[symbol] -= abs(event.FillQuantity)
-                    if self._pending_orders[symbol] <= 0:
-                        self._pending_orders.pop(symbol, None)
-                if event.Direction == OrderDirection.Buy:
-                    if symbol not in self.entry_prices:
-                        self.entry_prices[symbol] = event.FillPrice
-                        self.highest_prices[symbol] = event.FillPrice
-                        self.entry_times[symbol] = self.Time
-                slip_log(self, symbol, event.Direction, event.FillPrice)
-            elif event.Status == OrderStatus.Filled:
-                self._pending_orders.pop(symbol, None)
-                self._submitted_orders.pop(symbol, None)
-                self._order_retries.pop(event.OrderId, None)
-                if event.Direction == OrderDirection.Buy:
-                    self.entry_prices[symbol] = event.FillPrice
-                    self.highest_prices[symbol] = event.FillPrice
-                    self.entry_times[symbol] = self.Time
-                    self.daily_trade_count += 1
-                    crypto = self.crypto_data.get(symbol)
-                    if crypto and len(crypto['volume']) >= 1:
-                        self.entry_volumes[symbol] = crypto['volume'][-1]
-                    self.rsi_peaked_overbought.pop(symbol, None)
-                else:
-                    if symbol in self._partial_sell_symbols:
-                        self._partial_sell_symbols.discard(symbol)
-                    else:
-                        order = self.Transactions.GetOrderById(event.OrderId)
-                        exit_tag = order.Tag if order and order.Tag else "Unknown"
-                        entry = self.entry_prices.get(symbol, None)
-                        if entry is None:
-                            entry = event.FillPrice
-                            self.Debug(f"⚠️ WARNING: Missing entry price for {symbol.Value} sell, using fill price")
-                        pnl = (event.FillPrice - entry) / entry if entry > 0 else 0
-                        self._rolling_wins.append(1 if pnl > 0 else 0)
-                        self._recent_trade_outcomes.append(1 if pnl > 0 else 0)
-                        if pnl > 0:
-                            self._rolling_win_sizes.append(pnl)
-                            self.winning_trades += 1
-                            self.consecutive_losses = 0
-                        else:
-                            self._rolling_loss_sizes.append(abs(pnl))
-                            self.losing_trades += 1
-                            self.consecutive_losses += 1
-                        self.total_pnl += pnl
-                        if not hasattr(self, 'pnl_by_tag'):
-                            self.pnl_by_tag = {}
-                        if exit_tag not in self.pnl_by_tag:
-                            self.pnl_by_tag[exit_tag] = []
-                        self.pnl_by_tag[exit_tag].append(pnl)
-                        self.trade_log.append({
-                            'time': self.Time,
-                            'symbol': symbol.Value,
-                            'pnl_pct': pnl,
-                            'exit_reason': exit_tag,
-                        })
-                        if len(self._recent_trade_outcomes) >= 12:
-                            recent_wr = sum(self._recent_trade_outcomes) / len(self._recent_trade_outcomes)
-                            if recent_wr < 0.25:
-                                self._cash_mode_until = self.Time + timedelta(hours=2)
-                                self.Debug(f"⚠️ CASH MODE: WR={recent_wr:.0%} over {len(self._recent_trade_outcomes)} trades. Pausing 2h.")
-                        cleanup_position(self, symbol)
-                        self._failed_exit_attempts.pop(symbol, None)
-                        self._failed_exit_counts.pop(symbol, None)
-                slip_log(self, symbol, event.Direction, event.FillPrice)
-            elif event.Status == OrderStatus.Canceled:
-                self._pending_orders.pop(symbol, None)
-                self._submitted_orders.pop(symbol, None)
-                self._order_retries.pop(event.OrderId, None)
-                if event.Direction == OrderDirection.Sell and symbol not in self.entry_prices:
-                    if is_invested_not_dust(self, symbol):
-                        holding = self.Portfolio[symbol]
-                        self.entry_prices[symbol] = holding.AveragePrice
-                        self.highest_prices[symbol] = holding.AveragePrice
-                        self.entry_times[symbol] = self.Time
-                        self.Debug(f"RE-TRACKED after cancel: {symbol.Value}")
-            elif event.Status == OrderStatus.Invalid:
-                self._pending_orders.pop(symbol, None)
-                self._submitted_orders.pop(symbol, None)
-                self._order_retries.pop(event.OrderId, None)
-                if event.Direction == OrderDirection.Sell:
-                    price = self.Securities[symbol].Price if symbol in self.Securities else 0
-                    min_notional = get_min_notional_usd(self, symbol)
-                    if price > 0 and symbol in self.Portfolio and abs(self.Portfolio[symbol].Quantity) * price < min_notional:
-                        self.Debug(f"DUST CLEANUP on invalid sell: {symbol.Value} — releasing tracking")
-                        cleanup_position(self, symbol)
-                        self._failed_exit_counts.pop(symbol, None)
-                    else:
-                        fail_count = self._failed_exit_counts.get(symbol, 0) + 1
-                        self._failed_exit_counts[symbol] = fail_count
-                        self.Debug(f"Invalid sell #{fail_count}: {symbol.Value}")
-                        if fail_count >= 3:
-                            self.Debug(f"FORCE CLEANUP: {symbol.Value} after {fail_count} failed exits — releasing tracking")
-                            cleanup_position(self, symbol)
-                            self._failed_exit_counts.pop(symbol, None)
-                        elif symbol not in self.entry_prices:
-                            if is_invested_not_dust(self, symbol):
-                                holding = self.Portfolio[symbol]
-                                self.entry_prices[symbol] = holding.AveragePrice
-                                self.highest_prices[symbol] = holding.AveragePrice
-                                self.entry_times[symbol] = self.Time
-                                self.Debug(f"RE-TRACKED after invalid: {symbol.Value}")
-                self._session_blacklist.add(symbol.Value)
-        except Exception as e:
-            self.Debug(f"OnOrderEvent error: {e}")
-        if self.LiveMode:
-            persist_state(self)
+        on_order_event(self, event)
 
     def OnBrokerageMessage(self, message):
-        try:
-            txt = message.Message.lower()
-            if "system status:" in txt:
-                if "online" in txt:
-                    self.kraken_status = "online"
-                elif "maintenance" in txt:
-                    self.kraken_status = "maintenance"
-                elif "cancel_only" in txt:
-                    self.kraken_status = "cancel_only"
-                elif "post_only" in txt:
-                    self.kraken_status = "post_only"
-                else:
-                    self.kraken_status = "unknown"
-                self.Debug(f"Kraken status update: {self.kraken_status}")
-            if "rate limit" in txt or "too many" in txt:
-                self.Debug(f"⚠️ RATE LIMIT - pausing {self.rate_limit_cooldown_minutes}min")
-                self._rate_limit_until = self.Time + timedelta(minutes=self.rate_limit_cooldown_minutes)
-        except Exception as e:
-            self.Debug(f"BrokerageMessage parse error: {e}")
+        on_brokerage_message(self, message)
 
     def OnEndOfAlgorithm(self):
-        total = self.winning_trades + self.losing_trades
-        wr = self.winning_trades / total if total > 0 else 0
-        self.Debug("=== FINAL ===")
-        self.Debug(f"Trades: {self.trade_count} | WR: {wr:.1%}")
-        self.Debug(f"Final: ${self.Portfolio.TotalPortfolioValue:.2f}")
-        self.Debug(f"PnL: {self.total_pnl:+.2%}")
-
-        if total > 0:
-            avg_win = float(np.mean(list(self._rolling_win_sizes))) if len(self._rolling_win_sizes) > 0 else 0
-            avg_loss = float(np.mean(list(self._rolling_loss_sizes))) if len(self._rolling_loss_sizes) > 0 else 0
-            self.Debug("=== REALISM CHECKS ===")
-            self.Debug(f"Win Rate: {wr:.1%} (realistic range: 45-65%)")
-            self.Debug(f"Avg Win: {avg_win:.2%} (should be > round-trip fees 0.65%)")
-            self.Debug(f"Avg Loss: {avg_loss:.2%}")
-            if self.winning_trades > 0 and self.losing_trades > 0 and avg_loss > 0:
-                pf = (avg_win * self.winning_trades) / (avg_loss * self.losing_trades)
-                self.Debug(f"Profit Factor: {pf:.2f}")
-            if wr > 0.70:
-                self.Debug("⚠️ RED FLAG: Win rate > 70% — likely backtest overfitting")
-            if avg_win < 0.005:
-                self.Debug("⚠️ RED FLAG: Avg win < 0.5% — too small to survive live fees")
-            try:
-                days = max((self.Time - self.StartDate).days, 1)
-                cagr = (self.Portfolio.TotalPortfolioValue / 1000) ** (365 / days) - 1
-                if cagr > 5.0:
-                    self.Debug("⚠️ RED FLAG: CAGR > 500% — backtest is unreliable")
-            except Exception:
-                pass
-
-        persist_state(self)
+        on_end_of_algorithm(self)
