@@ -507,8 +507,24 @@ def rebalance(algo):
     except (KeyError, AttributeError):
         cash = algo.Portfolio.Cash
 
-    debug_limited(algo, (f"REBALANCE: {count_above_thresh}/{count_scored} setup-qualified "
-                         f"thresh={threshold_now:.2f} | cash=${cash:.2f}"))
+    # ── Throttled REBALANCE logging — avoid per-minute browser flooding ───────
+    # Log only every 5 minutes, OR when candidate count is notably high (>10),
+    # OR when a new candidate count vs last logged count is significantly different.
+    _now = algo.Time
+    _last_log = getattr(algo, '_last_rebalance_log_time', None)
+    _last_count = getattr(algo, '_last_rebalance_log_count', -1)
+    _log_interval_minutes = 5
+    _should_log = (
+        _last_log is None
+        or (_now - _last_log).total_seconds() >= _log_interval_minutes * 60
+        or count_above_thresh >= 10          # warn if unusually high
+        or abs(count_above_thresh - _last_count) >= 5  # notable change
+    )
+    if _should_log:
+        algo.Debug(f"REBALANCE: {count_above_thresh}/{count_scored} setup-qualified "
+                   f"thresh={threshold_now:.2f} | cash=${cash:.2f}")
+        algo._last_rebalance_log_time  = _now
+        algo._last_rebalance_log_count = count_above_thresh
 
     if not scores:
         log_skip(algo, "no setup candidates qualified")
@@ -516,6 +532,16 @@ def rebalance(algo):
 
     # Sort by confidence descending (highest-conviction first)
     scores.sort(key=lambda x: x['net_score'], reverse=True)
+
+    # ── Log top candidates (max 3) so we can see what would trade ─────────────
+    if scores and _should_log:
+        top = scores[:3]
+        for cand in top:
+            algo.Debug(
+                f"  TOP: {cand['symbol'].Value} setup={cand['setup_type']} "
+                f"conf={cand['net_score']:.3f}"
+            )
+
     algo._last_skip_reason = None
     execute_trades(algo, scores, threshold_now)
 

@@ -23,51 +23,52 @@ Design principles
 # ─────────────────────────────────────────────────────────────────────────────
 # Minimum confidence threshold for a setup to generate an entry signal.
 # This replaces the old ``entry_threshold`` additive score gate.
-SETUP_MIN_CONFIDENCE = 0.55
+SETUP_MIN_CONFIDENCE = 0.65
 
 # High-conviction threshold — triggers maximum position size
-SETUP_HIGH_CONVICTION = 0.72
+SETUP_HIGH_CONVICTION = 0.78
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Setup-specific minimum confidence gates
 # ─────────────────────────────────────────────────────────────────────────────
-IGNITION_BREAKOUT_MIN_CONFIDENCE     = 0.55
-COMPRESSION_EXPANSION_MIN_CONFIDENCE = 0.55
-MOMENTUM_CONTINUATION_MIN_CONFIDENCE = 0.55
+IGNITION_BREAKOUT_MIN_CONFIDENCE     = 0.65
+COMPRESSION_EXPANSION_MIN_CONFIDENCE = 0.65
+MOMENTUM_CONTINUATION_MIN_CONFIDENCE = 0.68   # strictest — most prone to over-qualifying
 
 # Order-book imbalance thresholds
 OBI_STRONG  = 0.30
-OBI_PARTIAL = 0.15
+OBI_PARTIAL = 0.20   # raised from 0.15 — require clearer imbalance signal
 
 # Volume surge thresholds (ratio vs rolling baseline)
 VOL_SURGE_STRONG  = 3.5
-VOL_SURGE_PARTIAL = 2.0
+VOL_SURGE_PARTIAL = 2.5   # raised from 2.0 — require more meaningful surge
 
 # Compression: BB width must be below rolling-median by at least this fraction
-COMPRESSION_BB_WIDTH_FACTOR = 0.85   # width < 85% of 30-bar median = compressed
-COMPRESSION_MIN_BARS        = 4      # need at least 4 compressed bars
+COMPRESSION_BB_WIDTH_FACTOR = 0.80   # tighter: width < 80% of 30-bar median (was 0.85)
+COMPRESSION_MIN_BARS        = 6      # need at least 6 compressed bars (was 4)
 
 # Expansion: BB width must expand by at least this factor from the compression min
-EXPANSION_MIN_FACTOR        = 1.35   # width > 135% of compression min = expanding
+EXPANSION_MIN_FACTOR        = 1.50   # tighter: width > 150% of compression min (was 1.35)
 
 # Breakout freshness: entries within this many bars of the high break are "fresh"
-BREAKOUT_FRESH_BARS         = 3
+# Stale breakouts (beyond this window) are a hard reject — no partial credit.
+BREAKOUT_FRESH_BARS         = 2      # tightened from 3 — only the freshest ignitions
 
 # Anti-chase: price must not be more than this % above Kalman estimate
-ANTICHASE_MAX_PCT           = 0.030  # 3% max distance above Kalman / VWAP
+ANTICHASE_MAX_PCT           = 0.020  # 2% max distance (was 3%) — tighter anti-chase
 
 # Kalman slope: minimum positive slope (as % per bar) to confirm trend
-KALMAN_SLOPE_MIN            = 0.0001  # 0.01% per bar
+KALMAN_SLOPE_MIN            = 0.0002  # raised from 0.0001 — require more visible trend
 
-# ADX thresholds
-ADX_STRONG    = 20
-ADX_MODERATE  = 14
+# ADX thresholds — raised to require a more established trend
+ADX_STRONG    = 25   # was 20
+ADX_MODERATE  = 18   # was 14
 
 # RS vs BTC: prefer symbols outperforming BTC (positive = outperforming)
-RS_BTC_POSITIVE = 0.001   # at least 0.1% outperformance to get RS bonus
+RS_BTC_POSITIVE = 0.002   # raised from 0.001 — require clearer outperformance
 
 # Maximum spread fraction allowed for valid setups
-MAX_SPREAD_FOR_SETUP = 0.008  # 0.8% (wider = no entry)
+MAX_SPREAD_FOR_SETUP = 0.006  # 0.6% (tightened from 0.8%)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -225,13 +226,10 @@ class IgnitionBreakoutSetup:
         # ── Component 1: Range break (30% weight) ───────────────────────────
         range_high_20 = float(np.max(highs[-21:-1]))  # exclude current bar
         freshness = crypto.get('breakout_freshness', 999)
-        if price > range_high_20:
-            if freshness <= BREAKOUT_FRESH_BARS:
-                components['range_break'] = 0.30  # fresh breakout
-            else:
-                components['range_break'] = 0.15  # stale breakout (partial)
+        if price > range_high_20 and freshness <= BREAKOUT_FRESH_BARS:
+            components['range_break'] = 0.30  # fresh breakout only — stale = hard reject
         else:
-            return False, 0.0, components  # Hard gate: must have a range break
+            return False, 0.0, components  # Hard gate: must be a FRESH range break
 
         # ── Component 2: Volume ignition (25% weight) ────────────────────────
         _, v_contrib = _vol_score(crypto)
@@ -481,15 +479,18 @@ class MomentumContinuationSetup:
 
         best_reclaim = 0.0
 
-        # Standard key levels + VWAP SD2 lower band as a fourth reclaim target
+        # Tighter reclaim window: was_near checks 3 bars back, is_above is stricter.
+        # Price must have actually pulled back TO the level, not just been near it.
         for level, weight in [(vwap, 0.25), (ema20_val, 0.22), (kalman_est, 0.20), (vwap_sd2_lower, 0.18)]:
             if level <= 0:
                 continue
             dist_below = (level - prices[-3]) / level if len(prices) >= 3 else 1.0
             dist_current = (price - level) / level
 
-            was_near = -0.008 <= dist_below <= 0.015
-            is_above = 0.000 <= dist_current <= 0.020
+            # Tightened: was within 0.5% below to 1% above (was -0.8% to 1.5%)
+            # and currently 0% to 1% above (was 0% to 2%)
+            was_near = -0.005 <= dist_below <= 0.010
+            is_above = 0.000 <= dist_current <= 0.010
             if was_near and is_above:
                 best_reclaim = max(best_reclaim, weight)
 
@@ -501,10 +502,11 @@ class MomentumContinuationSetup:
         # ── Component 3: OBI freshness + CVD uptick (20%) ────────────────────
         _, o_contrib = _obi_score(crypto)
         cvd_up = _cvd_uptick(crypto, lookback=3)
+        # Require BOTH OBI and CVD to avoid false signals from one noisy indicator
         if o_contrib > 0 and cvd_up:
             components['obi_freshness'] = 0.20
-        elif o_contrib > 0 or cvd_up:
-            components['obi_freshness'] = 0.10
+        else:
+            return False, 0.0, components  # Hard gate: need both OBI + CVD confirmation
 
         # ── Component 4: Volume confirmation (15%) ───────────────────────────
         _, v_contrib = _vol_score(crypto)

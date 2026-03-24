@@ -176,6 +176,61 @@ class RealisticLimitFillModel(FillModel):
         fill.FillPrice    = fill_price
         return fill
 
+    def MarketFill(self, asset, order):
+        """
+        Market order fill with conservative taker slippage.
+
+        Market orders guarantee execution (no miss / partial logic) but receive
+        a taker-rate price penalty.  This override prevents the C# base-class
+        ``MarketFill`` from calling ``GetSlippageApproximation`` via the security
+        object in a way that can trigger the ``'Crypto' object has no attribute
+        'Portfolio'`` runtime error when the slippage model is not properly wired.
+        """
+        utc_time = Extensions.ConvertToUtc(asset.LocalTime, asset.Exchange.TimeZone)
+        fill = OrderEvent(order, utc_time, OrderFee.Zero)
+
+        if order.Status == OrderStatus.Canceled:
+            return fill
+
+        price = asset.Price
+        if price <= 0:
+            bar = asset.Cache.GetData[TradeBar]()
+            if bar is not None:
+                price = bar.Close
+        if price <= 0:
+            return fill
+
+        # Taker slippage: market orders pay crossing-spread penalty
+        # Size it off candle volatility so fast-candle exits are penalised more.
+        try:
+            bar = asset.Cache.GetData[TradeBar]()
+            if bar is not None and bar.Open > 0:
+                range_pct   = (bar.High - bar.Low) / bar.Open
+                taker_slip  = price * min(0.002 + range_pct * 0.08, 0.010)
+            else:
+                taker_slip  = price * 0.003   # 0.3% fallback
+        except Exception:
+            taker_slip = price * 0.003
+
+        # Try to call the security's slippage model if properly available
+        try:
+            model_slip = asset.SlippageModel.GetSlippageApproximation(asset, order)
+            # Use the larger of taker baseline and model estimate
+            taker_slip = max(taker_slip, float(model_slip))
+        except Exception:
+            pass
+
+        if order.Direction == OrderDirection.Buy:
+            fill_price = price + taker_slip
+        else:
+            fill_price = price - taker_slip
+            fill_price = max(fill_price, price * 0.90)  # floor: max 10% slippage
+
+        fill.Status       = OrderStatus.Filled
+        fill.FillQuantity = order.Quantity
+        fill.FillPrice    = fill_price
+        return fill
+
 
 class RealisticCryptoSlippage:
     """
@@ -192,14 +247,23 @@ class RealisticCryptoSlippage:
     Exit slippage is materially more punitive than entry slippage in adverse
     conditions, because stop-triggered exits and market-order escalations
     get the worst fills.
+
+    ``algo`` must be passed at construction so regime context is read from the
+    algorithm object instead of the security object (``asset.Portfolio`` does
+    NOT exist on a ``Crypto`` security and would raise AttributeError).
     """
 
-    def __init__(self):
+    def __init__(self, algo=None):
+        self.algo                 = algo
         self.base_slippage_pct    = 0.0025   # 0.25% base — slightly more conservative
         self.volume_impact_factor = 0.18     # volume impact coefficient
         self.max_slippage_pct     = 0.05     # 5% hard cap (was 3%)
 
-    def get_slippage_approximation(self, asset, order):
+    def GetSlippageApproximation(self, asset, order):
+        """
+        LEAN slippage model interface (PascalCase required by LEAN's ISlippageModel).
+        Returns the slippage amount in price units (not percentage).
+        """
         price = asset.Price
         if price <= 0:
             return 0
@@ -226,26 +290,28 @@ class RealisticCryptoSlippage:
         elif price < 10.0:
             slippage_pct *= 1.4
 
-        # Try to get regime context from the algorithm if accessible
-        try:
-            algo = asset.Portfolio.Algorithm
-            vol_regime = getattr(algo, 'volatility_regime', 'normal')
-            market_regime = getattr(algo, 'market_regime', 'unknown')
+        # Use stored algo reference for regime context — never access
+        # algo-level state via the security/asset object (Crypto has no Portfolio).
+        algo = self.algo
+        if algo is not None:
+            try:
+                vol_regime    = getattr(algo, 'volatility_regime', 'normal')
+                market_regime = getattr(algo, 'market_regime', 'unknown')
 
-            # High-volatility regime: +50% slippage
-            if vol_regime == 'high':
-                slippage_pct *= 1.5
+                # High-volatility regime: +50% slippage
+                if vol_regime == 'high':
+                    slippage_pct *= 1.5
 
-            # BTC dumping (bear regime): +30% slippage on everything
-            if market_regime == 'bear':
-                slippage_pct *= 1.3
+                # BTC dumping (bear regime): +30% slippage on everything
+                if market_regime == 'bear':
+                    slippage_pct *= 1.3
 
-            # Exit direction gets worse execution in stressed conditions
-            is_exit = (order.Direction == OrderDirection.Sell)
-            if is_exit and (vol_regime == 'high' or market_regime == 'bear'):
-                slippage_pct *= 1.4   # exits get extra adversity
-        except Exception:
-            pass
+                # Exit direction gets worse execution in stressed conditions
+                is_exit = (order.Direction == OrderDirection.Sell)
+                if is_exit and (vol_regime == 'high' or market_regime == 'bear'):
+                    slippage_pct *= 1.4   # exits get extra adversity
+            except Exception:
+                pass
 
         slippage_pct = min(slippage_pct, self.max_slippage_pct)
         return price * slippage_pct
