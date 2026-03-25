@@ -13,8 +13,8 @@ Evaluates the focused universe with the single IgnitionBreakout setup,
 selects at most the top 1–2 candidates ranked by leadership quality,
 and executes entries with concentrated two-tier sizing.
 
-Also owns trade attribution (DiagnosticsEngine / TradeRecord) so that
-per-trade metadata lives alongside the entry logic that generates it.
+Also owns trade attribution (DiagnosticsEngine / TradeRecord) and the
+per-symbol arming state machine so that lifecycle tracking lives here.
 """
 
 # During a bear market regime, require higher setup confidence
@@ -25,6 +25,128 @@ MAX_NEW_POSITIONS_PER_CYCLE = 2
 
 # Minimum dollar volume required for a symbol to be a valid candidate
 MIN_CANDIDATE_DOLLAR_VOLUME = 80_000   # 80k USD per bar (on top of universe filter)
+
+# Breadth gate: skip new entries when < this fraction of universe is in uptrend
+BREADTH_MIN_ENTRY = 0.30
+
+# Configurable cooldown (hours) applied to a symbol after a FailedBreakout exit
+FAILED_BREAKOUT_COOLDOWN_HOURS = 2.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Arming State Machine
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ArmingStateMachine:
+    """
+    Per-symbol lifecycle tracker that prevents entries directly from raw
+    one-bar conditions.
+
+    States
+    ------
+    DORMANT     : symbol shows no relevant leadership signals
+    ARMING      : symbol has started showing leadership (RS positive, vol rising)
+                  but has not yet held it for the required minimum bars
+    READY       : symbol has satisfied arming criteria for ARM_MIN_BARS
+                  consecutive bars and may be evaluated for a breakout trigger
+    TRIGGERED   : a trade entry has been placed for this symbol
+    COOLDOWN    : symbol is in post-exit cooldown (general or failed-breakout)
+    INVALIDATED : symbol violated its arming criteria and reverted to DORMANT
+    """
+
+    ARM_MIN_BARS     = 2     # bars of continuous leadership to reach READY
+    ARM_RS_THRESHOLD = 0.001 # minimum instantaneous RS vs BTC bar to stay ARMING
+    ARM_VOL_MULT     = 1.2   # volume must be at least 1.2× baseline to stay ARMING
+
+    def update(self, symbol, crypto, algo):
+        """
+        Advance the arming state for one symbol using the current bar's data.
+        Modifies crypto['arm_state'] and crypto['arm_state_bars'] in-place.
+        Returns the new state string.
+        """
+        state      = crypto.get('arm_state', 'DORMANT')
+        state_bars = int(crypto.get('arm_state_bars', 0))
+
+        # ── TRIGGERED / COOLDOWN: managed externally; don't auto-advance ────
+        if state in ('TRIGGERED', 'COOLDOWN'):
+            crypto['arm_state_bars'] = state_bars + 1
+            return state
+
+        # ── Check if arming criteria are met ──────────────────────────────────
+        arming_ok = self._arming_criteria_met(crypto, algo)
+
+        if state == 'DORMANT':
+            if arming_ok:
+                crypto['arm_state']      = 'ARMING'
+                crypto['arm_state_bars'] = 1
+            return crypto['arm_state']
+
+        if state == 'ARMING':
+            if arming_ok:
+                state_bars += 1
+                crypto['arm_state_bars'] = state_bars
+                if state_bars >= self.ARM_MIN_BARS:
+                    crypto['arm_state'] = 'READY'
+            else:
+                # Lost leadership — invalidate
+                crypto['arm_state']      = 'INVALIDATED'
+                crypto['arm_state_bars'] = 0
+            return crypto['arm_state']
+
+        if state == 'READY':
+            if not arming_ok:
+                crypto['arm_state']      = 'INVALIDATED'
+                crypto['arm_state_bars'] = 0
+            else:
+                crypto['arm_state_bars'] = state_bars + 1
+            return crypto['arm_state']
+
+        if state == 'INVALIDATED':
+            # After invalidation, give the symbol one bar to recover to DORMANT
+            crypto['arm_state']      = 'DORMANT'
+            crypto['arm_state_bars'] = 0
+            return 'DORMANT'
+
+        return state
+
+    def _arming_criteria_met(self, crypto, algo):
+        """Return True if current bar shows minimum leadership signals."""
+        rs_hist = list(crypto.get('rs_vs_btc', []))
+        if not rs_hist or float(rs_hist[-1]) < self.ARM_RS_THRESHOLD:
+            return False
+
+        vols = list(crypto.get('volume', []))
+        long_vols = list(crypto.get('volume_long', []))
+        if len(vols) < 5:
+            return True   # not enough data yet — give benefit of doubt
+        baseline = (float(np.mean(long_vols[-120:])) if len(long_vols) >= 120
+                    else float(np.mean(vols[-20:])))
+        if baseline > 0:
+            if float(vols[-1]) < baseline * self.ARM_VOL_MULT:
+                return False
+
+        return True
+
+    def mark_triggered(self, crypto):
+        crypto['arm_state']      = 'TRIGGERED'
+        crypto['arm_state_bars'] = 0
+
+    def mark_cooldown(self, crypto):
+        crypto['arm_state']      = 'COOLDOWN'
+        crypto['arm_state_bars'] = 0
+
+    def mark_dormant(self, crypto):
+        crypto['arm_state']      = 'DORMANT'
+        crypto['arm_state_bars'] = 0
+
+
+# Singleton — shared across rebalance and exit calls
+_arm_sm = ArmingStateMachine()
+
+
+def get_arming_state_machine():
+    """Return the shared arming state machine instance."""
+    return _arm_sm
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Trade Attribution — DiagnosticsEngine
@@ -45,11 +167,18 @@ class TradeRecord:
         'gross_pnl_pct', 'net_pnl_pct',
         'exit_tag', 'hold_minutes',
         'breakout_freshness', 'vol_ratio', 'atr_at_entry',
+        # MFE / MAE analytics
+        'mfe_pct', 'mae_pct',
+        'time_to_mfe_minutes', 'time_to_mae_minutes',
+        # Outcome bucket for time-to-outcome analytics
+        'outcome_bucket',   # 'instant_fail' | 'dead_trade' | 'delayed_fail' | 'runner' | 'normal'
     ]
 
     def __init__(self):
         for s in self.__slots__:
             setattr(self, s, None)
+        # default outcome bucket
+        self.outcome_bucket = 'normal'
 
     def net_pnl_estimate(self, fee_pct=0.008):
         if self.gross_pnl_pct is not None:
@@ -103,7 +232,9 @@ class DiagnosticsEngine:
         self._open_records[symbol] = rec
 
     def record_exit(self, symbol, exit_price, exit_tag,
-                    realized_slippage=None, spread_at_exit=None):
+                    realized_slippage=None, spread_at_exit=None,
+                    mfe_pct=None, mae_pct=None,
+                    time_to_mfe_minutes=None, time_to_mae_minutes=None):
         algo = self.algo
         rec  = self._open_records.pop(symbol, None)
         if rec is None:
@@ -114,6 +245,10 @@ class DiagnosticsEngine:
         rec.exit_tag               = exit_tag
         rec.spread_at_exit         = spread_at_exit
         rec.realized_slippage_exit = realized_slippage
+        rec.mfe_pct                = mfe_pct
+        rec.mae_pct                = mae_pct
+        rec.time_to_mfe_minutes    = time_to_mfe_minutes
+        rec.time_to_mae_minutes    = time_to_mae_minutes
 
         if rec.entry_price and rec.entry_price > 0:
             rec.gross_pnl_pct = (exit_price - rec.entry_price) / rec.entry_price
@@ -121,6 +256,9 @@ class DiagnosticsEngine:
 
         if rec.entry_time and rec.exit_time:
             rec.hold_minutes = (rec.exit_time - rec.entry_time).total_seconds() / 60.0
+
+        # Classify into outcome bucket
+        rec.outcome_bucket = _classify_outcome_bucket(rec)
 
         self.completed.append(rec)
 
@@ -180,6 +318,16 @@ class DiagnosticsEngine:
         if wins and losses and sum(losses) != 0:
             algo.Debug(f"  Profit factor:{sum(wins)/abs(sum(losses)):.2f}")
 
+        # MFE / MAE summary
+        mfes = [r.mfe_pct for r in self.completed if r.mfe_pct is not None]
+        maes = [r.mae_pct for r in self.completed if r.mae_pct is not None]
+        if mfes:
+            algo.Debug(f"  Avg MFE:      {float(np.mean(mfes)):+.2%}  "
+                       f"Max MFE: {float(np.max(mfes)):+.2%}")
+        if maes:
+            algo.Debug(f"  Avg MAE:      {float(np.mean(maes)):+.2%}  "
+                       f"Worst MAE: {float(np.min(maes)):+.2%}")
+
         algo.Debug("─── By Exit Tag ───")
         for tag, stats in self.stats_by_exit().items():
             algo.Debug(
@@ -194,7 +342,62 @@ class DiagnosticsEngine:
                 f"avg={stats['avg_net_pnl']:+.2%}"
             )
 
+        algo.Debug("─── By Outcome Bucket ───")
+        for bucket, stats in self.stats_by_outcome_bucket().items():
+            algo.Debug(
+                f"  {bucket}: n={stats['count']} avg={stats['avg_net_pnl']:+.2%} "
+                f"hold={stats['avg_hold_min']:.0f}m "
+                f"MFE={stats['avg_mfe']:+.2%} MAE={stats['avg_mae']:+.2%}"
+            )
+
         algo.Debug("=" * 60)
+
+    def stats_by_outcome_bucket(self):
+        by_bucket = {}
+        for rec in self.completed:
+            bucket = rec.outcome_bucket or 'normal'
+            by_bucket.setdefault(bucket, []).append(rec)
+        result = {}
+        for bucket, records in by_bucket.items():
+            pnls  = [r.net_pnl_pct for r in records if r.net_pnl_pct is not None]
+            holds = [r.hold_minutes for r in records if r.hold_minutes is not None]
+            mfes  = [r.mfe_pct for r in records if r.mfe_pct is not None]
+            maes  = [r.mae_pct for r in records if r.mae_pct is not None]
+            result[bucket] = {
+                'count':        len(records),
+                'avg_net_pnl':  float(np.mean(pnls)) if pnls else 0.0,
+                'avg_hold_min': float(np.mean(holds)) if holds else 0.0,
+                'avg_mfe':      float(np.mean(mfes)) if mfes else 0.0,
+                'avg_mae':      float(np.mean(maes)) if maes else 0.0,
+            }
+        return result
+
+
+def _classify_outcome_bucket(rec):
+    """
+    Classify a completed trade into a time-to-outcome bucket.
+
+    Buckets:
+      instant_fail  : exit in < 15 minutes with a loss (failed quickly)
+      dead_trade    : held 15–90 minutes but exited near breakeven / slight loss
+      delayed_fail  : held > 90 minutes but exited with a loss
+      runner        : exited with net PnL > 5% (meaningful winner)
+      normal        : everything else (small win, or not enough data)
+    """
+    hold = rec.hold_minutes
+    pnl  = rec.net_pnl_pct
+
+    if hold is None or pnl is None:
+        return 'normal'
+    if pnl > 0.05:
+        return 'runner'
+    if hold < 15 and pnl < -0.01:
+        return 'instant_fail'
+    if 15 <= hold <= 90 and pnl < 0.005:
+        return 'dead_trade'
+    if hold > 90 and pnl < 0:
+        return 'delayed_fail'
+    return 'normal'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -251,21 +454,24 @@ def _leadership_rank(cand):
     """
     Composite leadership rank for sorting candidates.
     Higher = stronger leader.  Used to pick the top 1–2.
+    Incorporates cross-sectional RS rank from scoring.
     """
     f = cand.get('factors', {})
     rs_short  = float(f.get('rs_short',  0.0))
     rs_medium = float(f.get('rs_medium', 0.0))
     vol_ratio = float(f.get('vol_ratio', 0.0))
     freshness = int(f.get('freshness',   5))
+    rs_rank   = float(f.get('rs_rank',   0.5))
     conf      = float(cand.get('net_score', 0.0))
 
     fresh_score = 1.0 if freshness == 0 else (0.7 if freshness == 1 else 0.4)
 
     return (
-        (rs_short + rs_medium) * 0.35 +
-        min(vol_ratio / 10.0, 1.0)    * 0.25 +
-        fresh_score                    * 0.20 +
-        conf                           * 0.20
+        (rs_short + rs_medium) * 0.30 +
+        rs_rank                * 0.15 +
+        min(vol_ratio / 10.0, 1.0) * 0.25 +
+        fresh_score            * 0.15 +
+        conf                   * 0.15
     )
 
 
@@ -276,6 +482,14 @@ def _leadership_rank(cand):
 def rebalance(algo):
     if algo.IsWarmingUp:
         return
+
+    # ── Update arming states for all symbols ─────────────────────────────────
+    arm_sm = get_arming_state_machine()
+    for sym, crypto in algo.crypto_data.items():
+        try:
+            arm_sm.update(sym, crypto, algo)
+        except Exception:
+            pass
 
     if daily_loss_exceeded(algo):
         log_skip(algo, "max daily loss exceeded")
@@ -345,6 +559,12 @@ def rebalance(algo):
         log_skip(algo, "too many open orders")
         return
 
+    # ── Breadth gate: skip new entries in very weak participation environments ──
+    breadth = float(getattr(algo, 'market_breadth', 0.5))
+    if breadth < BREADTH_MIN_ENTRY and algo.market_regime != 'bull':
+        log_skip(algo, f"weak breadth {breadth:.0%}")
+        return
+
     # ── Evaluate universe: collect IgnitionBreakout candidates ───────────────
     candidates        = []
     count_evaluated   = 0
@@ -366,6 +586,18 @@ def rebalance(algo):
 
         crypto = algo.crypto_data[symbol]
         if not is_ready(crypto):
+            continue
+
+        # Arming-state gate: symbol must be in READY (or ARMING as fallback)
+        # to be eligible for a trigger.  TRIGGERED/COOLDOWN skip silently.
+        arm_state = crypto.get('arm_state', 'DORMANT')
+        if arm_state in ('DORMANT', 'INVALIDATED', 'COOLDOWN'):
+            reject_reasons['not_armed'] = reject_reasons.get('not_armed', 0) + 1
+            continue
+        if arm_state == 'TRIGGERED' and not is_invested_not_dust(algo, symbol):
+            # Trade may have been closed; reset to DORMANT so it can re-arm
+            crypto['arm_state']      = 'DORMANT'
+            crypto['arm_state_bars'] = 0
             continue
 
         count_evaluated += 1
@@ -642,6 +874,10 @@ def execute_trades(algo, candidates):
                     diag.record_entry(sym, setup_type, confidence, components,
                                       price, spread_at_entry=sp,
                                       estimated_slippage=est_slip)
+
+                # Mark arming state as TRIGGERED
+                if crypto:
+                    get_arming_state_machine().mark_triggered(crypto)
 
                 success_count += 1
                 algo.trade_count += 1

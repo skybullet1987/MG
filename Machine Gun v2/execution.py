@@ -721,6 +721,23 @@ def cleanup_position(algo, symbol, record_pnl=False, exit_price=None):
         algo._partial_tp_taken.pop(symbol, None)
     if hasattr(algo, '_breakeven_stops'):
         algo._breakeven_stops.pop(symbol, None)
+    # MFE/MAE tracking cleanup
+    if hasattr(algo, 'mfe_prices'):
+        algo.mfe_prices.pop(symbol, None)
+    if hasattr(algo, 'mae_prices'):
+        algo.mae_prices.pop(symbol, None)
+    if hasattr(algo, 'mfe_times'):
+        algo.mfe_times.pop(symbol, None)
+    if hasattr(algo, 'mae_times'):
+        algo.mae_times.pop(symbol, None)
+    # Reset arming state to DORMANT after position close
+    try:
+        from mg2_entries import get_arming_state_machine
+        crypto = algo.crypto_data.get(symbol)
+        if crypto and crypto.get('arm_state') == 'TRIGGERED':
+            get_arming_state_machine().mark_dormant(crypto)
+    except Exception:
+        pass
 
 
 def sync_existing_positions(algo):

@@ -15,6 +15,9 @@ Enhanced data pipeline to support the setup-driven entry architecture:
 - Order-flow persistence (consecutive above-average volume bars)
 - Kalman slope / Kalman history for trend confirmation
 - Volume persistence counter
+- Bars since volume ignition (new: staleness filter)
+- Bars since VWAP reclaim (new: staleness filter)
+- Cross-sectional RS rank across active universe
 """
 
 
@@ -83,6 +86,18 @@ def initialize_symbol(algo, symbol):
         # The price level of the 20-bar high that was broken (used for failed-breakout exit)
         'breakout_level':        0.0,
 
+        # ── Freshness staleness counters (NEW) ────────────────────────────
+        # Bars since volume reached ignition level (VOL_IGNITION_MULT × baseline)
+        'bars_since_vol_ignition':  999,
+        # Bars since price last crossed VWAP from below (reclaim event)
+        'bars_since_vwap_reclaim':  999,
+        # Previous bar's above-VWAP status (for edge detection)
+        '_prev_above_vwap':         False,
+
+        # ── Cross-sectional rank (updated by update_market_context) ───────
+        # Percentile rank of this symbol's short RS vs BTC (0.0–1.0; higher = stronger)
+        'rs_rank':              0.5,
+
         # ── Order-flow persistence (NEW) ──────────────────────────────────
         # How many consecutive bars have had above-baseline volume
         'vol_persistence':  0,
@@ -110,7 +125,19 @@ def initialize_symbol(algo, symbol):
         'kalman_error_cov': 1.0,
         'kalman_history':   deque(maxlen=10),   # stores last 10 estimates for slope
         'ker':              deque(maxlen=algo.short_period),   # Kalman efficiency ratio
+
+        # ── Arming state machine ───────────────────────────────────────────
+        # States: DORMANT / ARMING / READY / TRIGGERED / COOLDOWN / INVALIDATED
+        'arm_state':        'DORMANT',
+        'arm_state_bars':   0,   # bars spent in current state
     }
+
+
+# Volume threshold multiplier to classify a bar as an "ignition" event
+_VOL_IGNITION_MULT = 3.0
+
+# Minimum consecutive bars showing leadership signals before a symbol reaches READY
+_ARM_ARMING_BARS   = 2
 
 
 def update_symbol_data(algo, symbol, bar, quote_bar=None):
@@ -231,9 +258,29 @@ def update_symbol_data(algo, symbol, bar, quote_bar=None):
 
         crypto['prev_range_high_20'] = range_high_20
 
-    # ── Order-flow persistence (NEW) ─────────────────────────────────────
+    # ── Volume ignition freshness ─────────────────────────────────────────
     vols = list(crypto['volume'])
     long_vols = list(crypto['volume_long'])
+    if len(vols) >= 5:
+        baseline = (float(np.mean(long_vols[-120:])) if len(long_vols) >= 120
+                    else float(np.mean(vols[-20:])))
+        if baseline > 0 and volume >= baseline * _VOL_IGNITION_MULT:
+            crypto['bars_since_vol_ignition'] = 0
+        elif crypto['bars_since_vol_ignition'] < 999:
+            crypto['bars_since_vol_ignition'] = min(crypto['bars_since_vol_ignition'] + 1, 999)
+
+    # ── VWAP reclaim freshness ────────────────────────────────────────────
+    vwap_now = float(crypto.get('vwap', 0.0))
+    if vwap_now > 0:
+        above_now = price > vwap_now
+        if above_now and not crypto.get('_prev_above_vwap', False):
+            # Price just crossed VWAP from below → reclaim event
+            crypto['bars_since_vwap_reclaim'] = 0
+        elif crypto['bars_since_vwap_reclaim'] < 999:
+            crypto['bars_since_vwap_reclaim'] = min(crypto['bars_since_vwap_reclaim'] + 1, 999)
+        crypto['_prev_above_vwap'] = above_now
+
+    # ── Order-flow persistence ────────────────────────────────────────────
     if len(vols) >= 5:
         baseline = (float(np.mean(long_vols[-120:])) if len(long_vols) >= 120
                     else float(np.mean(vols[-20:])))
@@ -347,6 +394,32 @@ def update_market_context(algo):
                 uptrend_count += 1
     if total_ready > 5:
         algo.market_breadth = uptrend_count / total_ready
+
+    # Cross-sectional RS rank: percentile rank each symbol's short RS vs BTC
+    # so scoring.py can reward the strongest relative leaders
+    _update_rs_ranks(algo)
+
+
+def _update_rs_ranks(algo):
+    """
+    Compute per-symbol cross-sectional RS rank (0.0–1.0) across the active
+    universe.  Higher rank = stronger short-term relative strength vs BTC.
+    Updated every bar via update_market_context.
+    """
+    symbols_with_rs = []
+    for sym, crypto in algo.crypto_data.items():
+        rs_hist = list(crypto.get('rs_vs_btc', []))
+        if rs_hist:
+            symbols_with_rs.append((sym, float(rs_hist[-1])))
+
+    if len(symbols_with_rs) < 3:
+        return
+
+    # Sort ascending; rank is 0-based index / (n-1)
+    symbols_with_rs.sort(key=lambda x: x[1])
+    n = len(symbols_with_rs)
+    for rank_idx, (sym, _rs) in enumerate(symbols_with_rs):
+        algo.crypto_data[sym]['rs_rank'] = rank_idx / max(n - 1, 1)
 
 
 def annualized_vol(algo, crypto):

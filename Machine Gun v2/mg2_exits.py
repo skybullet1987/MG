@@ -22,10 +22,17 @@ Partial TP action (not a full exit):
   - At PARTIAL_TP_PNL: sell PARTIAL_TP_FRACTION, let the rest ride.
   - At most once per trade.
 
+Per-bar MFE/MAE tracking:
+  - algo.mfe_prices[symbol]  tracks per-trade highest price seen (for MFE)
+  - algo.mae_prices[symbol]  tracks per-trade lowest  price seen (for MAE)
+  - algo.mfe_times[symbol]   records the algo.Time when MFE was last updated
+  - algo.mae_times[symbol]   records the algo.Time when MAE was last updated
+
 Design notes:
   - No RSI scalp exits, no stagnation micro-exits, no volume dry-up exits.
   - No tiny interval time stops.
   - Designed to capture rare large winners.
+  - Failed breakout exits apply a dedicated symbol cooldown (configurable).
 """
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -53,6 +60,40 @@ PARTIAL_TP_BREAKEVEN   = 0.005
 MIN_HOLD_MINUTES       = 3
 
 
+def _update_mfe_mae(algo, symbol, price):
+    """
+    Per-bar update of Maximum Favorable Excursion (MFE) and Maximum Adverse
+    Excursion (MAE) for the active trade in `symbol`.
+
+    - MFE: the highest price seen since entry  → stored in algo.mfe_prices
+    - MAE: the lowest  price seen since entry  → stored in algo.mae_prices
+
+    Time of MFE/MAE are tracked in algo.mfe_times / algo.mae_times.
+    """
+    entry = algo.entry_prices.get(symbol)
+    if entry is None or entry <= 0 or price <= 0:
+        return
+
+    mfe_prices = getattr(algo, 'mfe_prices', None)
+    mae_prices = getattr(algo, 'mae_prices', None)
+    mfe_times  = getattr(algo, 'mfe_times',  None)
+    mae_times  = getattr(algo, 'mae_times',  None)
+    if mfe_prices is None or mae_prices is None:
+        return
+
+    # MFE tracking (highest high)
+    if symbol not in mfe_prices or price > mfe_prices[symbol]:
+        mfe_prices[symbol] = price
+        if mfe_times is not None:
+            mfe_times[symbol] = algo.Time
+
+    # MAE tracking (lowest low)
+    if symbol not in mae_prices or price < mae_prices[symbol]:
+        mae_prices[symbol] = price
+        if mae_times is not None:
+            mae_times[symbol] = algo.Time
+
+
 def check_exits(algo):
     if algo.IsWarmingUp:
         return
@@ -63,7 +104,14 @@ def check_exits(algo):
             algo._failed_exit_attempts.pop(kvp.Key, None)
             algo._failed_exit_counts.pop(kvp.Key, None)
             continue
+        # Per-bar MFE/MAE update for every held position
+        try:
+            _update_mfe_mae(algo, kvp.Key, algo.Securities[kvp.Key].Price)
+        except Exception:
+            pass
         if algo._failed_exit_counts.get(kvp.Key, 0) >= 3:
+            # Don't skip entirely — escalate to market order to prevent stuck positions
+            _escalate_stuck_exit(algo, kvp.Key, kvp.Value)
             continue
         check_exit(algo, kvp.Key, algo.Securities[kvp.Key].Price, kvp.Value)
 
@@ -76,6 +124,21 @@ def check_exits(algo):
             algo.highest_prices[symbol] = kvp.Value.AveragePrice
             algo.entry_times[symbol]    = algo.Time
             algo.Debug(f"ORPHAN RECOVERY: {symbol.Value} re-tracked")
+
+
+def _escalate_stuck_exit(algo, symbol, holding):
+    """
+    Force-exit a position that has repeatedly failed to close.
+    Called when failed_exit_counts >= 3, instead of silently skipping.
+    """
+    qty = abs(holding.Quantity)
+    if qty > 0 and len(algo.Transactions.GetOpenOrders(symbol)) == 0:
+        try:
+            algo.MarketOrder(symbol, -qty, tag="ForceExit(StuckEscalation)")
+            algo.Debug(f"FORCE MARKET EXIT: {symbol.Value} stuck position escalated")
+        except Exception as e:
+            algo.Debug(f"Force exit error {symbol.Value}: {e}")
+        algo._failed_exit_counts.pop(symbol, None)
 
 
 def check_exit(algo, symbol, price, holding):
@@ -205,19 +268,69 @@ def _do_exit(algo, symbol, holding, tag, price, min_notional_usd, pnl, hours):
     if price * abs(holding.Quantity) < min_notional_usd * 0.9:
         return
 
+    # ── Collect MFE/MAE before clearing position state ─────────────────────
+    entry   = algo.entry_prices.get(symbol)
+    mfe_pct = None
+    mae_pct = None
+    time_to_mfe_min = None
+    time_to_mae_min = None
+
+    mfe_prices = getattr(algo, 'mfe_prices', None)
+    mae_prices = getattr(algo, 'mae_prices', None)
+    mfe_times  = getattr(algo, 'mfe_times',  None)
+    mae_times  = getattr(algo, 'mae_times',  None)
+    entry_time = algo.entry_times.get(symbol)
+
+    if entry and entry > 0 and mfe_prices and symbol in mfe_prices:
+        mfe_pct = (mfe_prices[symbol] - entry) / entry
+        if mfe_times and symbol in mfe_times and entry_time:
+            time_to_mfe_min = (mfe_times[symbol] - entry_time).total_seconds() / 60.0
+    if entry and entry > 0 and mae_prices and symbol in mae_prices:
+        mae_pct = (mae_prices[symbol] - entry) / entry
+        if mae_times and symbol in mae_times and entry_time:
+            time_to_mae_min = (mae_times[symbol] - entry_time).total_seconds() / 60.0
+
     sold = smart_liquidate(algo, symbol, tag)
     if sold:
         algo._exit_cooldowns[symbol] = algo.Time + timedelta(hours=algo.exit_cooldown_hours)
         algo.entry_volumes.pop(symbol, None)
-        algo.Debug(f"EXIT [{tag}]: {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.1f}h")
+        algo.Debug(
+            f"EXIT [{tag}]: {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.1f}h"
+            + (f" | MFE:{mfe_pct:+.2%}" if mfe_pct is not None else "")
+            + (f" | MAE:{mae_pct:+.2%}" if mae_pct is not None else "")
+        )
 
         diag = getattr(algo, "_diagnostics", None)
         if diag is not None:
             sp = get_spread_pct(algo, symbol)
-            diag.record_exit(symbol, price, tag, spread_at_exit=sp)
+            diag.record_exit(
+                symbol, price, tag, spread_at_exit=sp,
+                mfe_pct=mfe_pct, mae_pct=mae_pct,
+                time_to_mfe_minutes=time_to_mfe_min,
+                time_to_mae_minutes=time_to_mae_min,
+            )
+
+        # Clear MFE/MAE tracking state for this symbol
+        if mfe_prices: mfe_prices.pop(symbol, None)
+        if mae_prices: mae_prices.pop(symbol, None)
+        if mfe_times:  mfe_times.pop(symbol, None)
+        if mae_times:  mae_times.pop(symbol, None)
 
         if pnl < 0:
             algo._symbol_loss_cooldowns[symbol] = algo.Time + timedelta(hours=1)
+
+        # Failed-breakout exits get an additional, longer cooldown
+        if tag == "FailedBreakout":
+            from mg2_entries import FAILED_BREAKOUT_COOLDOWN_HOURS, get_arming_state_machine
+            fb_cd = timedelta(hours=FAILED_BREAKOUT_COOLDOWN_HOURS)
+            algo._symbol_entry_cooldowns[symbol.Value] = algo.Time + fb_cd
+            algo.Debug(
+                f"  FB COOLDOWN: {symbol.Value} locked {FAILED_BREAKOUT_COOLDOWN_HOURS:.0f}h"
+            )
+            # Reset arming state so the symbol re-earns its setup
+            crypto = algo.crypto_data.get(symbol)
+            if crypto:
+                get_arming_state_machine().mark_dormant(crypto)
     else:
         fail_count = algo._failed_exit_counts.get(symbol, 0) + 1
         algo._failed_exit_counts[symbol] = fail_count
