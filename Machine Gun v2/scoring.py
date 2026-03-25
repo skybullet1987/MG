@@ -20,9 +20,13 @@ symbol is skipped with no partial credit or fallback blending:
   7. Not too extended above Kalman estimate (anti-chase)
   8. Spread acceptable (≤ MAX_SPREAD_SETUP)
   9. Expected move estimate clears fees + slippage + edge buffer
+ 10. Volume ignition fresh enough (≤ VOL_IGNITION_FRESH_MAX bars)
+ 11. VWAP reclaim fresh enough (≤ VWAP_RECLAIM_FRESH_MAX bars)
+ 12. False-breakout fingerprint filter (rule-based rejection of likely-fail patterns)
 
 The confidence score (0.55–1.0) is computed only when all gates pass and
 is used solely for candidate ranking — not as an additional entry gate.
+Cross-sectional RS rank is incorporated into confidence scoring.
 
 No CompressionExpansion.  No MomentumContinuation.  No setup blending.
 """
@@ -36,6 +40,10 @@ VOL_SURGE_STRONG     = 4.0     # "strong surge" threshold (extra ranking weight)
 ANTICHASE_MAX_PCT    = 0.025   # max extension above Kalman estimate (2.5%)
 MAX_SPREAD_SETUP     = 0.010   # 1.0% hard spread cap for setup qualification
 
+# Freshness staleness hard limits (bars)
+VOL_IGNITION_FRESH_MAX  = 4    # reject if volume ignition was > 4 bars ago
+VWAP_RECLAIM_FRESH_MAX  = 6    # reject if VWAP reclaim was > 6 bars ago
+
 # Expected-move gate: ATR × TP_MULT / price must clear this net threshold
 ATR_TP_MULT          = 6.0
 ROUND_TRIP_COST_EST  = 0.012   # 2 × (0.4% fee + 0.2% slippage)
@@ -45,6 +53,94 @@ EDGE_BUFFER          = 0.005   # minimum edge above costs
 SETUP_MIN_CONFIDENCE   = 0.55
 SETUP_HIGH_CONVICTION  = 0.75
 
+# ── Arming state constants ─────────────────────────────────────────────────────
+ARM_DORMANT     = 'DORMANT'
+ARM_ARMING      = 'ARMING'
+ARM_READY       = 'READY'
+ARM_TRIGGERED   = 'TRIGGERED'
+ARM_COOLDOWN    = 'COOLDOWN'
+ARM_INVALIDATED = 'INVALIDATED'
+
+
+# ── False-breakout fingerprint filter ─────────────────────────────────────────
+class FalseBreakoutFilter:
+    """
+    Rule-based filter that rejects likely-fail breakout patterns before
+    an entry is placed.  Each rule returns a string reason if the filter
+    triggers, or None if the pattern is acceptable.
+
+    Rejection patterns:
+      1. Too extended above VWAP already (likely exhaustion, not ignition).
+      2. BB width contracting right after breakout bar (expansion failed).
+      3. Declining volume persistence after initial ignition (fake follow-through).
+      4. Negative OBI (order book imbalance) on the breakout bar.
+      5. Combined: weak breadth AND already extended (double risk flag).
+    """
+
+    # Hard extension limit: beyond this % above VWAP we consider the move exhausted
+    MAX_VWAP_EXTENSION_PCT   = 0.05   # 5%
+    # If ATR is available, also gate on ATR-normalised extension
+    MAX_ATR_EXTENSION_MULT   = 3.5    # price more than 3.5 ATRs above VWAP = too extended
+    # OBI threshold: negative imbalance on breakout bar is a bearish signal
+    OBI_NEGATIVE_THRESHOLD   = -0.15
+    # Vol persistence drop: if vol_persistence fell by this much vs recent high, warn
+    VOL_PERSIST_DROP_MIN     = 3
+    # Breadth below this level combined with extension is a double red flag
+    WEAK_BREADTH_THRESHOLD   = 0.40
+
+    def check(self, crypto, algo):
+        """
+        Returns (reject, reason) where reject is True if the setup should be
+        skipped.  Runs all rules and returns on the first match.
+        """
+        price  = list(crypto.get('prices', []))[-1] if crypto.get('prices') else 0.0
+        vwap   = float(crypto.get('vwap', 0.0))
+
+        # Rule 1: too extended above VWAP
+        if vwap > 0 and price > 0:
+            ext_pct = (price - vwap) / vwap
+            if ext_pct > self.MAX_VWAP_EXTENSION_PCT:
+                return True, 'fb_too_extended_vwap'
+
+            # Rule 1b: ATR-normalised extension check
+            atr = crypto.get('atr')
+            if (atr and hasattr(atr, 'IsReady') and atr.IsReady
+                    and atr.Current.Value > 0 and vwap > 0):
+                atr_val = float(atr.Current.Value)
+                atr_ext = (price - vwap) / atr_val
+                if atr_ext > self.MAX_ATR_EXTENSION_MULT:
+                    return True, 'fb_too_extended_atr'
+
+        # Rule 2: BB width contracting after breakout (expansion failed)
+        bb_widths = list(crypto.get('bb_width', []))
+        if len(bb_widths) >= 4:
+            # The breakout bar should see expansion; if the last 2 bars narrow, suspicious
+            recent_w   = float(np.mean(bb_widths[-2:]))
+            breakout_w = float(bb_widths[-3]) if len(bb_widths) >= 3 else recent_w
+            if recent_w < breakout_w * 0.90:
+                return True, 'fb_bb_contracting'
+
+        # Rule 3: declining volume persistence (fake follow-through)
+        vol_pers = int(crypto.get('vol_persistence', 0))
+        if vol_pers <= 0:
+            return True, 'fb_vol_persistence_zero'
+
+        # Rule 4: negative OBI on breakout bar
+        obi_hist = list(crypto.get('obi_history', []))
+        if len(obi_hist) >= 2:
+            latest_obi = float(obi_hist[-1])
+            if latest_obi < self.OBI_NEGATIVE_THRESHOLD:
+                return True, 'fb_obi_negative'
+
+        # Rule 5: weak breadth + extended (double flag)
+        breadth = float(getattr(algo, 'market_breadth', 0.5))
+        if vwap > 0 and price > 0:
+            ext_pct = (price - vwap) / vwap
+            if breadth < self.WEAK_BREADTH_THRESHOLD and ext_pct > 0.02:
+                return True, 'fb_weak_breadth_extended'
+
+        return False, None
+
 
 # ── Setup implementation ───────────────────────────────────────────────────────
 class IgnitionBreakoutSetup:
@@ -53,12 +149,14 @@ class IgnitionBreakoutSetup:
     strong relative strength vs BTC, meaningful volume expansion, and
     clean EMA/VWAP/Kalman structure.
 
-    All nine conditions are hard gates.  If any fails, returns (None, 0.0, {}).
+    All conditions are hard gates.  If any fails, returns (None, 0.0, {}).
     Confidence score is computed only when all gates pass and is used for
     candidate ranking — not as an additional entry gate.
     """
 
     NAME = "IgnitionBreakout"
+
+    _false_breakout_filter = FalseBreakoutFilter()
 
     def evaluate(self, crypto, algo):
         """
@@ -122,19 +220,38 @@ class IgnitionBreakoutSetup:
         if not self._expected_move_ok(price, atr_val):
             return None, 0.0, {'_reject': 'expected_move_insufficient'}
 
+        # ── Gate 10: Volume ignition freshness ────────────────────────────────
+        bars_vol_ign = int(crypto.get('bars_since_vol_ignition', 999))
+        if bars_vol_ign > VOL_IGNITION_FRESH_MAX:
+            return None, 0.0, {'_reject': 'stale_vol_ignition'}
+
+        # ── Gate 11: VWAP reclaim freshness ───────────────────────────────────
+        bars_vwap_rec = int(crypto.get('bars_since_vwap_reclaim', 999))
+        if bars_vwap_rec > VWAP_RECLAIM_FRESH_MAX:
+            return None, 0.0, {'_reject': 'stale_vwap_reclaim'}
+
+        # ── Gate 12: False-breakout fingerprint filter ─────────────────────────
+        fb_reject, fb_reason = self._false_breakout_filter.check(crypto, algo)
+        if fb_reject:
+            return None, 0.0, {'_reject': fb_reason}
+
         # ── All gates passed — compute confidence for ranking ──────────────────
+        rs_rank = float(crypto.get('rs_rank', 0.5))
         confidence = self._compute_confidence(
-            rs_short, rs_medium, vol_ratio, freshness, price, vwap
+            rs_short, rs_medium, vol_ratio, freshness, price, vwap, rs_rank
         )
         components = {
-            'setup_type': self.NAME,
-            'rs_short':   rs_short,
-            'rs_medium':  rs_medium,
-            'vol_ratio':  vol_ratio,
-            'freshness':  freshness,
-            'vwap':       vwap,
-            'atr':        atr_val,
-            'kalman':     kalman,
+            'setup_type':          self.NAME,
+            'rs_short':            rs_short,
+            'rs_medium':           rs_medium,
+            'vol_ratio':           vol_ratio,
+            'freshness':           freshness,
+            'vwap':                vwap,
+            'atr':                 atr_val,
+            'kalman':              kalman,
+            'rs_rank':             rs_rank,
+            'bars_vol_ignition':   bars_vol_ign,
+            'bars_vwap_reclaim':   bars_vwap_rec,
         }
         return self.NAME, confidence, components
 
@@ -190,17 +307,18 @@ class IgnitionBreakoutSetup:
         return True   # no ATR yet — pass (benefit of doubt during warmup)
 
     def _compute_confidence(self, rs_short, rs_medium, vol_ratio, freshness,
-                             price, vwap):
+                             price, vwap, rs_rank=0.5):
         """
         Compute ranking confidence (0.55–1.0).
 
         Weights:
-          RS strength (short + medium)  35%
-          Volume surge magnitude         30%
-          Breakout freshness             20%
-          VWAP extension (less = better) 15%
+          RS strength (short + medium)     30%
+          Cross-sectional RS rank           15%
+          Volume surge magnitude            25%
+          Breakout freshness                15%
+          VWAP extension (less = better)   15%
         """
-        # RS component
+        # RS component (absolute strength)
         rs_combined = rs_short + rs_medium
         if rs_combined >= 0.05:
             rs_score = 1.0
@@ -210,6 +328,9 @@ class IgnitionBreakoutSetup:
             rs_score = 0.55
         else:
             rs_score = 0.35
+
+        # Cross-sectional rank component (percentile 0→1; top-quartile gets bonus)
+        rank_score = float(rs_rank)   # already 0–1; 1.0 = strongest in universe
 
         # Volume component
         if vol_ratio >= VOL_SURGE_STRONG:
@@ -241,9 +362,10 @@ class IgnitionBreakoutSetup:
                 ext_score = 0.30
 
         confidence = (
-            rs_score    * 0.35 +
-            vol_score   * 0.30 +
-            fresh_score * 0.20 +
+            rs_score    * 0.30 +
+            rank_score  * 0.15 +
+            vol_score   * 0.25 +
+            fresh_score * 0.15 +
             ext_score   * 0.15
         )
         return min(1.0, max(SETUP_MIN_CONFIDENCE, confidence))

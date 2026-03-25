@@ -184,6 +184,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._rolling_loss_sizes    = deque(maxlen=50)
         self._last_live_trade_time  = None
 
+        # ── MFE / MAE per-trade tracking (updated every bar in mg2_exits.py) ──
+        self.mfe_prices = {}   # symbol → highest price seen since entry
+        self.mae_prices = {}   # symbol → lowest  price seen since entry
+        self.mfe_times  = {}   # symbol → algo.Time of MFE update
+        self.mae_times  = {}   # symbol → algo.Time of MAE update
+
         # ── BTC / market context ──────────────────────────────────────────────
         self.btc_symbol      = None
         self.btc_returns     = deque(maxlen=72)
@@ -480,6 +486,11 @@ def _on_order_event(algo, event):
                 algo.entry_prices[symbol] = event.FillPrice
                 algo.highest_prices[symbol] = event.FillPrice
                 algo.entry_times[symbol] = algo.Time
+                # Initialise MFE/MAE tracking for this trade
+                algo.mfe_prices[symbol] = event.FillPrice
+                algo.mae_prices[symbol] = event.FillPrice
+                algo.mfe_times[symbol]  = algo.Time
+                algo.mae_times[symbol]  = algo.Time
                 algo.daily_trade_count += 1
                 crypto = algo.crypto_data.get(symbol)
                 if crypto and len(crypto['volume']) >= 1:
