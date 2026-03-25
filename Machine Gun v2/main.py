@@ -50,36 +50,29 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.entry_threshold           = 0.55
         self.high_conviction_threshold = 0.72
 
-        # ── Exit parameters ───────────────────────────────────────────────────
-        self.quick_take_profit = self._get_param("quick_take_profit", 0.150)
+        # ── Exit parameters (Leader Breakout v0) ─────────────────────────────
+        # Exit logic lives in mg2_exits.py; these are kept for compatibility
+        # with helpers in execution.py that reference algo.tight_stop_loss etc.
         self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.035)
         self.atr_tp_mult       = self._get_param("atr_tp_mult",       6.0)
-        self.atr_sl_mult       = self._get_param("atr_sl_mult",       3.0)   # raised from 2.5 — more breathing room
-        # Trailing: wider activation allows runners to develop
-        self.trail_activation  = self._get_param("trail_activation",  0.060)  # 6% (was 4%)
-        self.trail_stop_pct    = self._get_param("trail_stop_pct",    0.040)  # 4% (was 2.5%)
-        # Time exits
-        self.time_stop_hours          = self._get_param("time_stop_hours",          4.0)
-        self.time_stop_pnl_min        = self._get_param("time_stop_pnl_min",        0.005)
-        self.extended_time_stop_hours = self._get_param("extended_time_stop_hours", 6.0)
-        self.extended_time_stop_pnl_max = self._get_param("extended_time_stop_pnl_max", 0.020)
-        self.stale_position_hours     = self._get_param("stale_position_hours",     8.0)
-        self.stagnation_minutes       = self._get_param("stagnation_minutes",       90.0)
-
+        self.atr_sl_mult       = self._get_param("atr_sl_mult",       2.5)
+        self.trail_activation  = self._get_param("trail_activation",  0.060)
+        self.trail_stop_pct    = self._get_param("trail_stop_pct",    0.040)
+        # Legacy aliases used by some helpers
+        self.quick_take_profit   = 0.150   # not used by exits — kept for compat
         self.trailing_activation = self.trail_activation
         self.trailing_stop_pct   = self.trail_stop_pct
         self.base_stop_loss      = self.tight_stop_loss
         self.base_take_profit    = self.quick_take_profit
         self.atr_trail_mult      = 3.5
 
-        # ── Position sizing ───────────────────────────────────────────────────
-        # Kelly disabled by default — ensures we measure raw entry edge
-        self.use_kelly                   = False
-        self.position_size_pct           = 0.35   # base size for qualifying setups
-        self.position_size_high_conviction = 0.45  # high-conviction size
-        self.max_position_pct            = 0.50   # hard cap per position
-        self.base_max_positions          = 3
-        self.max_positions               = 3
+        # ── Position sizing (concentrated two-tier) ──────────────────────────
+        self.use_kelly                     = False
+        self.position_size_pct             = 0.40   # standard conviction
+        self.position_size_high_conviction = 0.50   # high-conviction tier
+        self.max_position_pct              = 0.60   # hard cap per position
+        self.base_max_positions          = 2
+        self.max_positions               = 2
         self.min_notional                = 5.5
         self.max_position_usd            = self._get_param("max_position_usd", 500.0)
         self.min_price_usd               = 0.01
@@ -170,10 +163,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._partial_tp_taken      = {}
         self._breakeven_stops       = {}
         self._partial_sell_symbols  = set()
-        self._choppy_regime_entries = {}
-        self.partial_tp_threshold   = 0.080   # updated: 8% (was 2.5%)
-        self.stagnation_pnl_threshold = 0.006
-        self.rsi_peaked_overbought  = {}
         self.trade_count            = 0
         self._pending_orders        = {}
         self._cancel_cooldowns      = {}
@@ -257,10 +246,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if self.LiveMode:
             cleanup_object_store(self)
             load_persisted_state(self)
-            self.Debug("=== LIVE TRADING (MOMENTUM BREAKOUT RUNNER) v8.0.0 ===")
-            self.Debug(f"Capital: ${self.Portfolio.Cash:.2f} | Max pos: {self.max_positions} | Size: {self.position_size_pct:.0%}")
-            self.Debug(f"Kelly: {'ON' if self.use_kelly else 'OFF (flat sizing)'}")
-            self.Debug("Setup families: IgnitionBreakout | CompressionExpansion | MomentumContinuation")
+            self.Debug("=== LIVE TRADING — Leader Breakout v0 (Machine Gun v2) ===")
+            self.Debug(f"Capital: ${self.Portfolio.Cash:.2f} | Max pos: {self.max_positions} | Size: {self.position_size_pct:.0%}/{self.position_size_high_conviction:.0%}")
+            self.Debug("Setup: IgnitionBreakout only | Concentrated (top 1-2 candidates)")
 
     def CustomSecurityInitializer(self, security):
         security.SetSlippageModel(RealisticCryptoSlippage(self))
@@ -496,7 +484,6 @@ def _on_order_event(algo, event):
                 crypto = algo.crypto_data.get(symbol)
                 if crypto and len(crypto['volume']) >= 1:
                     algo.entry_volumes[symbol] = crypto['volume'][-1]
-                algo.rsi_peaked_overbought.pop(symbol, None)
             else:
                 if symbol in algo._partial_sell_symbols:
                     algo._partial_sell_symbols.discard(symbol)
@@ -611,7 +598,7 @@ def _on_brokerage_message(algo, message):
 def _on_end_of_algorithm(algo):
     total = algo.winning_trades + algo.losing_trades
     wr = algo.winning_trades / total if total > 0 else 0
-    algo.Debug("=== FINAL REPORT — Machine Gun v2 Momentum Breakout Runner v8.0.0 ===")
+    algo.Debug("=== FINAL REPORT — Leader Breakout v0 (Machine Gun v2) ===")
     algo.Debug(f"Trades: {algo.trade_count} | WR: {wr:.1%}")
     algo.Debug(f"Final: ${algo.Portfolio.TotalPortfolioValue:.2f}")
     algo.Debug(f"PnL: {algo.total_pnl:+.2%}")
